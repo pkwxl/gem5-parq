@@ -26,6 +26,7 @@
 * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#include <algorithm>
 #include <iostream>
 #include <thread>
 
@@ -33,11 +34,24 @@ using namespace std;
 
 /*
  * c = a + b
+ *
+ * Elements are handed out in blocks of chunk_size, round-robin across
+ * threads (block-cyclic distribution). chunk_size=1 reproduces the
+ * original element-interleaved assignment, where every cache line is
+ * touched by all `threads` threads (worst-case false sharing);
+ * chunk_size >= num_values/threads gives each thread one contiguous,
+ * effectively unshared block. This is a knob for dialing coherence
+ * traffic intensity up or down with the same binary.
  */
-void array_add(int *a, int *b, int *c, int tid, int threads, int num_values)
+void array_add(int *a, int *b, int *c, int tid, int threads,
+               int num_values, int chunk_size)
 {
-    for (int i = tid; i < num_values; i += threads) {
-        c[i] = a[i] + b[i];
+    for (int base = tid * chunk_size; base < num_values;
+         base += threads * chunk_size) {
+        int end = min(base + chunk_size, num_values);
+        for (int i = base; i < end; i++) {
+            c[i] = a[i] + b[i];
+        }
     }
 }
 
@@ -45,23 +59,35 @@ void array_add(int *a, int *b, int *c, int tid, int threads, int num_values)
 int main(int argc, char *argv[])
 {
     unsigned num_values;
+    unsigned chunk_size = 1;
     if (argc == 1) {
         num_values = 100;
     } else if (argc == 2) {
         num_values = atoi(argv[1]);
         if (num_values <= 0) {
-            cerr << "Usage: " << argv[0] << " [num_values]" << endl;
+            cerr << "Usage: " << argv[0]
+                 << " [num_values] [chunk_size]" << endl;
+            return 1;
+        }
+    } else if (argc == 3) {
+        num_values = atoi(argv[1]);
+        chunk_size = atoi(argv[2]);
+        if (num_values <= 0 || chunk_size <= 0) {
+            cerr << "Usage: " << argv[0]
+                 << " [num_values] [chunk_size]" << endl;
             return 1;
         }
     } else {
-        cerr << "Usage: " << argv[0] << " [num_values]" << endl;
+        cerr << "Usage: " << argv[0]
+             << " [num_values] [chunk_size]" << endl;
         return 1;
     }
 
     unsigned cpus = thread::hardware_concurrency();
 
     cout << "Running on " << cpus << " cores. ";
-    cout << "with " << num_values << " values" << endl;
+    cout << "with " << num_values << " values, chunk_size " << chunk_size;
+    cout << endl;
 
     int *a, *b, *c;
     a = new int[num_values];
@@ -83,10 +109,11 @@ int main(int argc, char *argv[])
 
     // NOTE: -1 is required for this to work in SE mode.
     for (int i = 0; i < cpus - 1; i++) {
-        threads[i] = new thread(array_add, a, b, c, i, cpus, num_values);
+        threads[i] = new thread(array_add, a, b, c, i, cpus, num_values,
+                                 chunk_size);
     }
     // Execute the last thread with this thread context to appease SE mode
-    array_add(a, b, c, cpus - 1, cpus, num_values);
+    array_add(a, b, c, cpus - 1, cpus, num_values, chunk_size);
 
     cout << "Waiting for other threads to complete" << endl;
 
