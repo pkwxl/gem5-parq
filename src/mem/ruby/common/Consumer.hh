@@ -49,7 +49,9 @@
 
 #include <iostream>
 #include <set>
+#include <thread>
 
+#include "base/uncontended_mutex.hh"
 #include "sim/clocked_object.hh"
 
 namespace gem5
@@ -87,10 +89,33 @@ class Consumer
     void scheduleEventAbsolute(Tick timeAbs);
     void scheduleEvent(Cycles timeDelta);
 
+    /*
+     * Per-consumer wakeup mutex (design doc:
+     * docs/specs/parallel-eventq-lockfree-l2-design.md, sections 2.3/6.2).
+     * Any thread enqueueing into one of this Consumer's inbound
+     * MessageBuffers, and this Consumer's own wakeup() dispatch, must hold
+     * this lock for the duration -- it is what makes "wakeup() scans all
+     * inbound buffers" atomic w.r.t. a concurrent cross-thread enqueue.
+     *
+     * Same-thread re-entrant, cross-thread exclusive: SLICC-generated
+     * wakeup() code can enqueue into the consumer's own buffers (recycle,
+     * reanalyzeMessages, enqueueDeferredMessages) while already holding this
+     * lock on the same thread; a *different* thread trying to acquire it
+     * always blocks normally. Recursion never changes how many *distinct*
+     * locks a thread holds, so it doesn't weaken the section 6.2 invariant
+     * (a thread holds at most one such lock at a time).
+     */
+    void lock();
+    void unlock();
+
   private:
     std::set<Tick> m_wakeup_ticks;
     EventFunctionWrapper m_wakeup_event;
     ClockedObject *em;
+
+    UncontendedMutex m_wakeup_mutex;
+    std::thread::id m_wakeup_mutex_owner;
+    unsigned m_wakeup_mutex_depth = 0;
 
     void scheduleNextWakeup();
     void processCurrentEvent();

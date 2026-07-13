@@ -91,8 +91,33 @@ Consumer::processCurrentEvent()
     // remove the current tick from the wakeup list, wake up, and then schedule
     // the next wakeup
     m_wakeup_ticks.erase(curr);
+    lock();
     wakeup();
+    unlock();
     scheduleNextWakeup();
+}
+
+void
+Consumer::lock()
+{
+    std::thread::id self = std::this_thread::get_id();
+    if (m_wakeup_mutex_owner == self) {
+        ++m_wakeup_mutex_depth;
+        return;
+    }
+    m_wakeup_mutex.lock();
+    m_wakeup_mutex_owner = self;
+    m_wakeup_mutex_depth = 1;
+}
+
+void
+Consumer::unlock()
+{
+    assert(m_wakeup_mutex_owner == std::this_thread::get_id());
+    if (--m_wakeup_mutex_depth == 0) {
+        m_wakeup_mutex_owner = std::thread::id();
+        m_wakeup_mutex.unlock();
+    }
 }
 
 } // namespace ruby

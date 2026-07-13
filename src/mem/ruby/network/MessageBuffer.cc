@@ -41,12 +41,14 @@
 #include "mem/ruby/network/MessageBuffer.hh"
 
 #include <cassert>
+#include <mutex>
 
 #include "base/cprintf.hh"
 #include "base/logging.hh"
 #include "base/random.hh"
 #include "base/stl_helpers.hh"
 #include "debug/RubyQueue.hh"
+#include "sim/eventq.hh"
 
 namespace gem5
 {
@@ -219,6 +221,25 @@ MessageBuffer::enqueue(MsgPtr message, Tick current_time, Tick delta,
                        bool ruby_is_random, bool ruby_warmup,
                        bool bypassStrictFIFO)
 {
+    // Per-consumer wakeup mutex (design doc section 2.3/6.2): held for the
+    // whole enqueue so a concurrent, cross-thread wakeup() on m_consumer
+    // can never observe this buffer mid-update. Consumer::lock() is
+    // same-thread re-entrant, so this is also safe when m_consumer's own
+    // wakeup() enqueues into one of its own buffers (recycle,
+    // reanalyzeMessages, enqueueDeferredMessages).
+    //
+    // Fast path: a given EventQueue is always serviced by exactly one OS
+    // thread for the life of the run, so if the calling thread is already
+    // servicing m_consumer's own EventQueue, no *other* thread can be
+    // touching m_consumer concurrently -- the lock is provably redundant
+    // and can be skipped. This is the common case for any intra-domain
+    // message (e.g. a controller talking to its own Sequencer/directory);
+    // only genuine cross-domain sends pay the lock.
+    assert(m_consumer != NULL);
+    std::unique_lock<Consumer> consumer_lock(*m_consumer, std::defer_lock);
+    if (curEventQueue() != m_consumer->getObject()->eventQueue())
+        consumer_lock.lock();
+
     // record current time incase we have a pop that also adjusts my size
     if (m_time_last_time_enqueue < current_time) {
         m_msgs_this_cycle = 0;  // first msg this cycle
@@ -296,7 +317,6 @@ MessageBuffer::enqueue(MsgPtr message, Tick current_time, Tick delta,
             arrival_time, *(message.get()));
 
     // Schedule the wakeup
-    assert(m_consumer != NULL);
     m_consumer->scheduleEventAbsolute(arrival_time);
     m_consumer->storeEventInfo(m_vnet_id);
 }
