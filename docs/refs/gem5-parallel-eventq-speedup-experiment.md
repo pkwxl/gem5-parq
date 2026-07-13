@@ -1,10 +1,15 @@
 # gem5 多核并行仿真加速实验：从"设计分析"到实测数据
 
 > 承接 [`gem5-parallel-event-dispatch-analysis.md`](./gem5-parallel-event-dispatch-analysis.md)
-> 的源码分析，本报告用两个真实跑通的 gem5 SE 模式实验，检验那份报告里的判断：
-> quantum 同步的 lookahead 约束是不是真的会咬人？"局部事件留在本地"这条原则
-> 落实到位之后，实测加速比能到多少？复现脚本见
+> 的源码分析，本报告用三个真实跑通（或跑不通）的 gem5 SE 模式实验，检验那份
+> 报告里的判断：quantum 同步的 lookahead 约束是不是真的会咬人？"局部事件留在
+> 本地"这条原则落实到位之后，实测加速比能到多少？如果想要一个折中的"私有部分
+> timing、共享部分粗粒度"的混合精度方案，gem5 现有架构是否支持？复现脚本见
 > [`scripts/`](./scripts)。
+>
+> 三个实验的结论一句话概括：**只要共享的 cache/内存还需要 timing
+> 精度，gem5 经典内存系统 + 多 EventQueue 就没有可用的并行路径**——不是
+> 调参数、换 barrier 实现、插桩延迟能绕开的问题，是架构上的硬边界（第 6 节）。
 
 ## 0. 实验环境
 
@@ -181,15 +186,89 @@ gem5 现有的 quantum 并行机制在 8 路以内给出的是接近线性的加
 
 ## 5. 下一步可以做的实验
 
-- **在实验一崩溃的路径上，人为把跨队列端口的延迟拉到 ≥ `sim_quantum`**
-  （例如把共享 L2 换成一个模拟"集群间总线"的、延迟被显式设成大于
-  quantum 的连接），验证"只要满足 lookahead 约束，共享一致性域也能跨
-  队列"这个假设，并测出这种配置下（为了正确性被迫引入的额外延迟）对
-  仿真时序精度和并行加速比分别有多大代价——这是把 4.5 条建议从纸面
-  设想变成可测量结论的关键实验。
+- ~~在实验一崩溃的路径上，人为把跨队列端口的延迟拉到 ≥ `sim_quantum`~~
+  **——已经做了，见第 6 节，此路不通**：`ThreadBridge`（gem5 唯一支持跨
+  EventQueue 的桥接对象）对 timing 请求直接 `panic`，不是"延迟拉够了
+  就能跑"的问题，`sim_quantum`/延迟大小根本没有机会参与判断。
 - **把 `num_sys` 推到远超 8**（机器有 112 核），观察实验二的并行效率
   曲线什么时候开始明显下降，以及 `wall_seconds` 与 `hostSeconds` 的
   差距如何随 N 增长，验证第 4 节里"构图阶段是新瓶颈"的猜测。
 - **在实验二的独立子系统之间人为引入少量、可控频率的跨队列消息**
   （比如每隔固定条指令发一次），做出一条"跨队列流量 vs 并行效率"的
   曲线，替代目前"零流量"和"崩溃"两个极端之间的空白。
+
+## 6. 实验三：混合精度方案（私有 timing + 共享 atomic）走不通
+
+第 4 节的建议本来设想了一条折中路线：私有的 L1/L2 保留详细 timing，只有
+真正打到共享 LLC/内存的请求才跨 EventQueue，而且用 gem5 官方提供的、
+专门为跨线程访问设计的 `mem.ThreadBridge`（`src/mem/thread_bridge.{hh,cc}`）
+来接这条跨队列的边——它的文档明确写着是为"从一个线程访问另一个线程上的
+SimObject"设计的桥接器。配置见
+[`scripts/parallel_bench_hybrid.py`](./scripts/parallel_bench_hybrid.py)：
+每个 CPU 的私有 L1+L2 各自一个 EventQueue（`timing` 模式），共享的 LLC+
+`MemCtrl` 留在 EventQueue 0，两者之间接一个每核一份的 `ThreadBridge`。
+
+```bash
+gem5.opt parallel_bench_hybrid.py --num-cpus 2 --num-values 1000 \
+    --parallel --sim-quantum 1us
+```
+
+**结果：还是跑不起来**，而且比实验一崩得更干脆——第一次 L2 miss 真正
+打到 `ThreadBridge` 的那一刻直接 `panic`，连断言失败前那点仿真都没有：
+
+```
+src/mem/thread_bridge.cc:57: panic: ThreadBridge only supports atomic/functional access.
+Program aborted at tick 7500
+  ... ThreadBridge::IncomingPort::recvTimingReq
+  ... RequestPort::sendTimingReq
+  ... BaseCache::sendMSHRQueuePacket
+  ... BaseCache::CacheReqPacketQueue::sendDeferredPacket
+  ... EventQueue::serviceOne
+  ... doSimLoop
+```
+
+`src/mem/thread_bridge.cc` 里 `ThreadBridge::IncomingPort::recvTimingReq`
+的实现就是一行 `panic(...)`；只有 `recvAtomic`/`recvFunctional` 才有真正
+的实现（通过 `EventQueue::ScopedMigration` 让发起访问的线程临时"借用"
+目标队列的锁，同步执行）。
+
+### 为什么"私有 timing + 共享 atomic"这个设想在经典 gem5 里搭不出来
+
+根子在于 `system.mem_mode` 是**整个系统唯一的一个全局开关**，经典
+`BaseCache` 不管处在层级的哪一层，只要自己收到的是 timing 请求，往
+`mem_side` 转发时用的必然还是 `sendTimingReq`——**没有"到了这一层就把
+请求降级成 atomic"这种局部转换**。也就是说，只要为了让私有 L1/L2 有
+timing 细节而把 `mem_mode` 设成 `"timing"`，这个模式会一路传导到最底层，
+包括打到 `ThreadBridge` 的那一刻；而 `ThreadBridge` 见到 timing 请求
+就直接拒绝。反过来，如果把 `mem_mode` 整体设成 `"atomic"` 让
+`ThreadBridge` 能正常工作，代价是**私有 L1/L2 也一起失去了 timing
+细节**——不再是"私有精确、共享粗糙"的混合模型，而是整个系统都没有周期级
+时序，退化成纯功能仿真（KVM/fast-forward 场景用的就是这个模式，但那不是
+在做"多核性能建模"）。
+
+### 三个实验拼起来的最终结论
+
+| 实验 | 私有部分精度 | 共享部分精度 | 跨队列连接方式 | 结果 |
+|---|---|---|---|---|
+| 一 | timing | timing | 直接端口连接 | 断言崩溃（`eventq.hh:759`），与 quantum 大小无关 |
+| 三 | timing | timing（经 `ThreadBridge` 强制降级失败） | `ThreadBridge` | 启动即 `panic`，因为 `ThreadBridge` 拒绝 timing |
+| （二） | timing（各自私有，无共享） | 不存在共享部分 | 无跨队列流量 | 87%~99% 并行效率，但不代表任何"多核性能"场景 |
+
+三条路都已经堵死或者跑偏：直连会崩、官方桥接器直接拒绝 timing、唯一能
+稳定拿到高并行效率的场景（实验二）根本没有共享内存/cache 一致性，不能
+代表"多核处理器性能仿真"这个目标。**结论到此可以定稿**：在 gem5 现有的
+经典（非 Ruby）内存系统 + 多 EventQueue 架构下，只要还需要对共享的
+cache/内存做 timing 精度建模，就没有办法把这样的多核系统拆到多个线程上
+并行仿真——这是 `system.mem_mode` 的全局性设计和 `ThreadBridge` 的
+atomic-only 限制共同划出的一条架构边界，不是性能调优或者参数搜索能绕开的
+问题。第 4 节里关于 barrier 开销、quantum 合并算法、分区安全检查的建议
+仍然成立，但都是在"跨队列流量本身被允许存在"这个前提之下的优化——而这个
+前提，对于需要 timing 精度的共享内存多核模型，目前是不满足的。
+
+如果之后想在这个方向上继续推进，现实的路径不是继续在 `sim/eventq.hh`
+这一层找空间，而是要么接受 Ruby（另一套独立的一致性协议实现，尚未验证
+是否有相同限制，见上一轮讨论里放弃的那个方向）、要么接受牺牲一部分
+timing 精度换并行度（比如统计抽样、周期性在 timing/atomic 之间切换而非
+空间上混合）、要么就是承认"单次仿真内部并行"这条路对精确多核建模不划算，
+把并行度花在"同时跑多个独立的仿真配置/参数扫描"上（这也是实际使用 gem5
+做多核性能研究的团队更常见的并行方式）。
