@@ -1,0 +1,8 @@
+mode,num_sys,wall_seconds,host_seconds,sim_seconds
+serial,1,23.072,22.29,0.031224
+serial,2,47.451,46.40,0.031224
+serial,4,97.855,96.21,0.031224
+serial,8,195.056,192.24,0.031224
+parallel,2,24.044,22.99,0.031225
+parallel,4,25.673,24.03,0.031225
+parallel,8,28.029,25.22,0.031225
