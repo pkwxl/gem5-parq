@@ -1,0 +1,48 @@
+{
+  "permissions": {
+    "defaultMode": "default",
+    "additionalDirectories": [
+      "/tmp",
+      "/workspace",
+      "/home/wxl"
+    ],
+    "allow": [
+      "Bash(*)",
+      "Read(//tmp/**)",
+      "Edit(//tmp/**)",
+      "Write(//tmp/**)",
+      "Read(//workspace/**)",
+      "Edit(//workspace/gem5/**)",
+      "Write(//workspace/gem5/**)",
+      "Edit(//workspace/shm/**)",
+      "Write(//workspace/shm/**)",
+      "Read(/home/wxl/**)",
+      "Edit(/home/wxl/**)",
+      "Write(/home/wxl/**)"
+    ],
+    "deny": [
+      "Bash(git push *)",
+      "Bash(git reset --hard *)",
+      "Bash(git reset --hard)",
+      "Bash(git clean -f *)",
+      "Bash(git clean -fd *)",
+      "Bash(git checkout -- .)",
+      "Bash(git checkout .)",
+      "Bash(git restore .)",
+      "Bash(git restore --staged .)",
+      "Bash(git branch -D *)",
+      "Bash(git commit --amend *)",
+      "Bash(git commit --no-verify *)",
+      "Bash(git commit -m * --no-verify)",
+      "Bash(git commit --no-gpg-sign *)",
+      "Bash(git push --no-verify *)",
+      "Bash(chmod -R 777 /)",
+      "Bash(chmod 777 /)",
+      "Bash(chown -R * /)",
+      "Bash(dd if=* of=/dev/*)",
+      "Bash(mkfs*)",
+      "Bash(shutdown *)",
+      "Bash(reboot)"
+    ]
+  }
+}
