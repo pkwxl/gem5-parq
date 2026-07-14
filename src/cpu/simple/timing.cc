@@ -270,7 +270,18 @@ TimingSimpleCPU::suspendContext(ThreadID thread_num)
         _status = Idle;
 
         if (fetchEvent.scheduled()) {
-            deschedule(fetchEvent);
+            if (inParallelMode && curEventQueue() != eventQueue()) {
+                // Cross-domain suspend (e.g. exit_group halting a thread
+                // whose CPU lives on another domain's EventQueue): we cannot
+                // deschedule an event on a queue we don't own (eventq.hh's
+                // owner-only assert). Leaving fetchEvent scheduled is safe --
+                // it fires harmlessly on the owning thread, where fetch()
+                // returns immediately because _status is now Idle. The
+                // deschedule here is only an optimization to cancel a
+                // now-unnecessary fetch. See design doc section 9.8.
+            } else {
+                deschedule(fetchEvent);
+            }
         }
     }
 
