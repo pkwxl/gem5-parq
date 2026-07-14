@@ -84,16 +84,33 @@ Consumer::scheduleEventAbsolute(Tick evt_time)
 void
 Consumer::scheduleNextWakeup()
 {
+    // Always called under lock() (see MessageBuffer::enqueue() and
+    // processCurrentEvent() below), so m_wakeup_scheduled/
+    // m_wakeup_scheduled_when are race-free here.
+
     // look for the next tick in the future to schedule
     auto it = m_wakeup_ticks.lower_bound(em->clockEdge());
-    if (it != m_wakeup_ticks.end()) {
-        Tick when = *it;
-        assert(when >= em->clockEdge());
-        if (m_wakeup_event.scheduled() && (when < m_wakeup_event.when()))
+    if (it == m_wakeup_ticks.end())
+        return;
+
+    Tick when = *it;
+    assert(when >= em->clockEdge());
+
+    if (m_wakeup_scheduled) {
+        if (when < m_wakeup_scheduled_when) {
+            // Only em's own owning thread may call reschedule()
+            // (eventq.hh's assert enforces this); see design doc section
+            // 8.7 for the known-unresolved case of two cross-domain
+            // threads racing to move this earlier.
             em->reschedule(m_wakeup_event, when, true);
-        else if (!m_wakeup_event.scheduled())
-            em->schedule(m_wakeup_event, when);
+            m_wakeup_scheduled_when = when;
+        }
+        return;
     }
+
+    em->schedule(m_wakeup_event, when);
+    m_wakeup_scheduled = true;
+    m_wakeup_scheduled_when = when;
 }
 
 void
@@ -108,6 +125,14 @@ Consumer::processCurrentEvent()
     // the whole method, not just wakeup(), so the erased/processed tick
     // and the next-wakeup scheduling both see a consistent set.
     lock();
+    // This in-flight dispatch has now actually fired -- clear before
+    // touching m_wakeup_ticks so a concurrent scheduleNextWakeup() (which
+    // can only run once it acquires this same lock) never observes a
+    // stale "still in flight" state (design doc section 8.7; this
+    // replaces relying on m_wakeup_event.scheduled(), which
+    // EventQueue::serviceOne() clears before this method -- and thus
+    // lock() -- is even reached).
+    m_wakeup_scheduled = false;
     auto curr = m_wakeup_ticks.begin();
     assert(em->clockEdge() == *curr);
     m_wakeup_ticks.erase(curr);

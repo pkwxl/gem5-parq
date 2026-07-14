@@ -113,6 +113,22 @@ class Consumer
     EventFunctionWrapper m_wakeup_event;
     ClockedObject *em;
 
+    /*
+     * Whether a wakeup dispatch for `em` is currently in flight, and if so,
+     * for which tick (design doc section 8.7). Deliberately not derived
+     * from m_wakeup_event.scheduled(): that core Event flag is cleared by
+     * EventQueue::serviceOne() before the callback (and thus before
+     * lock()) runs, so a cross-domain thread holding this lock can observe
+     * an honest-but-stale "not scheduled" reading in the window between
+     * serviceOne()'s dequeue and processCurrentEvent() actually acquiring
+     * the lock, and double-schedule the same Event object. These two
+     * fields are only ever touched while holding m_wakeup_mutex, so they
+     * carry a real happens-before relationship that m_wakeup_event's own
+     * flag does not.
+     */
+    bool m_wakeup_scheduled = false;
+    Tick m_wakeup_scheduled_when = 0;
+
     UncontendedMutex m_wakeup_mutex;
     std::thread::id m_wakeup_mutex_owner;
     unsigned m_wakeup_mutex_depth = 0;
