@@ -1092,3 +1092,301 @@ lock-free 环形缓冲区，单个 `std::atomic<unsigned>::fetch_add` 记录
 这次带 `s`/`u`/无条件 `C` 记录的第三版）已经移除，不留在树上；
 `Consumer.cc` 当前树上状态与上一次提交（`cc36b250a2`）完全一致，
 `MessageBuffer.cc` 的同域快速路径移除（8.5 节方向 a）还没有提交。
+
+（补记：8.5 节方向 (a) 实际已经在 `d14e8c3f08` 提交，早于本节写作
+时间——上一段末尾那句话是撰写时的笔误，当时忘了核对提交历史，这里
+一并更正。）
+
+### 8.7 修复设计：把"是否已有一次调度在途"的判断从 `Event::Scheduled`
+搬进 `Consumer` 自己、由同一把锁保护的状态里
+
+8.6 节的结论是：问题不在于锁覆盖的范围不够大，而在于判断依据本身
+（`m_wakeup_event.scheduled()`）的清除时机不受 `Consumer::lock()`
+管辖——`EventQueue::serviceOne()`（`src/sim/eventq.cc:229`）在真正
+调用回调（从而进入 `processCurrentEvent()`、拿到锁）**之前**就清掉
+了这个标志位。这一节把候选修复方向落成一个具体的设计，供实现前过一遍。
+
+**新增状态**（`Consumer` 私有成员，替换掉对 `m_wakeup_event.
+scheduled()`/`m_wakeup_event.when()` 的读取）：
+
+```cpp
+bool m_wakeup_scheduled = false;  // 是否已经有一次对 em 的调度请求在途
+Tick m_wakeup_scheduled_when = 0; // 在途请求对应的 tick（仅当上面为 true 时有意义）
+```
+
+**不变式**：这两个字段只在持有 `m_wakeup_mutex`（即调用者已经进过
+`Consumer::lock()`）的代码路径里被读或写——`scheduleNextWakeup()`
+和 `processCurrentEvent()`，两者现在都只能在锁内被调用（前者已经是
+这样，`scheduleEvent`/`scheduleEventAbsolute` 的调用方
+`MessageBuffer::enqueue()` 早在 7.1 节就把整个 enqueue 包在锁里；后者
+本来就在 8.2 节的修复里锁住了）。因此这两个字段的每一次读写之间都有
+锁提供的 happens-before 关系，不会重演 8.6 节那种"标志真实但过时"
+的问题——因为这次清除它的代码本身就在锁的保护范围内，不像
+`Event::Scheduled` 那样在 gem5 核心的 `serviceOne()` 里被锁管不到的
+地方清除。
+
+**`scheduleNextWakeup()` 改法**（伪代码，替换现有实现）：
+
+```cpp
+void
+Consumer::scheduleNextWakeup()
+{
+    auto it = m_wakeup_ticks.lower_bound(em->clockEdge());
+    if (it == m_wakeup_ticks.end())
+        return;
+
+    Tick when = *it;
+    assert(when >= em->clockEdge());
+
+    if (m_wakeup_scheduled) {
+        if (when < m_wakeup_scheduled_when) {
+            // 只有 em 的宿主线程能调用 reschedule()（eventq.hh:819 的
+            // assert 要求如此）；跨域线程理论上也可能走到这个分支
+            // （见下面"未解决的遗留问题"），但目前复现里没有观察到，
+            // 保留 eventq.hh 自带的 assert 作为兜底——命中就是一次
+            // 干净的、确定性的崩溃，而不是静默的错误行为。
+            em->reschedule(m_wakeup_event, when, true);
+            m_wakeup_scheduled_when = when;
+        }
+        return;  // 已经有一次调度在途，不需要（也不能）再发起一次
+    }
+
+    em->schedule(m_wakeup_event, when);
+    m_wakeup_scheduled = true;
+    m_wakeup_scheduled_when = when;
+}
+```
+
+**`processCurrentEvent()` 改法**：在拿到锁之后、动 `m_wakeup_ticks`
+之前，先把 `m_wakeup_scheduled` 清掉——这一步就是"消费掉这次在途
+请求"的唯一时刻，而且严格发生在锁的保护范围内：
+
+```cpp
+void
+Consumer::processCurrentEvent()
+{
+    lock();
+    m_wakeup_scheduled = false;   // 这次在途请求已经真正触发，清掉
+                                   // 标志；必须在锁内、在读 m_wakeup_ticks
+                                   // 之前做，让并发的 scheduleNextWakeup()
+                                   // 看到的状态始终和"是否真的还有一次
+                                   // 调度在途"一致
+    auto curr = m_wakeup_ticks.begin();
+    assert(em->clockEdge() == *curr);
+    m_wakeup_ticks.erase(curr);
+    wakeup();
+    scheduleNextWakeup();
+    unlock();
+}
+```
+
+**为什么这修得掉 8.6 节的具体崩溃**：8.6 节的因果链里，`D`
+（跨域线程）在 `1649425` 读到 `m_wakeup_event.scheduled()==false`——
+这是 `serviceOne()` 提前清除、但 `B` 还没跑到 `processCurrentEvent()`
+去真正处理这次 wakeup 时的"诚实但过时"读数。换成 `m_wakeup_scheduled`
+之后，这个字段在同样的时间窗口里仍然是 `true`（因为它只会在 `B`
+真正拿到锁、进入 `processCurrentEvent()` 之后才被清掉，而不是被
+`serviceOne()` 提前清掉）——所以 `D` 在 `1649425` 这一步会读到
+`m_wakeup_scheduled==true`，直接走 `return` 分支，不会对同一个
+`m_wakeup_event` 发起第二次 `em->schedule()`，也就不会把它重复插入
+`async_queue`，8.6 节观察到的"同一个 tick 触发两次"就不会发生。
+
+**为什么这不会重新引入 8.5 节修掉的问题**：8.5 节的根因是"同域快速
+路径跳过锁，导致本域线程的无锁写入和跨域线程的加锁读取之间没有
+happens-before 关系"。这个修复完全不涉及要不要加锁——它假设锁已经
+覆盖了 `scheduleNextWakeup()`/`processCurrentEvent()` 的全部访问
+（8.5 节的修复已经做到这一点），只是把"判断依据"从一个锁管不到的
+外部标志位换成锁管得到的内部标志位。两个修复是正交的、都需要，
+不是互相替代。
+
+**已知未解决的遗留问题**（不在这次修复范围内，如实记录）：
+`scheduleNextWakeup()` 里"发现更早的 tick，需要把已经在途的调度提前"
+这个分支调用了 `em->reschedule()`，而 `reschedule()` 按
+`eventq.hh:819` 的 assert 只能由 `em` 的宿主线程调用。如果这个分支
+被一个跨域线程走到（比如两个不同的跨域发送方，各自把 tick snap 到
+不同的 quantum 边界后，后到的那个 snap 结果反而更早），会直接触发
+`eventq.hh` 自己的 assert——这本身是"崩得干净"而不是"静默出错"，
+但说明这个分支目前只对"同域线程发现一个比跨域已排队的请求更早的
+同域 tick"这一种情况是安全的，对"两个跨域线程互相抢跑"这种情况没有
+真正设计过。8.4 节的诊断曾经测过这个分支在当前测试拓扑里触发次数是
+零，所以现阶段不是这次崩溃的成因，但如果以后拓扑变化导致这个分支
+真的被跨域线程走到，会是一个新的、需要单独设计的问题（大概率需要
+让跨域线程也只能通过类似 `schedule()`/`asyncInsert()` 的路径提交
+"请求提前"这件事，而不是直接调用 `reschedule()`）。
+
+**验证计划**：实现后（1）用 A 节基线命令确认 `simTicks` 不变；
+（2）重跑 `--parallel-l2-eventq --sim-quantum=0.1ns` 复现命令，确认
+`assert(em->clockEdge() == *curr)` 不再触发；由于崩溃发生的具体 tick
+在不同次运行里本身是竞态、不是确定的，跑一次通过不能说明问题已经
+彻底修好，需要多跑几次（至少 5-10 次)看是否稳定不崩，而不是只看
+一次干净退出就下结论。
+
+### 8.8 补齐 8.7 留下的缺口："把在途 wakeup 提前"这条路径的
+跨线程正确性设计（顺带发现同一分支里第二个潜伏缺陷）
+
+8.7 节实现后明确留下了一个"如实记录、暂不修复"的缺口：
+`scheduleNextWakeup()` 里"发现更早的 tick、需要把已在途的调度提前"
+这个分支调用 `em->reschedule()`，而 `eventq.hh` 的
+`assert(!inParallelMode || this == curEventQueue())` 要求它只能由
+`em` 的宿主线程调用。本节把这个缺口的修复设计写清楚。设计过程中还
+发现了**同一个分支里的第二个、更隐蔽的潜伏缺陷**，一并修。
+
+**缺陷一（P1，8.7 已知）**：跨域线程在锁内发现新插入的 tick 比在途
+的 `m_wakeup_scheduled_when` 更早时，走 `em->reschedule()` 会直接
+命中 `eventq.hh` 的宿主线程断言。可达场景：跨域链路延迟较长（比如
+snap 后落在较远的 quantum 边界 W），而另一个跨域发送方随后插入了
+一个更早的 snap 边界 E < W。8.4 节的诊断测得这个分支在当前拓扑/
+负载里触发次数为零，所以是潜伏而非现行——但它是"设计上没考虑"，
+不是"设计上不可能"。
+
+**缺陷二（P2，本节新发现）**：**宿主线程自己**走这个 reschedule
+分支也可能出错。链条是：跨域线程 D 在 `m_wakeup_event` 未在途时
+调用 `em->schedule()`——跨线程走 `asyncInsert()`，事件进入 `em` 的
+`async_queue`，要等下一个 quantum 边界的 `handleAsyncInsertions()`
+才被合并进主队列；在合并发生**之前**，宿主线程 B 插入了一个更早的
+本地 tick E（完全可能：D 的 snap 边界 W 可以在多个周期之外，而 B
+的本地事件只需 `clockEdge()+1` 个周期），`scheduleNextWakeup()` 看
+`m_wakeup_scheduled==true` 且 `E < m_wakeup_scheduled_when`，于是
+调用 `em->reschedule()`——线程归属合法，但 `reschedule()` 内部的
+`remove()` 只在**主队列**里找这个事件，而它此刻还躺在
+`async_queue` 里，于是直接 `panic("event not found!")`
+（`eventq.cc` 的 `EventQueue::remove()`，两处 panic 已核实）。
+这个缺陷同样还没有实测触发过（触发了也是干净的 panic 而不是
+静默错误），但结构上可达，而且和 P1 是同一个分支的两张面孔：
+**`m_wakeup_event` 一旦经由异步路径调度过，在它真正触发之前，
+对它做 `reschedule()` 从任何线程都不安全**。
+
+**修复设计的核心规则**：`em->reschedule(m_wakeup_event, ...)` 只在
+同时满足两个条件时允许——①当前线程是 `em` 的宿主线程；②
+`m_wakeup_event` 上一次是被**本地**（宿主线程直接 `insert()`）调度
+的，而不是经由跨域 `asyncInsert()`。其余所有"需要一次更早的触发"
+的情形，改用一个**一次性的、堆分配的 AutoDelete "kick" 事件**通过
+`em->schedule()` 提交——`schedule()` 本来就是任意线程可调用的
+（跨线程自动走 `asyncInsert()`），这正是 gem5 自己给"让某个队列的
+线程在 tick T 做一件事"提供的惯用机制。kick 用
+`EventFunctionWrapper(callback, name, /*del=*/true, prio)` 构造
+（`del=true` 置 `AutoDelete`/`Managed` 标志，`serviceOne()` 在
+dispatch 后自动 `release()` 释放，已核实 `eventq.hh`/`eventq.cc`
+两端的机制），优先级用和 `m_wakeup_event` 相同的 `ev_prio`（需要在
+`Consumer` 里存一份副本）。
+
+**状态变更**（全部仍然只在 `Consumer::lock()` 保护下读写，延续
+8.7 的不变式）：
+
+```cpp
+// 替换 8.7 的 m_wakeup_scheduled_when，语义细化：
+bool m_wakeup_scheduled = false;   // m_wakeup_event 是否在途（含 async_queue 里）
+Tick m_wakeup_when = 0;            // m_wakeup_event 在途时的目标 tick
+bool m_wakeup_async_pending = false; // 在途的这次调度是否经由跨域 asyncInsert
+                                     // （true 则在它触发前禁止 reschedule）
+std::set<Tick> m_inflight_ticks;   // 所有"已承诺会在该 tick 精确触发一次"
+                                   // 的 tick 集合（m_wakeup_event 的 + 各 kick 的）
+Event::Priority m_ev_prio;         // 构造 kick 时复用
+```
+
+`m_inflight_ticks` 必须是集合而不是单个标量：一旦存在多个在途事件
+（主事件 + 若干 kick），某一次触发之后"剩余在途事件里最早的是哪个"
+这个信息就无法从单个标量恢复——8.7 的单标量 `_when` 在引入 kick 后
+不够用了，这是本节把它替换掉的原因。
+
+**核心不变式**：在每次对 `m_wakeup_ticks` 的插入或消费之后（同一个
+锁临界区内立即执行修复动作），未来最早的待处理 tick E 必然满足
+`m_inflight_ticks` 中存在一个**恰好等于 E** 的承诺。比 E 晚的 tick
+不需要提前承诺——每次触发后重新锚定（链式覆盖），这和现在（以及
+改动前单线程版本）的行为一致。由此可推出：每个 tick 都会被恰好一次
+、在恰好它自己的时刻的触发消费掉，`processCurrentEvent()` 的
+`assert(em->clockEdge() == *curr)` 恒成立；同一 tick 不会有两个
+在途事件（承诺前先查 `m_inflight_ticks`，已有即跳过）。
+
+还有一个不显然但重要的推论：**"发现最早 tick 没有被承诺"的线程，
+必然就是刚刚插入这个 tick 的线程自己**（因为更早的每次插入都在
+各自的临界区里当场完成了承诺）。所以跨域线程创建 kick 时用的 tick
+一定是它自己刚 snap 过的 quantum 边界——8.7 节 snap 论证的"合并
+发生在目标 tick 之前"的保证对 kick 自动成立，不需要额外论证。
+
+**改写后的调度逻辑**（伪代码；`ensureScheduled()` 即现在的
+`scheduleNextWakeup()`，调用者必须已持锁）：
+
+```cpp
+void Consumer::ensureScheduled()   // 调用者持有 Consumer::lock()
+{
+    auto it = m_wakeup_ticks.lower_bound(em->clockEdge());
+    if (it == m_wakeup_ticks.end()) return;
+    Tick when = *it;
+
+    if (!m_inflight_ticks.empty()) {
+        assert(*m_inflight_ticks.begin() >= when);  // 不变式自检
+        if (*m_inflight_ticks.begin() == when)
+            return;                 // 最早 tick 已有承诺
+    }
+
+    bool owning = !inParallelMode
+               || curEventQueue() == em->eventQueue();
+
+    if (m_wakeup_scheduled && owning && !m_wakeup_async_pending) {
+        // 唯一允许 reschedule 的情形：宿主线程 + 本地调度的在途事件
+        em->reschedule(&m_wakeup_event, when, true);
+        m_inflight_ticks.erase(m_wakeup_when);
+        m_inflight_ticks.insert(when);
+        m_wakeup_when = when;       // 原来的 tick 失去承诺，之后链式补上
+    } else if (!m_wakeup_scheduled) {
+        em->schedule(&m_wakeup_event, when);   // 任意线程合法（跨域走 async）
+        m_wakeup_scheduled = true;
+        m_wakeup_when = when;
+        m_wakeup_async_pending = !owning;
+        m_inflight_ticks.insert(when);
+    } else {
+        // 主事件在途但不可动（跨域线程，或 async-pending）：一次性 kick
+        auto *kick = new EventFunctionWrapper(
+            [this]{ processKick(); }, "Consumer kick",
+            /*del=*/true, m_ev_prio);
+        em->schedule(kick, when);
+        m_inflight_ticks.insert(when);
+    }
+}
+
+void Consumer::processCurrentEvent()   // m_wakeup_event 触发
+{
+    lock();
+    m_wakeup_scheduled = false;
+    m_wakeup_async_pending = false;
+    m_inflight_ticks.erase(em->clockEdge());
+    // （以下与 8.7 相同）
+    auto curr = m_wakeup_ticks.begin();
+    assert(em->clockEdge() == *curr);
+    m_wakeup_ticks.erase(curr);
+    wakeup();
+    ensureScheduled();
+    unlock();
+}
+
+void Consumer::processKick()           // 某个一次性 kick 触发
+{
+    lock();
+    m_inflight_ticks.erase(em->clockEdge());
+    auto curr = m_wakeup_ticks.begin();
+    assert(em->clockEdge() == *curr);
+    m_wakeup_ticks.erase(curr);
+    wakeup();
+    ensureScheduled();
+    unlock();
+}
+```
+
+（`processCurrentEvent()`/`processKick()` 的共同体可以抽成一个私有
+helper，伪代码为清晰起见写开。）
+
+**开销分析**：串行/单线程模式下 `inParallelMode==false`，`owning`
+恒真、`m_wakeup_async_pending` 恒假——kick 分支**永远不会走到**，
+不产生任何堆分配，调度行为和现在完全一致（基线 `simTicks` 必须
+逐字节不变，这仍然是硬性验证条件）。新增的常态开销只有
+`m_inflight_ticks` 的一次 insert + 一次 erase（常态大小为 1）；如果
+7.3 节的单线程开销数字因此明显变差，可以后续对 size==1 的常见情形
+做特化，但先不做。
+
+**验证计划**：（1）基线 `simTicks` 逐字节不变；（2）复现命令多次
+稳定通过（同 8.7 的标准）；（3）加一个临时计数器统计 kick 的创建
+次数——如果在当前拓扑/负载里是零（8.4 的测量结果暗示很可能是零），
+要如实记录"该路径是构造上正确、但未被实测行使过"，不能把"没触发"
+当成"验证通过"；届时可以考虑构造一个跨域延迟差异更大的压力配置来
+真正行使它，作为后续工作。
