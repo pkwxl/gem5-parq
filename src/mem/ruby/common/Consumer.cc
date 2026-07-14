@@ -55,8 +55,17 @@ Consumer::Consumer(ClockedObject *_em, Event::Priority ev_prio)
 void
 Consumer::scheduleEvent(Cycles timeDelta)
 {
-    m_wakeup_ticks.insert(em->clockEdge(timeDelta));
-    ensureScheduled();
+    // Own-thread only: clockEdge() computes against the calling thread's
+    // TLS curTick and mutates the Clocked cache, so a cross-domain caller
+    // would both read a skewed horizon and race em's own thread (design
+    // doc section 9.4/9.5). Cross-domain callers must go through
+    // scheduleEventAbsolute() with a sender-relative arrival tick. All
+    // in-tree callers are objects scheduling themselves from their own
+    // wakeup, so this holds today.
+    assert(!inParallelMode || curEventQueue() == em->eventQueue());
+    Tick when = em->clockEdge(timeDelta);
+    m_wakeup_ticks.insert(when);
+    commitTick(when);
 }
 
 void
@@ -78,36 +87,35 @@ Consumer::scheduleEventAbsolute(Tick evt_time)
     }
 
     m_wakeup_ticks.insert(when);
-    ensureScheduled();
+    commitTick(when);
 }
 
 void
-Consumer::ensureScheduled()
+Consumer::commitTick(Tick when)
 {
     // Always called under lock() (see MessageBuffer::enqueue() and the
     // fire paths below), so all the scheduling state here is race-free.
+    // `when` is either the tick the caller just inserted into
+    // m_wakeup_ticks (insert paths, possibly cross-domain) or
+    // *m_wakeup_ticks.begin() (fire-path re-anchor, always em's own
+    // thread).
     //
     // Invariant (design doc section 8.8): the earliest pending wakeup
     // tick always has a fire committed at exactly that tick in
     // m_inflight_ticks; later ticks are re-covered chain-style after
     // each fire, so every tick is consumed exactly once, at its own
     // time.
-
-    // look for the next tick in the future to schedule
-    auto it = m_wakeup_ticks.lower_bound(em->clockEdge());
-    if (it == m_wakeup_ticks.end())
+    //
+    // Deliberately no em->clockEdge() reads here: from a cross-domain
+    // thread that value is computed against the *caller's* TLS curTick
+    // (skewed by up to a quantum) and the call mutates em's Clocked
+    // cache -- both bit us at large quanta (design doc section 9.4).
+    // The inflight set alone decides: if some fire is already committed
+    // at or before `when`, the earliest pending tick is covered (chain
+    // re-anchoring handles the rest); otherwise `when` is the new
+    // earliest and needs a commitment now.
+    if (!m_inflight_ticks.empty() && *m_inflight_ticks.begin() <= when)
         return;
-
-    Tick when = *it;
-    assert(when >= em->clockEdge());
-
-    if (!m_inflight_ticks.empty()) {
-        // Every committed fire targets a pending tick, so none can be
-        // earlier than the earliest pending one.
-        assert(*m_inflight_ticks.begin() >= when);
-        if (*m_inflight_ticks.begin() == when)
-            return;
-    }
 
     bool owning = !inParallelMode || curEventQueue() == em->eventQueue();
 
@@ -149,12 +157,21 @@ void
 Consumer::consumeCurrentTick()
 {
     // Caller (a fire path below) holds lock() and has already removed
-    // this fire's commitment from m_inflight_ticks.
+    // this fire's commitment from m_inflight_ticks. Fire paths always
+    // run on em's own thread, so the clockEdge() reads here are sound.
     auto curr = m_wakeup_ticks.begin();
     assert(em->clockEdge() == *curr);
     m_wakeup_ticks.erase(curr);
     wakeup();
-    ensureScheduled();
+    // Re-anchor: commit the next pending tick if it isn't covered yet.
+    // Every remaining tick is in the future (each tick is consumed at
+    // exactly its own time), and inflight commitments only ever target
+    // pending ticks, so begin() is the right anchor.
+    if (!m_wakeup_ticks.empty()) {
+        assert(m_inflight_ticks.empty() ||
+               *m_inflight_ticks.begin() >= *m_wakeup_ticks.begin());
+        commitTick(*m_wakeup_ticks.begin());
+    }
 }
 
 void
@@ -171,7 +188,7 @@ Consumer::processCurrentEvent()
     // consistent set.
     lock();
     // This in-flight dispatch has now actually fired -- clear before
-    // touching m_wakeup_ticks so a concurrent ensureScheduled() (which
+    // touching m_wakeup_ticks so a concurrent commitTick() (which
     // can only run once it acquires this same lock) never observes a
     // stale "still in flight" state (design doc section 8.7; this
     // replaces relying on m_wakeup_event.scheduled(), which

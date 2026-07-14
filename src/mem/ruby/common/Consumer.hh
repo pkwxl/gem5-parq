@@ -144,7 +144,7 @@ class Consumer
     std::thread::id m_wakeup_mutex_owner;
     unsigned m_wakeup_mutex_depth = 0;
 
-    void ensureScheduled();
+    void commitTick(Tick when);
     void consumeCurrentTick();
     void processCurrentEvent();
     void processKick();
