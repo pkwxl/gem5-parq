@@ -62,8 +62,22 @@ Consumer::scheduleEvent(Cycles timeDelta)
 void
 Consumer::scheduleEventAbsolute(Tick evt_time)
 {
-    m_wakeup_ticks.insert(
-        divCeil(evt_time, em->clockPeriod()) * em->clockPeriod());
+    Tick when = divCeil(evt_time, em->clockPeriod()) * em->clockPeriod();
+
+    // Cross-domain callers (a different EventQueue's thread than the one
+    // that services `em`) must not hand this domain an arrival time that
+    // its own clock may already have passed by the time it's observed --
+    // domains only drift by at most sim_quantum between GlobalSyncEvent
+    // barriers (design doc sections 2.5/8.2), so snapping the arrival up
+    // to the next quantum boundary guarantees `when` is never behind any
+    // domain's current tick, since no domain can be more than one
+    // (uncrossed) boundary ahead of another at any instant.
+    if (inParallelMode && curEventQueue() != em->eventQueue()) {
+        assert(simQuantum > 0);
+        when = divCeil(when, simQuantum) * simQuantum;
+    }
+
+    m_wakeup_ticks.insert(when);
     scheduleNextWakeup();
 }
 
@@ -85,16 +99,21 @@ Consumer::scheduleNextWakeup()
 void
 Consumer::processCurrentEvent()
 {
+    // m_wakeup_ticks is also touched by scheduleEventAbsolute() from
+    // cross-domain threads (under this same lock, see MessageBuffer::
+    // enqueue()); reading/erasing it here without the lock is a data race
+    // -- a foreign thread's concurrent insert can corrupt the underlying
+    // std::set out from under this read (observed as a segfault inside
+    // std::set's rbtree code, not just the assert below firing). Cover
+    // the whole method, not just wakeup(), so the erased/processed tick
+    // and the next-wakeup scheduling both see a consistent set.
+    lock();
     auto curr = m_wakeup_ticks.begin();
     assert(em->clockEdge() == *curr);
-
-    // remove the current tick from the wakeup list, wake up, and then schedule
-    // the next wakeup
     m_wakeup_ticks.erase(curr);
-    lock();
     wakeup();
-    unlock();
     scheduleNextWakeup();
+    unlock();
 }
 
 void
