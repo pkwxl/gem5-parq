@@ -68,6 +68,11 @@ SEWorkload::unserialize(CheckpointIn &cp)
 void
 SEWorkload::syscall(ThreadContext *tc)
 {
+    // Serialize all syscall emulation: with CPUs on different EventQueues
+    // (multi-threaded simulation) the handlers mutate process-wide shared
+    // state -- futex map, fd tables, memory state -- that has no
+    // per-structure synchronization (see Process::seEmulLock).
+    std::lock_guard<std::recursive_mutex> lock(Process::seEmulLock);
     tc->getProcessPtr()->syscall(tc);
 }
 

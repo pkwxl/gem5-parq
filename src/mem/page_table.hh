@@ -35,6 +35,7 @@
 #ifndef __MEM_PAGE_TABLE_HH__
 #define __MEM_PAGE_TABLE_HH__
 
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
@@ -66,6 +67,22 @@ class EmulationPageTable : public Serializable
     typedef std::unordered_map<Addr, Entry> PTable;
     typedef PTable::iterator PTableItr;
     PTable pTable;
+
+    /*
+     * In SE mode with per-CPU EventQueues (multi-threaded simulation,
+     * design doc docs/specs/parallel-eventq-lockfree-l2-design.md section
+     * 9.6), TLB-miss lookups run concurrently on every CPU's thread while
+     * syscall/fault handling (already serialized by Process::seEmulLock)
+     * mutates the table. Readers take this shared, writers exclusive.
+     * Note the Entry pointers lookup() hands out stay valid across
+     * inserts (std::unordered_map guarantees reference stability) but not
+     * across the erases in remap()/unmap() -- callers use them
+     * immediately, and munmap/mremap of a page another thread is
+     * concurrently touching would be a guest program bug to begin with.
+     */
+    mutable std::shared_mutex ptLock;
+
+    const Entry *lookupUnlocked(Addr vaddr);
 
     const Addr _pageSize;
     const Addr offsetMask;

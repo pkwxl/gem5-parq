@@ -43,6 +43,7 @@
 
 #include "arch/generic/decoder.hh"
 #include "base/compiler.hh"
+#include "base/intmath.hh"
 #include "cpu/exetrace.hh"
 #include "debug/Config.hh"
 #include "debug/Drain.hh"
@@ -216,8 +217,26 @@ TimingSimpleCPU::activateContext(ThreadID thread_num)
         _status = BaseSimpleCPU::Running;
 
     // kick things off by initiating the fetch of the next instruction
-    if (!fetchEvent.scheduled())
-        schedule(fetchEvent, clockEdge(Cycles(0)));
+    if (!fetchEvent.scheduled()) {
+        Tick when;
+        if (inParallelMode && curEventQueue() != eventQueue()) {
+            // Cross-domain activation (clone starting a thread on another
+            // CPU, futex wake): this thread's curTick -- and therefore
+            // clockEdge(), which is computed from it and also mutates this
+            // CPU's Clocked cache -- can be up to one quantum away from
+            // the target queue's time, so an activation tick derived from
+            // it can land in the target's past (observed as eventq.hh's
+            // schedule() assert; design doc section 9.6). Snap to the next
+            // quantum boundary instead: never behind any queue, and no
+            // earlier than the barrier where the target merges this
+            // cross-thread insertion anyway.
+            assert(simQuantum > 0);
+            when = divCeil(curTick() + 1, simQuantum) * simQuantum;
+        } else {
+            when = clockEdge(Cycles(0));
+        }
+        schedule(fetchEvent, when);
+    }
 
     if (std::find(activeThreads.begin(), activeThreads.end(), thread_num)
          == activeThreads.end()) {

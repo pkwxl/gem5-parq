@@ -71,21 +71,19 @@ Consumer::scheduleEvent(Cycles timeDelta)
 void
 Consumer::scheduleEventAbsolute(Tick evt_time)
 {
+    // No quantum snap on cross-domain arrivals (design doc section 9.6;
+    // an earlier version rounded them up to the next quantum boundary).
+    // The raw arrival tick is safe as long as sim_quantum never exceeds
+    // the minimum cross-domain communication latency (section 2.5's
+    // parti-gem5 argument): domains drift by at most one quantum between
+    // barriers, so an arrival at least one quantum ahead of the sender's
+    // clock can never be in the receiver's past, and lands at or after
+    // the barrier where the receiver merges its async queue. That
+    // precondition is enforced at configuration time (see the
+    // --parallel-l2-eventq block in configs/deprecated/example/se.py);
+    // snapping additionally would distort every cross-domain arrival by
+    // up to a quantum for no correctness gain.
     Tick when = divCeil(evt_time, em->clockPeriod()) * em->clockPeriod();
-
-    // Cross-domain callers (a different EventQueue's thread than the one
-    // that services `em`) must not hand this domain an arrival time that
-    // its own clock may already have passed by the time it's observed --
-    // domains only drift by at most sim_quantum between GlobalSyncEvent
-    // barriers (design doc sections 2.5/8.2), so snapping the arrival up
-    // to the next quantum boundary guarantees `when` is never behind any
-    // domain's current tick, since no domain can be more than one
-    // (uncrossed) boundary ahead of another at any instant.
-    if (inParallelMode && curEventQueue() != em->eventQueue()) {
-        assert(simQuantum > 0);
-        when = divCeil(when, simQuantum) * simQuantum;
-    }
-
     m_wakeup_ticks.insert(when);
     commitTick(when);
 }

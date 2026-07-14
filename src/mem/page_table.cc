@@ -33,6 +33,7 @@
  */
 #include "mem/page_table.hh"
 
+#include <mutex>
 #include <string>
 
 #include "base/compiler.hh"
@@ -52,6 +53,8 @@ EmulationPageTable::map(Addr vaddr, Addr paddr, int64_t size, uint64_t flags)
     assert(pageOffset(vaddr) == 0);
 
     DPRINTF(MMU, "Allocating Page: %#x-%#x\n", vaddr, vaddr + size);
+
+    std::unique_lock<std::shared_mutex> lock(ptLock);
 
     while (size > 0) {
         auto it = pTable.find(vaddr);
@@ -80,6 +83,8 @@ EmulationPageTable::remap(Addr vaddr, int64_t size, Addr new_vaddr)
     DPRINTF(MMU, "moving pages from vaddr %08p to %08p, size = %d\n", vaddr,
             new_vaddr, size);
 
+    std::unique_lock<std::shared_mutex> lock(ptLock);
+
     while (size > 0) {
         [[maybe_unused]] auto new_it = pTable.find(new_vaddr);
         auto old_it = pTable.find(vaddr);
@@ -96,6 +101,7 @@ EmulationPageTable::remap(Addr vaddr, int64_t size, Addr new_vaddr)
 void
 EmulationPageTable::getMappings(std::vector<std::pair<Addr, Addr>> *addr_maps)
 {
+    std::shared_lock<std::shared_mutex> lock(ptLock);
     for (auto &iter : pTable)
         addr_maps->push_back(std::make_pair(iter.first, iter.second.paddr));
 }
@@ -106,6 +112,8 @@ EmulationPageTable::unmap(Addr vaddr, int64_t size)
     assert(pageOffset(vaddr) == 0);
 
     DPRINTF(MMU, "Unmapping page: %#x-%#x\n", vaddr, vaddr + size);
+
+    std::unique_lock<std::shared_mutex> lock(ptLock);
 
     while (size > 0) {
         auto it = pTable.find(vaddr);
@@ -122,6 +130,8 @@ EmulationPageTable::isUnmapped(Addr vaddr, int64_t size)
     // starting address must be page aligned
     assert(pageOffset(vaddr) == 0);
 
+    std::shared_lock<std::shared_mutex> lock(ptLock);
+
     for (int64_t offset = 0; offset < size; offset += _pageSize)
         if (pTable.find(vaddr + offset) != pTable.end())
             return false;
@@ -130,7 +140,7 @@ EmulationPageTable::isUnmapped(Addr vaddr, int64_t size)
 }
 
 const EmulationPageTable::Entry *
-EmulationPageTable::lookup(Addr vaddr)
+EmulationPageTable::lookupUnlocked(Addr vaddr)
 {
     Addr page_addr = pageAlign(vaddr);
     PTableItr iter = pTable.find(page_addr);
@@ -139,10 +149,18 @@ EmulationPageTable::lookup(Addr vaddr)
     return &(iter->second);
 }
 
+const EmulationPageTable::Entry *
+EmulationPageTable::lookup(Addr vaddr)
+{
+    std::shared_lock<std::shared_mutex> lock(ptLock);
+    return lookupUnlocked(vaddr);
+}
+
 bool
 EmulationPageTable::translate(Addr vaddr, Addr &paddr)
 {
-    const Entry *entry = lookup(vaddr);
+    std::shared_lock<std::shared_mutex> lock(ptLock);
+    const Entry *entry = lookupUnlocked(vaddr);
     if (!entry) {
         DPRINTF(MMU, "Couldn't Translate: %#x\n", vaddr);
         return false;

@@ -34,6 +34,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -128,6 +129,19 @@ class Process : public SimObject
     /// Attempt to fix up a fault at vaddr by allocating a page on the stack.
     /// @return Whether the fault has been fixed.
     bool fixupFault(Addr vaddr);
+
+    /*
+     * Global SE-mode emulation lock (design doc
+     * docs/specs/parallel-eventq-lockfree-l2-design.md section 9.6).
+     * When CPUs are split across EventQueues (multi-threaded simulation),
+     * syscall emulation and fault fixup mutate state shared between all
+     * of a process's thread contexts -- the futex map, fd tables, memory
+     * state / page allocation -- with no per-structure synchronization.
+     * SEWorkload::syscall() and Process::fixupFault() serialize on this.
+     * Recursive because fault fixup can nest inside syscall handling.
+     * Uncontended in single-threaded simulation.
+     */
+    static std::recursive_mutex seEmulLock;
 
     // After getting registered with system object, tell process which
     // system-wide context id it is assigned.

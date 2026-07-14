@@ -344,6 +344,19 @@ if args.ruby:
             ]
         for router in system.ruby.network.routers:
             router.eventq_index = domain_of_router.get(router, xbar_domain)
+
+        # Each CPU joins its own L1's domain (design doc section 9.6,
+        # parti-gem5's original core+L1-per-thread shape). This makes the
+        # CPU<->sequencer edges -- both the mandatory-queue enqueue and
+        # the port-level response callback, the latter of which bypasses
+        # the Consumer lock system entirely and crashed at tick 5.08e9 in
+        # section 9.4 -- same-domain, and lifts the exact-mode quantum
+        # bound from 1 ruby cycle to the network link latency. The cost:
+        # syscall emulation and fault fixup now run concurrently across
+        # domains, serialized by Process::seEmulLock.
+        for i in range(args.num_cpus):
+            for obj in system.cpu[i].descendants():
+                obj.eventq_index = i
 else:
     MemClass = Simulation.setMemClass(args)
     system.membus = SystemXBar()
@@ -361,8 +374,28 @@ root = Root(full_system=False, system=system)
 
 if args.ruby and args.parallel_l2_eventq:
     m5.ticks.fixGlobalFrequency()
-    root.sim_quantum = m5.ticks.fromSeconds(
+    quantum = m5.ticks.fromSeconds(
         m5.util.convert.anyToLatency(args.sim_quantum)
     )
+    # Correctness precondition (design doc sections 2.5/9.6): with no
+    # quantum snap on cross-domain arrival ticks, the quantum must not
+    # exceed the minimum cross-domain communication latency. With CPUs
+    # assigned to their L1 domains, the only cross-domain edges left in
+    # this topology are the Crossbar's internal links (router <-> central
+    # xbar), whose latency is --link-latency ruby-clock cycles.
+    ruby_period = m5.ticks.fromSeconds(
+        m5.util.convert.anyToLatency(args.ruby_clock)
+    )
+    max_quantum = args.link_latency * ruby_period
+    if quantum > max_quantum:
+        fatal(
+            "--sim-quantum (%d ticks) must not exceed the minimum "
+            "cross-domain link latency (--link-latency=%d ruby cycles "
+            "= %d ticks)",
+            quantum,
+            args.link_latency,
+            max_quantum,
+        )
+    root.sim_quantum = quantum
 
 Simulation.run(args, root, system, FutureClass)

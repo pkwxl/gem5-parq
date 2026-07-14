@@ -401,9 +401,15 @@ Process::replicatePage(Addr vaddr, Addr new_paddr, ThreadContext *old_tc,
     SETranslatingPortProxy(new_tc).writeBlob(vaddr, buf_p.get(), buf_size);
 }
 
+std::recursive_mutex Process::seEmulLock;
+
 bool
 Process::fixupFault(Addr vaddr)
 {
+    // Fault fixup allocates pages and grows shared memory state; with
+    // CPUs on different EventQueues this can race syscall emulation and
+    // other CPUs' faults (see seEmulLock's declaration).
+    std::lock_guard<std::recursive_mutex> lock(seEmulLock);
     return memState->fixupFault(vaddr);
 }
 
