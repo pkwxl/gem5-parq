@@ -136,6 +136,8 @@ AddOption('--with-ubsan', action='store_true',
           help='Build with Undefined Behavior Sanitizer if available')
 AddOption('--with-asan', action='store_true',
           help='Build with Address Sanitizer if available')
+AddOption('--with-tsan', action='store_true',
+          help='Build with Thread Sanitizer if available')
 AddOption('--with-systemc-tests', action='store_true',
           help='Build systemc tests')
 AddOption('--install-hooks', action='store_true',
@@ -767,11 +769,18 @@ for variant_path in variant_paths:
                 suppressions_opts)
         warning('LSAN_OPTIONS=%s' % suppressions_opts)
         print()
+    if GetOption('with_tsan'):
+        # Thread Sanitizer cannot be combined with Address Sanitizer.
+        assert not GetOption('with_asan'), \
+            "--with-tsan is incompatible with --with-asan"
+        sanitizers.append('thread')
     if sanitizers:
         sanitizers = ','.join(sanitizers)
         if env['GCC'] or env['CLANG']:
             libsan = (
-                ['-static-libubsan', '-static-libasan']
+                ['-static-libubsan', '-static-libtsan']
+                if env['GCC'] and GetOption('with_tsan')
+                else ['-static-libubsan', '-static-libasan']
                 if env['GCC']
                 else ['-static-libsan']
             )
@@ -779,7 +788,20 @@ for variant_path in variant_paths:
                                  '-fno-omit-frame-pointer'],
                        LINKFLAGS=['-fsanitize=%s' % sanitizers] + libsan)
 
-            if main["BIN_TARGET_ARCH"] == "x86_64":
+            if GetOption('with_tsan'):
+                # A PIE binary is loaded at an ASLR-randomized address that
+                # can land inside ThreadSanitizer's fixed shadow region
+                # ("unexpected memory mapping"); with ASLR unavailable to
+                # disable in this environment, build non-PIE so the binary
+                # loads at a fixed low address TSan expects.
+                env.Append(CCFLAGS=['-fno-pie'], LINKFLAGS=['-no-pie'])
+
+            if main["BIN_TARGET_ARCH"] == "x86_64" and \
+                    not GetOption('with_tsan'):
+                # Thread Sanitizer maps its shadow at fixed high addresses;
+                # the medium code model's high-address large objects collide
+                # with it ("unexpected memory mapping"). Keep the default
+                # (small) model for TSan -- the tsan binary stays under 2GB.
                 # Sanitizers can enlarge binary size drammatically, north of
                 # 2GB.  This can prevent successful linkage due to symbol
                 # relocation outside from the 2GB region allocated by the small
