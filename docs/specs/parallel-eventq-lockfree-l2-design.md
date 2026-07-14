@@ -1612,3 +1612,64 @@ tick 基于自己的 clockEdge、跨线程 tick 已经 snap 过，都保证在 e
 窗口内没撞上 bug 二不等于 bug 二消失了——9.4 节 Q=500 的崩溃发生
 在 tick 5.08e9，本轮窗口根本没跑到那个暴露区间。端口层的修复
 （CPU 入域）是下一节的主体。
+
+### 9.6 CPU 入域（parti-gem5 原始形态）：精确模式首次跑通完整负载，
+以及撞上 SE 模式最后的大山——functional 访问
+
+实现（提交 `fd31250bf8`）：`--parallel-l2-eventq` 下每个 CPU 的
+subtree 分进它自己 L1 的域；配套四件事：①去掉 Consumer 的跨域
+quantum snap（原始到达 tick 在 Q ≤ 最小跨域延迟时本来就安全，2.5 节
+论证；该前提改为 se.py 配置期 `fatal()` 强制）；②全局递归锁
+`Process::seEmulLock` 串行化系统调用仿真和缺页修复；③
+`EmulationPageTable` 加 shared_mutex（TLB miss 查表 vs 系统调用
+改表）；④ `TimingSimpleCPU::activateContext` 跨域激活（clone/futex
+唤醒）时把 fetch tick snap 到下一个 quantum 边界——修复实测撞到的
+`eventq.hh` schedule 断言（clone3 → `Process::initState` → 对另一个
+域的 CPU 直接 `activateContext`，用调用方的歪斜时钟算激活时刻，
+tick 7.0e9 / 22.6e9 两次实锤，backtrace 完整）。
+
+**结果**：
+- 串行基线逐字节不变（31555788000，锁无竞争时零行为差异）。
+- **ll=1、Q=500（精确模式上限）完整小负载首次通过**：负载自校验
+  Success，simTicks=6389611500，vs 串行 6389611000——差恰好一个
+  ruby 周期（0.5ns / 6.4e9 tick ≈ 8×10⁻⁸ 相对偏差），且**两次运行
+  逐 tick 可复现**。接近但不完全精确；一个周期的差异来自某处跨域
+  同 tick 事件的执行顺序与串行不同（具体在哪一层未查，如实记录）。
+- ll=20、Q=10000 的 2e9 窗口通过：7.06-7.84s，vs 串行 ll=20 的
+  2.78s → **0.37x**（此前 Q=100 是 0.008x）。
+- **未解决**：ll=20 的长运行（完整小负载 27s 处、完整大负载 87s 处）
+  段错误在 `Sequencer::functionalWrite` ← `RubySystem::
+  functionalWrite` ← 缺页修复的 `VMA::fillMemPages`（文件后备页的
+  惰性装载）。
+
+**新发现的真正大山：SE 模式的 functional 访问在多域下完全未同步**。
+机制：SE 模式所有对客户机内存的 functional 访问——缺页时的文件页
+填充、`read()`/`write()` 等系统调用对客户缓冲区的拷贝、futex 对
+futex 字的读取——都走 `RubySystem::functionalRead/Write`，它会
+**遍历所有域的所有 controller 的所有 MessageBuffer、所有 sequencer
+的在途请求表、所有交换机的缓冲**（为了找到/更新一条 cache line 的
+最新副本），而这些结构正被各域自己的线程并发修改。`seEmulLock`
+只把系统调用彼此串行化，管不到"系统调用线程 vs 各域模拟线程"这个
+维度。ll=1/Q=500 能通过只是交错窗口更窄、更走运，不是安全。
+
+**候选修复方向（未实现，需要决策）**：
+1. **细粒度锁住 functional 遍历**：遍历到每个 controller 时取它的
+   `Consumer::lock()`（controller 的状态转换本来就在自己的
+   Consumer 锁内执行，天然互斥）；Sequencer 的在途请求表加一把
+   小 mutex（makeRequest/回调/functionalWrite 三方共用，热路径
+   但无竞争时开销 ~几十 ns）；网络交换机的缓冲同理用其 Consumer
+   锁。遍历者一次只持一把对象锁（持有间释放），锁序
+   seEmulLock → 单个 Consumer 锁，无环。估计 4-6 个文件、
+   60-100 行，机械但面广。
+2. **停世界（stop-the-world）**：functional 操作只在 quantum 边界
+   执行（所有域线程停在屏障时）。语义最干净、覆盖所有未知角落，
+   但 gem5 没有现成的"从任意点挂起到下一个屏障再执行回调"机制，
+   要新造，改动更深。
+3. （补充性）fillMemPages 这一特定实例还有个窄修法——新分配的物理
+   页不可能在任何 cache 里，直接写 backing store 语义等价——但它
+   救不了 read()/write()/futex 这些访问"真的可能被缓存的行"的
+   场景，只能算规避不算修复。
+
+这是 parti-gem5 选择 FS 模式的原因在我们自己的数据里的重演。方向 1
+是当前倾向（Consumer 锁体系已经存在，顺势延伸），但它是又一个
+"预期会撞到未知"的子阶段，动手前值得停一下。
