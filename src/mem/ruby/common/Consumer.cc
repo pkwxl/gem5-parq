@@ -49,14 +49,14 @@ namespace ruby
 Consumer::Consumer(ClockedObject *_em, Event::Priority ev_prio)
     : m_wakeup_event([this]{ processCurrentEvent(); },
                     "Consumer Event", false, ev_prio),
-      em(_em)
+      em(_em), m_ev_prio(ev_prio)
 { }
 
 void
 Consumer::scheduleEvent(Cycles timeDelta)
 {
     m_wakeup_ticks.insert(em->clockEdge(timeDelta));
-    scheduleNextWakeup();
+    ensureScheduled();
 }
 
 void
@@ -78,15 +78,20 @@ Consumer::scheduleEventAbsolute(Tick evt_time)
     }
 
     m_wakeup_ticks.insert(when);
-    scheduleNextWakeup();
+    ensureScheduled();
 }
 
 void
-Consumer::scheduleNextWakeup()
+Consumer::ensureScheduled()
 {
-    // Always called under lock() (see MessageBuffer::enqueue() and
-    // processCurrentEvent() below), so m_wakeup_scheduled/
-    // m_wakeup_scheduled_when are race-free here.
+    // Always called under lock() (see MessageBuffer::enqueue() and the
+    // fire paths below), so all the scheduling state here is race-free.
+    //
+    // Invariant (design doc section 8.8): the earliest pending wakeup
+    // tick always has a fire committed at exactly that tick in
+    // m_inflight_ticks; later ticks are re-covered chain-style after
+    // each fire, so every tick is consumed exactly once, at its own
+    // time.
 
     // look for the next tick in the future to schedule
     auto it = m_wakeup_ticks.lower_bound(em->clockEdge());
@@ -96,21 +101,60 @@ Consumer::scheduleNextWakeup()
     Tick when = *it;
     assert(when >= em->clockEdge());
 
-    if (m_wakeup_scheduled) {
-        if (when < m_wakeup_scheduled_when) {
-            // Only em's own owning thread may call reschedule()
-            // (eventq.hh's assert enforces this); see design doc section
-            // 8.7 for the known-unresolved case of two cross-domain
-            // threads racing to move this earlier.
-            em->reschedule(m_wakeup_event, when, true);
-            m_wakeup_scheduled_when = when;
-        }
-        return;
+    if (!m_inflight_ticks.empty()) {
+        // Every committed fire targets a pending tick, so none can be
+        // earlier than the earliest pending one.
+        assert(*m_inflight_ticks.begin() >= when);
+        if (*m_inflight_ticks.begin() == when)
+            return;
     }
 
-    em->schedule(m_wakeup_event, when);
-    m_wakeup_scheduled = true;
-    m_wakeup_scheduled_when = when;
+    bool owning = !inParallelMode || curEventQueue() == em->eventQueue();
+
+    if (m_wakeup_scheduled && owning && !m_wakeup_async_pending) {
+        // The only case where reschedule() is legal: we are em's owning
+        // thread AND the in-flight schedule was made locally, so the
+        // event is in em's main queue (an async-pending event may still
+        // be in the async queue, where reschedule()'s remove() would
+        // panic "event not found").
+        em->reschedule(m_wakeup_event, when, true);
+        m_inflight_ticks.erase(m_wakeup_when);
+        m_inflight_ticks.insert(when);
+        m_wakeup_when = when;
+    } else if (!m_wakeup_scheduled) {
+        // schedule() is legal from any thread -- a cross-domain caller
+        // is routed through asyncInsert() and merged at the next quantum
+        // boundary, which the arrival-tick quantum snap guarantees is
+        // still ahead of `when`.
+        em->schedule(m_wakeup_event, when);
+        m_wakeup_scheduled = true;
+        m_wakeup_when = when;
+        m_wakeup_async_pending = !owning;
+        m_inflight_ticks.insert(when);
+    } else {
+        // The main event is in flight but untouchable (we are a foreign
+        // thread, or its schedule is async-pending): commit the earlier
+        // fire with a one-shot self-deleting kick instead. Unreachable
+        // in serial mode, where `owning` is always true and
+        // m_wakeup_async_pending always false.
+        auto *kick = new EventFunctionWrapper(
+            [this]{ processKick(); }, "Consumer kick",
+            true /* AutoDelete */, m_ev_prio);
+        em->schedule(kick, when);
+        m_inflight_ticks.insert(when);
+    }
+}
+
+void
+Consumer::consumeCurrentTick()
+{
+    // Caller (a fire path below) holds lock() and has already removed
+    // this fire's commitment from m_inflight_ticks.
+    auto curr = m_wakeup_ticks.begin();
+    assert(em->clockEdge() == *curr);
+    m_wakeup_ticks.erase(curr);
+    wakeup();
+    ensureScheduled();
 }
 
 void
@@ -121,23 +165,33 @@ Consumer::processCurrentEvent()
     // enqueue()); reading/erasing it here without the lock is a data race
     // -- a foreign thread's concurrent insert can corrupt the underlying
     // std::set out from under this read (observed as a segfault inside
-    // std::set's rbtree code, not just the assert below firing). Cover
-    // the whole method, not just wakeup(), so the erased/processed tick
-    // and the next-wakeup scheduling both see a consistent set.
+    // std::set's rbtree code, not just the assert in consumeCurrentTick()
+    // firing). Cover the whole method, not just wakeup(), so the
+    // erased/processed tick and the next-wakeup scheduling both see a
+    // consistent set.
     lock();
     // This in-flight dispatch has now actually fired -- clear before
-    // touching m_wakeup_ticks so a concurrent scheduleNextWakeup() (which
+    // touching m_wakeup_ticks so a concurrent ensureScheduled() (which
     // can only run once it acquires this same lock) never observes a
     // stale "still in flight" state (design doc section 8.7; this
     // replaces relying on m_wakeup_event.scheduled(), which
     // EventQueue::serviceOne() clears before this method -- and thus
     // lock() -- is even reached).
     m_wakeup_scheduled = false;
-    auto curr = m_wakeup_ticks.begin();
-    assert(em->clockEdge() == *curr);
-    m_wakeup_ticks.erase(curr);
-    wakeup();
-    scheduleNextWakeup();
+    m_wakeup_async_pending = false;
+    [[maybe_unused]] auto erased = m_inflight_ticks.erase(em->clockEdge());
+    assert(erased == 1);
+    consumeCurrentTick();
+    unlock();
+}
+
+void
+Consumer::processKick()
+{
+    lock();
+    [[maybe_unused]] auto erased = m_inflight_ticks.erase(em->clockEdge());
+    assert(erased == 1);
+    consumeCurrentTick();
     unlock();
 }
 

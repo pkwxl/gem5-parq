@@ -114,27 +114,40 @@ class Consumer
     ClockedObject *em;
 
     /*
-     * Whether a wakeup dispatch for `em` is currently in flight, and if so,
-     * for which tick (design doc section 8.7). Deliberately not derived
-     * from m_wakeup_event.scheduled(): that core Event flag is cleared by
-     * EventQueue::serviceOne() before the callback (and thus before
-     * lock()) runs, so a cross-domain thread holding this lock can observe
-     * an honest-but-stale "not scheduled" reading in the window between
-     * serviceOne()'s dequeue and processCurrentEvent() actually acquiring
-     * the lock, and double-schedule the same Event object. These two
-     * fields are only ever touched while holding m_wakeup_mutex, so they
-     * carry a real happens-before relationship that m_wakeup_event's own
-     * flag does not.
+     * Consumer-owned scheduling state (design doc sections 8.7/8.8),
+     * only ever touched while holding m_wakeup_mutex. Deliberately not
+     * derived from m_wakeup_event.scheduled(): that core Event flag is
+     * cleared by EventQueue::serviceOne() before the callback (and thus
+     * before lock()) runs, so a cross-domain thread holding this lock can
+     * observe an honest-but-stale "not scheduled" reading in the window
+     * between serviceOne()'s dequeue and processCurrentEvent() actually
+     * acquiring the lock, and double-schedule the same Event object.
+     *
+     * m_wakeup_async_pending records that m_wakeup_event's current
+     * schedule came from a cross-domain thread (via asyncInsert()), in
+     * which case the event may still be sitting in em's async queue --
+     * reschedule()'s internal remove() only searches the main queue and
+     * would panic -- so it must not be rescheduled by anyone until it
+     * fires. m_inflight_ticks holds every tick at which some event (the
+     * main wakeup event or a one-shot kick) is committed to fire; the
+     * invariant is that the earliest pending wakeup tick always has a
+     * fire committed at exactly that tick, later ticks being re-covered
+     * chain-style after each fire.
      */
     bool m_wakeup_scheduled = false;
-    Tick m_wakeup_scheduled_when = 0;
+    Tick m_wakeup_when = 0;
+    bool m_wakeup_async_pending = false;
+    std::set<Tick> m_inflight_ticks;
+    Event::Priority m_ev_prio;
 
     UncontendedMutex m_wakeup_mutex;
     std::thread::id m_wakeup_mutex_owner;
     unsigned m_wakeup_mutex_depth = 0;
 
-    void scheduleNextWakeup();
+    void ensureScheduled();
+    void consumeCurrentTick();
     void processCurrentEvent();
+    void processKick();
 };
 
 
