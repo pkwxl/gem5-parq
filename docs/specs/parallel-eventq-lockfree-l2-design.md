@@ -987,3 +987,108 @@ lock-free 环形缓冲区，单个 `std::atomic<unsigned>::fetch_add` 记录
 先在这次测试拓扑上数一遍，不能拍脑袋）。诊断代码（环形缓冲区）已经
 移除，不留在树上；上面的日志片段是从一次实际运行里摘录、手工裁剪的
 证据。
+
+### 8.6 选了方向 (a) 之后：崩溃仍然存在，而且是一个更深层的、
+`Consumer::lock()` 本身治不了的问题
+
+选了 8.5 节的方向 (a)：`MessageBuffer::enqueue()` 去掉同域快速路径，
+无论同域跨域一律 `Consumer::lock()`。改完重新编译，A 节基线命令
+`simTicks` 依然是 `31555788000`（没有影响现有行为）。重新跑
+`--parallel-l2-eventq --sim-quantum=0.1ns` 复现命令——**还是崩在同一个
+`assert(em->clockEdge() == *curr)`**，只是撑得比改动前更久（改动前
+最早在 tick ~1.06 亿量级崩，改动后有一次撑到了 tick 163405000）。
+这说明方向 (a) 确实修掉了一部分真实的竞态（不是没用），但没有修完。
+
+用和 8.5 节同款的 lock-free 环形缓冲区诊断（这次额外加了两样东西：
+①在 `scheduleNextWakeup()` 里无条件记录一条 `C`（check）事件，把
+`m_wakeup_event.scheduled()` 的原始读数直接打出来，不再从"走了哪个
+分支"里反推；②在 `em->schedule()` 调用**之后**立刻补一条 `s`（同一个
+临界区内的复查），确认那次调用是否真的把 `Scheduled` 位置上了；
+③给 `Consumer::unlock()` 也加了一条 `u` 记录，这样能看清楚每次加锁/
+解锁的精确边界）抓到了下面这段完整的因果链（`D` 是跨域发送方线程，
+`B` 是这个 `Consumer` 归属域自己的线程；序号是全局单调的，可以当成
+真实的时间顺序）：
+
+```
+1649410 D  l                                     // D 第一次加锁（新申请，非重入）
+1649411 D  X  tick=168452000                     // D 跨域插入 168452000
+1649412 D  C  tick=168452000            sched=0  // 检查：未调度
+1649413 D  S  tick=168452000            sched=0  // 调用 em->schedule()
+1649414 D  s  tick=168452000 aux=168452000 sched=1  // 调用后立刻复查：确认已经是"已调度"
+1649415 D  u                                     // D 解锁，第一次 enqueue() 结束
+1649423 D  l                                     // D 第二次加锁（新申请，同一个线程 D）
+1649424 D  X  tick=168452500                     // D 跨域插入另一条消息 168452500
+1649425 D  C  tick=168452000            sched=0  // 检查：又读到"未调度"！！
+1649426 D  S  tick=168452000            sched=0  // 于是又调用了一次 em->schedule()
+1649427 D  s  tick=168452000 aux=168452000 sched=1
+1649428 D  u
+1649430 B  l
+1649431 B  B  tick=168452000                     // B 第一次正常触发、处理 168452000
+1649432 B  E  tick=168452000
+1649439 B  C  tick=168452500 aux=168452000 sched=1  // scheduleNextWakeup：发现还"已调度"
+1649440 B  N  tick=168452500 aux=168452000 sched=1  // （这是 D 第二次 schedule() 的残留）
+1649441 B  u
+1649442 B  l
+1649443 B  B  tick=168452000                     // m_wakeup_event 对同一个 tick 又触发一次！
+1649444 B  !  clockEdge=168452000 vs earliest=168452500   // 断言失败
+```
+
+关键点：`1649414` 和 `1649425` 之间，**从头到尾没有任何其它线程碰过
+这个 consumer**（过滤后的日志里两条记录直接相邻）——`D` 自己在
+`1649414` 用一次立即复查确认了 `m_wakeup_event.scheduled()==true`，
+紧接着（同一个线程，程序顺序上必然在后面执行）在 `1649425` 却读到
+`false`。对同一个线程而言，这不可能是"读到过期缓存值"（单线程程序
+顺序内自己写的东西自己必然能看见，这是 C++ 内存模型的基本保证），
+所以这次是**这个标志位真的、确实地被清除了**——而清除它的，只能是
+`src/sim/eventq.cc:229` 的 `event->flags.clear(Event::Scheduled)`，
+这行代码在 `EventQueue::serviceOne()` 里，**发生在真正调用
+`event->process()`（也就是我们的 `processCurrentEvent()` 回调，从而
+才会走到 `Consumer::lock()`）之前**。也就是说：
+
+**`B` 的 `serviceOne()` 已经把 `m_wakeup_event` 从队列里取出、把
+`Scheduled` 位清掉了，但 `B` 还没来得及真正调用
+`processCurrentEvent()` 去拿 `Consumer::lock()`（可能正好被 `D` 当时
+还没释放的锁挡住，也可能只是两次操作之间线程调度的间隙）——这个
+"标志已清、但对应的 `m_wakeup_ticks`/锁保护的状态还没来得及更新"
+的窗口，`Consumer::lock()` 完全保护不到，因为这次清除标志位的代码
+根本不属于 `Consumer` 自己，是 gem5 通用事件队列机制
+（`EventQueue::serviceOne()`）里的一行、在拿到我们的锁*之前*就执行
+了。** `D` 在这个窗口里拿着（对它自己而言完全合法持有的）
+`Consumer::lock()`，看到的 `m_wakeup_event.scheduled()==false` 是
+*真实、当下正确*的读数，不是竞态造成的脏读——但这个"真实"本身具有
+误导性：`B` 马上就要真正处理这次 wakeup 了，`D` 却因为看到"未调度"
+而对同一个 Event 对象又调用了一次 `em->schedule()`，把它第二次塞进
+`em` 的 `async_queue`（跨域调用走 `asyncInsert()`，`eventq.hh:772-773`
+）。等 `handleAsyncInsertions()` 把 `async_queue` 里的两份都 drain
+进主队列时，同一个 `Event` 对象被插入了两次，于是它对同一个（已经
+被 `B` 正常处理过一次的）tick 又触发了一次——这正是
+`1649442-1649444` 观察到的现象。
+
+**结论：8.5 节的"去掉同域快速路径"（方向 a）确实修掉了一种真实的
+竞态（不同域发送方和本域"自己发给自己"之间缺 happens-before），但
+`Consumer::lock()` 这一层的设计本身有一个更根本的问题**——它试图用
+`m_wakeup_event.scheduled()`（gem5 核心 `Event` 对象自己的标志位）
+来判断"要不要发起新的调度"，但这个标志位的*清除*时机（`serviceOne()`
+在真正调用回调之前）完全不受 `Consumer::lock()` 管辖，是 gem5 通用
+事件机制自己的时序，不是 `Consumer`/`MessageBuffer` 这一层能通过
+"更早、更全地加锁"来控制的——不管把 `Consumer::lock()` 的覆盖范围
+扩到多大，只要判断依据仍然是 `m_wakeup_event.scheduled()`，就永远
+可能在"标志已清、`m_wakeup_ticks` 还没被这次触发对应的
+`processCurrentEvent()` 调用更新"这个窗口里被跨域线程看到一个
+"诚实但过时"的读数。
+
+**候选修复方向**（都还没实现，需要先讨论/决定）：不要用
+`m_wakeup_event.scheduled()` 判断"是否需要发起新调度"，改成
+`Consumer` 自己维护一个只在 `Consumer::lock()` 保护下读写的状态
+（比如一个 `bool`，标记"当前是否已经有一次对 `em` 的调度请求在途"）
+——`processCurrentEvent()` 拿到锁之后才把它清掉（而不是依赖
+`serviceOne()` 在拿锁*之前*就清掉的 `Event::Scheduled`），这样这个
+状态的每一次变化都严格发生在同一把锁的保护范围内，不再依赖 gem5
+核心事件机制自己的、不受这把锁管辖的标志位时序。这比 8.5 节的修复
+改动更深——要动 `Consumer` 的核心调度状态机，不只是
+`MessageBuffer::enqueue()` 的加锁范围，值得先讨论清楚再动手，尤其是
+要重新论证这样改会不会影响 `reschedule()`（"发现有更早的 tick，要把
+已经排队的 wakeup 提前"）这条路径的正确性。诊断代码（环形缓冲区，
+这次带 `s`/`u`/无条件 `C` 记录的第三版）已经移除，不留在树上；
+`Consumer.cc` 当前树上状态与上一次提交（`cc36b250a2`）完全一致，
+`MessageBuffer.cc` 的同域快速路径移除（8.5 节方向 a）还没有提交。
