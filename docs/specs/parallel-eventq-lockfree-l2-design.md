@@ -1748,3 +1748,74 @@ MemState——候选方向（尚未决策）至少有：把线程栈/mmap 生命
 functional 加锁在真实并行运行下既未改变时序、也未在跨域 walk 上
 造成死锁（walk 全程只持叶子/短锁，屏障处不持 controller 锁，
 持锁者要么在跑要么在屏障且不持锁，恒能推进）。
+
+### 9.8 用 sanitizer 定位 mmap 墙：不是时序发散，是两个真实的跨域
+数据竞争/UAF——修掉后 mmap 墙消除，露出下一层线程退出竞争
+
+9.7 结尾把 mmap 墙猜成"客户机行为随时序发散"。这个诊断**错了**，
+用 sanitizer 一测就翻案（如实更正记录）。
+
+**先确认不是"发散"而是内存破坏**：给 `MemState::mapRegion` 的
+`assert(isUnmapped)` 换成打印重叠 VMA 的 panic + 追踪 mmap/munmap，
+重跑发现崩溃点其实先炸在页表 `Trie: Inconsistent parent/kid`
+（`base/trie.hh:331`）并伴随 glibc `malloc(): unaligned tcache chunk`
+——**堆已经被破坏**。mapRegion 断言和 Trie panic 只是同一处堆破坏
+的两个先后触发的探针，两次重跑还崩在同一 tick（8466898500）。
+
+**TSan 在本沙盒不可用**：ThreadSanitizer 需要固定 shadow 布局，
+撞上 PIE+ASLR（"unexpected memory mapping"）。本沙盒关不掉 ASLR
+（`randomize_va_space` 只读、`setarch -R`/`personality` 被 seccomp
+挡住，连 sudo 也不行），非 PIE 重建也救不了共享库的高位随机映射。
+改用 **AddressSanitizer**（ASLR 兼容，且症状本来就是堆破坏，正对
+ASan 口径）。为此给构建系统加了 `--with-tsan`（附带成果，TSan 在别的
+环境能用）和 ASan 的常规路径；ASan 的 X86_ASAN 用单独 build_opts。
+
+**ASan 直接锤出两个真 bug**：
+1. **`FutexMap::wakeup` 的 use-after-free**（`futex_map.cc:75`，
+   **串行模式也复现**，是个和并行无关的既存 gem5 bug）：
+   `auto& tc = waiterList.front().tc;` 绑的是 front 结点内 `.tc`
+   字段的引用，`pop_front()` 释放该结点后 `waitingTcs.erase(tc)`
+   仍读它——UAF。串行下释放的结点还没被复用所以侥幸不炸；并行下
+   另一线程的分配可能在 free 和 erase 之间回收这 32 字节结点，读到
+   垃圾指针。修法：pop 前把指针**按值拷贝**（`auto *tc = …`）。
+2. **X86 TLB 的跨域数据竞争**（mmap 墙的真正根因）：
+   `MemState::unmapRegion`/`remapRegion`（`mem_state.cc:268/364`）里
+   ```
+   for (auto *tc: _ownerProcess->system->threads)
+       tc->getMMUPtr()->flushAll();
+   ```
+   一个域线程上的 munmap/mremap 会伸手 flush **每一个** CPU 的 TLB，
+   而 `X86ISA::TLB::flushAll()` 改的是该 TLB 的 `trie`/`freeList`/
+   `tlb[]`——与此同时那些 CPU 各自的域线程正在自己的 TLB 上
+   lookup/insert。`seEmulLock` 只把 munmap 彼此串行，管不到"munmap
+   线程 vs 各 CPU 自己的翻译线程"。ASan 报的正是 flushAll 里
+   `freeList` 的 **double-free**（同一 `&tlb[i]` 被 push 两次）＋
+   Trie 撕裂，这才是 Trie/tcache/mapRegion 一连串堆破坏的源头。
+   修法（按用户选定的"锁住该结构再复验"）：给 X86 TLB 加一把
+   `UncontendedMutex tlbLock`，在 `lookup`/`insert`/`flushAll`/
+   `flushNonGlobal`/`demapPage` 里持有（`evictLRU` 在 `insert` 锁内、
+   不再单独加锁）。叶子锁，锁序 `seEmulLock → tlbLock`（munmap 侧）
+   与 owner 侧单独持 `tlbLock`，无环。
+
+**复验结果**：两处都修掉后，并行 ll=20 完整小负载在 ASan 下**不再有
+任何堆破坏**（无 Trie、无 double-free、无 tcache、无 mapRegion 断言），
+**mmap 墙消除**，且比之前多跑到 tick 8502397000。
+
+**露出的下一层墙（性质更干净，属线程退出的跨域事件调度）**：ASan 干净
+之后撞上 `eventq.hh:794` 的 `deschedule(): !inParallelMode ||
+this == curEventQueue()` 断言。backtrace：`exit_group`/`tgkill` →
+`BaseSimpleCPU::haltContext` → `TimingSimpleCPU::suspendContext`
+（`timing.cc:272-273` `deschedule(fetchEvent)`）。即一个线程执行
+`exit_group` 时要停掉**所有**线程的上下文，伸手去 deschedule 别的域
+CPU 的 fetchEvent——正是 9.6 对 `activateContext`（跨域 **schedule**）
+和 8.8 对跨域 **reschedule** 处理过的同一族问题的第三个实例（这次是
+跨域 **deschedule**，发生在线程退出路径）。这也说明用户最初"规整线程
+生命周期"的直觉方向没错，只是先被上面两个堆破坏 bug 挡着看不到。修法
+同族：跨域 suspend/halt 时把 deschedule 路由到目标域自己的队列（或用
+8.8 那套 kick 机制），尚未实现。
+
+**待办的正常构建回归**：futex + TLB 两处修改需在非 ASan 的
+`build/X86/gem5.opt` 上复验串行基线 simTicks 逐字节不变（TLB 锁必须
+时序中性），再提交。TLB 的 `lookup` 在热路径，加锁的单线程开销尚未
+测量——按项目一贯做法先保正确性、开销如实另测；更省开销的替代是把
+跨域 flush 路由到 owner 域（免热路径锁），列为后续可选优化。
