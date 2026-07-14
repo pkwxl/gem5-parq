@@ -44,6 +44,7 @@
 #include "arch/generic/tlb.hh"
 #include "arch/x86/pagetable.hh"
 #include "base/trie.hh"
+#include "base/uncontended_mutex.hh"
 #include "mem/request.hh"
 #include "params/X86TLB.hh"
 #include "sim/stats.hh"
@@ -106,6 +107,17 @@ namespace X86ISA
 
         TlbEntryTrie trie;
         uint64_t lruSeq;
+
+        /**
+         * Serializes access to tlb/freeList/trie. Normally this TLB is only
+         * touched by its own CPU's thread, but with a parallel EventQueue a
+         * munmap/mremap on another domain reaches in via
+         * MemState::unmapRegion -> BaseMMU::flushAll -> TLB::flushAll while
+         * this CPU's thread concurrently looks up / inserts entries. Held as
+         * a leaf lock by every method that mutates or reads those structures.
+         * See docs/specs/parallel-eventq-lockfree-l2-design.md section 9.8.
+         */
+        UncontendedMutex tlbLock;
 
         AddrRange m5opRange;
 

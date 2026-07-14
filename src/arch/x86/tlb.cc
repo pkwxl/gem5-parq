@@ -39,6 +39,7 @@
 
 #include <cstring>
 #include <memory>
+#include <mutex>
 
 #include "arch/x86/faults.hh"
 #include "arch/x86/insts/microldstop.hh"
@@ -105,6 +106,10 @@ TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid)
     //virtual addresses
     vpn = concAddrPcid(vpn, pcid);
 
+    // Leaf lock vs a cross-domain flushAll() (see tlbLock in tlb.hh).
+    // evictLRU() runs under this lock; it must not re-acquire it.
+    std::lock_guard<UncontendedMutex> tlb_lock(tlbLock);
+
     // If somebody beat us to it, just use that existing entry.
     TlbEntry *newEntry = trie.lookup(vpn);
     if (newEntry) {
@@ -135,6 +140,7 @@ TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid)
 TlbEntry *
 TLB::lookup(Addr va, bool update_lru)
 {
+    std::lock_guard<UncontendedMutex> tlb_lock(tlbLock);
     TlbEntry *entry = trie.lookup(va);
     if (entry && update_lru)
         entry->lruSeq = nextSeq();
@@ -144,6 +150,7 @@ TLB::lookup(Addr va, bool update_lru)
 void
 TLB::flushAll()
 {
+    std::lock_guard<UncontendedMutex> tlb_lock(tlbLock);
     DPRINTF(TLB, "Invalidating all entries.\n");
     for (unsigned i = 0; i < size; i++) {
         if (tlb[i].trieHandle) {
@@ -163,6 +170,7 @@ TLB::setConfigAddress(uint32_t addr)
 void
 TLB::flushNonGlobal()
 {
+    std::lock_guard<UncontendedMutex> tlb_lock(tlbLock);
     DPRINTF(TLB, "Invalidating all non global entries.\n");
     for (unsigned i = 0; i < size; i++) {
         if (tlb[i].trieHandle && !tlb[i].global) {
@@ -176,6 +184,7 @@ TLB::flushNonGlobal()
 void
 TLB::demapPage(Addr va, uint64_t asn)
 {
+    std::lock_guard<UncontendedMutex> tlb_lock(tlbLock);
     TlbEntry *entry = trie.lookup(va);
     if (entry) {
         trie.remove(entry->trieHandle);
