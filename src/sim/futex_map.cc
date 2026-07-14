@@ -72,7 +72,12 @@ FutexMap::wakeup(Addr addr, uint64_t tgid, int count)
         // memory addresses outside of syscalls, so we
         // must only count threads that were actually
         // woken up by this syscall.
-        auto& tc = waiterList.front().tc;
+        // Copy the pointer by value: binding a reference into the front
+        // WaiterState and using it after pop_front() frees that node is a
+        // use-after-free (benign in serial where the freed node is still
+        // intact, but under a parallel EventQueue another thread's
+        // allocation can recycle the node between the free and the erase).
+        auto *tc = waiterList.front().tc;
         tc->activate();
         woken_up++;
         waiterList.pop_front();
