@@ -701,3 +701,111 @@ void Throttle_L2_to_L1_i::wakeup() {
 `Switch.hh`/`.cc`、`configs/ruby/Network.py`/`SimpleNetwork.py`
 这一层的拓扑创建代码），本节先记录 per-consumer 锁这一半的完成
 状态，Throttle 改动留到下一次会话专门做。
+
+## 8. gem5 史上第一次多线程 Ruby 实测（方案二）：两次真实崩溃
+
+按 6.3 节"方案二"（复用 `Crossbar.py` 不改代码，只给共享 xbar
+router 单独分配一个 `eventq_index`）在
+`configs/deprecated/example/se.py` 里加了一段实验性代码（新增
+`--parallel-l2-eventq`/`--sim-quantum` 两个选项，gated，默认关闭，
+不影响任何现有行为——关闭状态下跑 A 节基线命令，`simTicks` 仍然是
+`31555788000`，和 7.2 节的验证结果一致）。域划分用的是 6.3 节的方案：
+`l1_cntrl0..3` 各一个域（0..3）、`l2_cntrl0`+`dir_cntrl0`+
+`system.mem_ctrls` 共享一个域（4）、`network.ext_links` 覆盖不到的
+router（也就是共享 xbar）单独给一个域（5）。分配方式对每个域的
+controller 用 `descendants()` 显式设置每个后代对象的 `eventq_index`
+（不依赖 `Parent` proxy 沿 SimObject 树自动传播——参考
+`configs/example/arm/fs_bigLITTLE.py` 里 KVM 多 `eventq_index` 场景
+同样是对 `cpu.descendants()` 显式赋值，不依赖隐式传播，这次跟随
+同一个已验证过的模式）。
+
+打开 `--parallel-l2-eventq` 实际跑起来，**在真正跑通之前连续遇到了
+两次崩溃**，都如实记录在这里（不是"順利跑通"）：
+
+### 8.1 崩溃一：`sim_quantum` 设置方向想反了
+
+第一次尝试用 `--sim-quantum=10us`（模仿 `fs_bigLITTLE.py` 里 KVM
+异构核场景的默认值 1ms 量级），几乎立刻在 `tick 2000` 就触发
+`src/sim/eventq.hh:759` 的 `assert(when >= getCurTick())`——某个域
+把跨域消息往另一个域调度时，目标域的本地 `curTick_` 已经跑到了
+比这条消息的到达时间还晚的地方。
+
+**根因，回头看其实 2.5 节已经写明白了，只是没有对上号**：gem5 的
+`GlobalSyncEvent`/`sim_quantum` 屏障机制只保证"任意两个域之间的时钟
+漂移不超过一个 quantum"，不保证"漂移为零"——两次全局屏障之间，各个
+域按各自的 wall-clock 速度独立跑，跑得快的域可能几乎跑满整个
+quantum 窗口后才等到跑得慢的域追上来。要让跨域调度的 `when`
+（通常是"本地当前 tick + link_latency"这个量级）不落在目标域已经
+跑过去的时间点之前，**唯一的保证方式是 `sim_quantum <= 最小跨域
+消息延迟（这里是 Throttle 的 `link_latency`，默认 1 个 ruby 时钟
+周期 = 2GHz 下 500 ticks）`**——这正是 2.5 节"quantum 取得比共享
+cache 命中延迟略小"这条经验规则的数学来源，只是当时读的时候没有
+反应过来这是个方向性约束（quantum 要比延迟小，不是比延迟大），
+第一次选 10us（1e7 ticks）完全选反了量级。改成 `--sim-quantum=0.1ns`
+（100 ticks，比 500-tick 的 link_latency 小）后这个特定崩溃消失，
+仿真真正往前推进到了 `tick 107508500`。
+
+### 8.2 崩溃二：`Consumer::processCurrentEvent()` 的一个未被注意到的
+隐藏假设，在跨域场景下不成立
+
+修完 8.1 后新崩溃：`src/mem/ruby/common/Consumer.cc:89`
+`assert(em->clockEdge() == *curr)` 失败。查了代码，这是一个**真实的、
+之前没写代码时就该想到但没想到的数据竞争/时序假设错误**，不是环境
+问题：
+
+- `Consumer::processCurrentEvent()`（`Consumer.cc:86-98`）开头直接
+  `m_wakeup_ticks.begin()`/`m_wakeup_ticks.erase(curr)`，**完全没有
+  加锁**——只在中间调用 `wakeup()` 本体那一段才 `lock()`/`unlock()`。
+- 而 `MessageBuffer::enqueue()`（7.1 节新增的逻辑）里
+  `m_consumer->scheduleEventAbsolute(arrival_time)`（往
+  `m_wakeup_ticks` 里插入新的到达时间）**是在 `consumer_lock` 的
+  保护范围内**调用的（`MessageBuffer.cc:239-241,320`，跨域时才真正
+  加锁）。
+- 问题：`processCurrentEvent()` 读/删 `m_wakeup_ticks` 这一步*没有*
+  拿同一把锁。当它在本地域线程上因为一个更早调度好的 wakeup 事件被
+  触发而执行到这里时，另一个域的线程完全可能*在同一时刻*正通过
+  `enqueue()`（持锁）往这同一个 `m_wakeup_ticks` 里插入一个新的、
+  时间上更早的到达时间——因为跨域消息的时序本来就是放宽过的
+  （2.5 节），"稍后插入的条目时间上反而更早"这件事在这个设计里是
+  被允许发生的常规情况，不是异常。`processCurrentEvent()` 里
+  `assert(em->clockEdge() == *curr)` 这行代码隐含的假设是"当前要
+  处理的这个 wakeup，一定对应 `m_wakeup_ticks` 里最早的那个 tick，
+  而且没有别的线程会在我处理的同时改这个 set"——这个假设在单
+  `EventQueue`（没有其它线程能碰这个 Consumer）场景下自动成立，
+  但在真正的跨域场景下不成立，而且完全没有代码保护它。
+
+**这不只是"加个锁"就能修的表面问题**：即使给
+`processCurrentEvent()` 开头的读/删也套上 `lock()`/`unlock()`，
+逻辑上还是可能出现"本地线程正准备处理 tick=107508500 的 wakeup，
+外部线程恰好在这一刻插入了一个 tick=107508000（更早）的到达时间"——
+加锁只能防止数据结构本身被同时读写破坏（内存安全），不能防止
+"更早的 tick 在逻辑上已经来不及排进当前正在处理的这一次 wakeup"
+这个时序倒挂本身。真正的修复大概率需要 2.5 节已经点出但我们还没
+实现的机制：**跨域调度的到达时间要被动地对齐（不是自然计算出来的
+`current_time + delta`，而是主动向上取整）到"下一个 quantum 边界"**
+——如果所有跨域消息的目标 tick 都精确落在 quantum 边界上，而
+`GlobalSyncEvent` 的屏障机制保证边界时刻两侧的域都已经真正同步
+（`handleAsyncInsertions()` 就是在越过屏障那一刻做的，
+`global_event.cc:154`），"插入一个比当前已处理进度更早的 tick"这个
+情况就不会再发生——但这个"跨域到达时间取整到 quantum 边界"的逻辑
+目前完全没有写，只存在于论文描述和 2.5 节的转述里。
+
+### 8.3 当前状态和下一步
+
+- 崩溃一已解决（配置层面：`sim_quantum` 要设得比 `link_latency`
+  小，不是大）。
+- 崩溃二**未解决**，且不是配置问题，是 7.1 节的 per-consumer 锁
+  实现里一个真实的遗漏（`processCurrentEvent()` 对 `m_wakeup_ticks`
+  的访问没上锁，且即使上锁也不足以解决时序倒挂）。这是 gem5 第一次
+  真正跑多线程 Ruby 触发出来的、设计阶段没有预见到的具体问题，
+  如实记录，不打算掩盖或简化描述。
+- 下一步可选方向（都还没做，留到下次会话决定）：(a) 实现"跨域到达
+  时间对齐到 quantum 边界"这个 8.2 节分析指向的根本修复；(b) 或者
+  先给 `processCurrentEvent()` 也加锁，把断言从"必须是最早"放宽成
+  "重新取当前最早的 tick 再处理，不假设是最初触发这次 wakeup 时的
+  那个 tick"，作为更小范围的修补，但需要重新论证这样改是否还能保证
+  `wakeup()` 语义正确（尤其是 SLICC 生成代码里对"这次 wakeup 对应
+  哪个 tick"的隐含假设有没有依赖）。
+- 实验用的 se.py 改动（`--parallel-l2-eventq`/`--sim-quantum`）保留
+  在树上，默认关闭、不影响现有行为，方便下次会话直接复现这两次崩溃
+  而不用重新写配置代码。
