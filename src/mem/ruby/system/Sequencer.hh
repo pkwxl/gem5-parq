@@ -45,6 +45,7 @@
 #include <list>
 #include <unordered_map>
 
+#include "base/uncontended_mutex.hh"
 #include "cpu/testers/rubytest/RubyTester.hh"
 #include "mem/ruby/common/Address.hh"
 #include "mem/ruby/protocol/MachineType.hh"
@@ -242,6 +243,15 @@ class Sequencer : public RubyPort
   protected:
     // RequestTable contains both read and write requests, handles aliasing
     std::unordered_map<Addr, std::list<SequencerRequest>> m_RequestTable;
+    // Guards structural mutation/iteration of m_RequestTable against a
+    // concurrent functional walk (RubySystem::functionalWrite ->
+    // Sequencer::functionalWrite) running on the SE-mode syscall thread while
+    // this sequencer's own domain thread inserts/erases entries. Used as a
+    // strict leaf lock: only ever held around the container operations
+    // themselves, never across issueRequest()/hitCallback()/enqueue(), so it
+    // never nests with a Consumer wakeup lock. See
+    // docs/specs/parallel-eventq-lockfree-l2-design.md section 9.6.
+    UncontendedMutex m_reqTableMutex;
     // UnadressedRequestTable contains "unaddressed" requests,
     // guaranteed not to alias each other
     std::unordered_map<uint64_t, SequencerRequest> m_UnaddressedRequestTable;

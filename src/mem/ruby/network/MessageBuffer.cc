@@ -567,6 +567,29 @@ MessageBuffer::readyTime() const
 uint32_t
 MessageBuffer::functionalAccess(Packet *pkt, bool is_read, WriteMask *mask)
 {
+    // Functional accesses originate outside the normal event-driven flow
+    // (e.g. SE-mode syscall/page-fault guest-memory accesses run on a
+    // separate host thread under Process::seEmulLock). With a parallel
+    // EventQueue the owning domain thread may concurrently mutate
+    // m_prio_heap / m_stall_msg_map via enqueue()/dequeue(), which are
+    // serialized by the consumer's wakeup lock. Take that same lock here so
+    // the walk below cannot iterate a container mid-mutation. Consumer::lock()
+    // is same-thread reentrant, so this is safe even when the caller already
+    // holds this consumer's lock (e.g. AbstractController::functionalRead-
+    // Buffers). m_consumer may be NULL for buffers with no consumer, in which
+    // case nothing can be concurrently mutating this buffer. See
+    // docs/specs/parallel-eventq-lockfree-l2-design.md section 9.6.
+    if (m_consumer == nullptr)
+        return functionalAccessUnlocked(pkt, is_read, mask);
+
+    std::lock_guard<Consumer> consumer_lock(*m_consumer);
+    return functionalAccessUnlocked(pkt, is_read, mask);
+}
+
+uint32_t
+MessageBuffer::functionalAccessUnlocked(Packet *pkt, bool is_read,
+                                        WriteMask *mask)
+{
     DPRINTF(RubyQueue, "functional %s for %#x\n",
             is_read ? "read" : "write", pkt->getAddr());
 

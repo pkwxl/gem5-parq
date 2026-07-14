@@ -542,8 +542,13 @@ RubySystem::simpleFunctionalRead(PacketPtr pkt)
 
     // In this loop we count the number of controllers that have the given
     // address in read only, read write and busy states.
+    // Each controller's access-permission read touches its SLICC state, so
+    // take its wakeup lock for the duration (one controller at a time). See
+    // docs/specs/parallel-eventq-lockfree-l2-design.md section 9.6.
     for (auto& cntrl : netCntrls[request_net_id]) {
+        cntrl->lock();
         access_perm = cntrl-> getAccessPermission(line_address);
+        cntrl->unlock();
         if (access_perm == AccessPermission_Read_Only){
             num_ro++;
             if (ctrl_ro == nullptr) ctrl_ro = cntrl;
@@ -598,7 +603,9 @@ RubySystem::simpleFunctionalRead(PacketPtr pkt)
     if (num_invalid == (num_controllers - 1) && num_backing_store == 1) {
         DPRINTF(RubySystem,
                 "only copy in Backing_Store memory, read from it\n");
+        ctrl_backing_store->lock();
         ctrl_backing_store->functionalRead(line_address, pkt);
+        ctrl_backing_store->unlock();
         return true;
     } else if (num_ro > 0 || num_rw >= 1) {
         if (num_rw > 1) {
@@ -618,10 +625,14 @@ RubySystem::simpleFunctionalRead(PacketPtr pkt)
         // Use the copy from the controller with read/write permission (if
         // any), otherwise use get the first read only found
         if (ctrl_rw) {
+            ctrl_rw->lock();
             ctrl_rw->functionalRead(line_address, pkt);
+            ctrl_rw->unlock();
         } else {
             assert(ctrl_ro);
+            ctrl_ro->lock();
             ctrl_ro->functionalRead(line_address, pkt);
+            ctrl_ro->unlock();
         }
         return true;
     } else if ((num_busy + num_maybe_stale) > 0) {
@@ -646,7 +657,9 @@ RubySystem::simpleFunctionalRead(PacketPtr pkt)
             // No copy in transit or buffered indicates that a block marked
             // as Maybe_Stale is actually up-to-date, just waiting an Ack or
             // similar type of message which carries no data.
+            ctrl_ms->lock();
             ctrl_ms->functionalRead(line_address, pkt);
+            ctrl_ms->unlock();
             return true;
         }
     }
@@ -668,9 +681,15 @@ RubySystem::partialFunctionalRead(PacketPtr pkt)
     AbstractController *ctrl_rw = nullptr;
     AbstractController *ctrl_bs = nullptr;
 
-    // Build lists of controllers that have line
+    // Build lists of controllers that have line. Each permission read touches
+    // the controller's SLICC state, so hold its wakeup lock for the duration
+    // (one controller at a time). See
+    // docs/specs/parallel-eventq-lockfree-l2-design.md section 9.6.
     for (auto ctrl : m_abs_cntrl_vec) {
-        switch(ctrl->getAccessPermission(line_address)) {
+        ctrl->lock();
+        AccessPermission perm = ctrl->getAccessPermission(line_address);
+        ctrl->unlock();
+        switch(perm) {
             case AccessPermission_Read_Only:
                 ctrl_ro.push_back(ctrl);
                 break;
@@ -705,19 +724,30 @@ RubySystem::partialFunctionalRead(PacketPtr pkt)
     // until we get a full copy of the line
     WriteMask bytes;
     bytes.setBlockSize(getBlockSizeBytes());
+    // Cache-state reads below take each controller's wakeup lock (one at a
+    // time); the functionalReadBuffers() calls further down take it inside
+    // MessageBuffer::functionalAccess. See section 9.6 of the design doc.
     if (ctrl_rw != nullptr) {
+        ctrl_rw->lock();
         ctrl_rw->functionalRead(line_address, pkt, bytes);
+        ctrl_rw->unlock();
         // if a RW controllter has the full line that's all uptodate
         if (bytes.isFull())
             return true;
     }
 
     // Get data from RO and BS
-    for (auto ctrl : ctrl_ro)
+    for (auto ctrl : ctrl_ro) {
+        ctrl->lock();
         ctrl->functionalRead(line_address, pkt, bytes);
+        ctrl->unlock();
+    }
 
-    if (ctrl_bs)
+    if (ctrl_bs) {
+        ctrl_bs->lock();
         ctrl_bs->functionalRead(line_address, pkt, bytes);
+        ctrl_bs->unlock();
+    }
 
     // if there is any busy controller or bytes still not set, then a partial
     // and/or dirty copy of the line might be in a message buffer or the
@@ -732,14 +762,18 @@ RubySystem::partialFunctionalRead(PacketPtr pkt)
         if (ctrl_bs != nullptr)
             ctrl_bs->functionalReadBuffers(pkt, bytes);
         for (auto ctrl : ctrl_busy) {
+            ctrl->lock();
             ctrl->functionalRead(line_address, pkt, bytes);
+            ctrl->unlock();
             ctrl->functionalReadBuffers(pkt, bytes);
         }
         for (auto& network : m_networks) {
             network->functionalRead(pkt, bytes);
         }
         for (auto ctrl : ctrl_others) {
+            ctrl->lock();
             ctrl->functionalRead(line_address, pkt, bytes);
+            ctrl->unlock();
             ctrl->functionalReadBuffers(pkt, bytes);
         }
     }
@@ -772,17 +806,29 @@ RubySystem::functionalWrite(PacketPtr pkt)
     assert(netCntrls.count(request_net_id));
 
     for (auto& cntrl : netCntrls[request_net_id]) {
+        // functionalWriteBuffers() iterates the controller's MessageBuffers,
+        // each of which takes this controller's wakeup lock internally
+        // (MessageBuffer::functionalAccess). The cache-state ops below read
+        // the controller's SLICC state directly, so guard them with the same
+        // lock so a concurrent domain thread cannot mutate that state
+        // mid-access. The lock is held for one controller at a time and
+        // released before touching its sequencer, keeping the walk to a
+        // single object lock at any moment. See
+        // docs/specs/parallel-eventq-lockfree-l2-design.md section 9.6.
         num_functional_writes += cntrl->functionalWriteBuffers(pkt);
 
+        cntrl->lock();
         access_perm = cntrl->getAccessPermission(line_addr);
         if (access_perm != AccessPermission_Invalid &&
             access_perm != AccessPermission_NotPresent) {
             num_functional_writes +=
                 cntrl->functionalWrite(line_addr, pkt);
         }
+        cntrl->unlock();
 
         // Also updates requests pending in any sequencer associated
-        // with the controller
+        // with the controller (guarded by the sequencer's own request-table
+        // mutex; the controller lock above is already released here).
         if (cntrl->getCPUSequencer()) {
             num_functional_writes +=
                 cntrl->getCPUSequencer()->functionalWrite(pkt);

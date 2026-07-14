@@ -41,6 +41,8 @@
 
 #include "mem/ruby/system/Sequencer.hh"
 
+#include <mutex>
+
 #include "base/logging.hh"
 #include "cpu/testers/rubytest/RubyTester.hh"
 #include "debug/LLSC.hh"
@@ -260,10 +262,17 @@ Sequencer::functionalWrite(Packet *func_pkt)
 {
     int num_written = RubyPort::functionalWrite(func_pkt);
 
-    for (const auto &table_entry : m_RequestTable) {
-        for (const auto& seq_req : table_entry.second) {
-            if (seq_req.functionalWrite(func_pkt))
-                ++num_written;
+    // Hold the request-table mutex across the whole read-only walk so a
+    // concurrent domain thread cannot insert/erase/pop entries mid-iteration
+    // (see m_reqTableMutex in Sequencer.hh). This is a leaf lock: the walk
+    // below acquires no other lock.
+    {
+        std::lock_guard<UncontendedMutex> table_lock(m_reqTableMutex);
+        for (const auto &table_entry : m_RequestTable) {
+            for (const auto& seq_req : table_entry.second) {
+                if (seq_req.functionalWrite(func_pkt))
+                    ++num_written;
+            }
         }
     }
     // Functional writes to addresses being monitored
@@ -360,6 +369,11 @@ Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
     }
 
     Addr line_addr = makeLineAddress(pkt->getAddr());
+    // Hold the request-table mutex across the lookup/insert so a concurrent
+    // functional walk (Sequencer::functionalWrite) cannot iterate the table
+    // while we insert/rehash it. Released on return, before makeRequest()
+    // calls issueRequest(), so it never nests with a Consumer wakeup lock.
+    std::lock_guard<UncontendedMutex> table_lock(m_reqTableMutex);
     // Check if there is any outstanding request for the same cache line.
     auto &seq_req_list = m_RequestTable[line_addr];
 
@@ -558,11 +572,17 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
                         initialRequestTime, forwardRequestTime,
                         firstResponseTime, !ruby_request);
         }
-        seq_req_list.pop_front();
+        {
+            // Leaf-lock the structural mutation against a concurrent
+            // functional walk; see m_reqTableMutex in Sequencer.hh.
+            std::lock_guard<UncontendedMutex> table_lock(m_reqTableMutex);
+            seq_req_list.pop_front();
+        }
     }
 
     // free all outstanding requests corresponding to this address
     if (seq_req_list.empty()) {
+        std::lock_guard<UncontendedMutex> table_lock(m_reqTableMutex);
         m_RequestTable.erase(address);
     }
 }
@@ -630,11 +650,17 @@ Sequencer::readCallback(Addr address, DataBlock& data,
                     initialRequestTime, forwardRequestTime,
                     firstResponseTime, !ruby_request);
         ruby_request = false;
-        seq_req_list.pop_front();
+        {
+            // Leaf-lock the structural mutation against a concurrent
+            // functional walk; see m_reqTableMutex in Sequencer.hh.
+            std::lock_guard<UncontendedMutex> table_lock(m_reqTableMutex);
+            seq_req_list.pop_front();
+        }
     }
 
     // free all outstanding requests corresponding to this address
     if (seq_req_list.empty()) {
+        std::lock_guard<UncontendedMutex> table_lock(m_reqTableMutex);
         m_RequestTable.erase(address);
     }
 }
@@ -686,11 +712,17 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
         hitCallback(&seq_req, data, true, mach, externalHit,
                     initialRequestTime, forwardRequestTime,
                     firstResponseTime, false);
-        seq_req_list.pop_front();
+        {
+            // Leaf-lock the structural mutation against a concurrent
+            // functional walk; see m_reqTableMutex in Sequencer.hh.
+            std::lock_guard<UncontendedMutex> table_lock(m_reqTableMutex);
+            seq_req_list.pop_front();
+        }
     }
 
     // free all outstanding requests corresponding to this address
     if (seq_req_list.empty()) {
+        std::lock_guard<UncontendedMutex> table_lock(m_reqTableMutex);
         m_RequestTable.erase(address);
     }
 }

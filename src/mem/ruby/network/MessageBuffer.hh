@@ -200,6 +200,12 @@ class MessageBuffer : public SimObject
     void reanalyzeList(std::list<MsgPtr> &, Tick);
 
     uint32_t functionalAccess(Packet *pkt, bool is_read, WriteMask *mask);
+    // Actual body of functionalAccess(); functionalAccess() wraps this call
+    // in the consumer's wakeup lock so the walk cannot race the owning
+    // domain thread mutating m_prio_heap / m_stall_msg_map. See
+    // docs/specs/parallel-eventq-lockfree-l2-design.md section 9.6.
+    uint32_t functionalAccessUnlocked(Packet *pkt, bool is_read,
+                                       WriteMask *mask);
 
   private:
     // Data Members (m_ prefix)
