@@ -492,25 +492,53 @@ cache-to-cache 直连。这把 6.4 节需要覆盖的链路限定在 L2↔L1 这
 
 共 8 个实例，4 个挂在 L2 侧、4 个分别挂在各自 L1_i 侧。
 
-**需要改的地方，不只是"加 Throttle"**：现有 `Throttle` 是被
-`Switch::addOutPort()` 创建、存进 `std::list<Throttle> throttles`
-（`Switch.hh:121`），一个 `Switch` 对象名下所有 throttle 共用**同一个
-`_em`**（即那个 `Switch` 自己，`Switch.cc:105-111` 传入
-`this`）——而 `--topology=Crossbar`/`SimplePt2Pt` 这类拓扑，通常是
-**一个共享的 crossbar `Switch` 对象**路由所有 5 个节点的流量。如果
-不改，`Throttle_L2→L1_i` 和 `Throttle_L1_i→L2` 会因为"挂在同一个
-`Switch`"而共用同一个 `_em`/`EventQueue`，6.2 节"寄生在发送方线程"
-这个前提就不成立了，死锁风险原样保留。
+**修正（原先这里判断错了，记录下来避免下次重新踩一遍）**：最初以为
+现有 `Throttle`/`Switch` 机制需要新增 C++ 类才能做到"按方向绑定
+`_em`"，实测查证后发现**不需要新 C++ 代码，现有机制已经支持**：
 
-**这是本设计里唯一必须动的架构点**：4 核 1 L2 这种规模，链路是纯
-点对点（每个 L1 只跟 L2 一条双向链路），不需要 `Switch`/
-`PerfectSwitch` 那一整套多端口交换机路由机制。建议不复用
-`Switch`，而是新增一个更轻量的、专为点对点跨 domain 链路设计的
-持有者对象（结构上是"`Throttle` + 一个只属于一侧 controller 的
-`_em`"），由拓扑配置脚本（`configs/ruby/Network.py`/
-`SimpleNetwork.py` 这一层）在创建 L1_i↔L2 链路时，分别把
-`Throttle_L2→L1_i` 的 `_em` 设成 L2 controller 一侧的对象、
-`Throttle_L1_i→L2` 的 `_em` 设成 L1_i controller 一侧的对象。
+- `eventq_index` 是 `SimObject` 基类自带的通用 Param
+  （`src/python/m5/SimObject.py:637`：
+  `eventq_index = Param.UInt32(Parent.eventq_index, ...)`）——每个
+  `Switch`/`Router` SimObject 实例本来就能在 Python 配置里独立指定
+  自己的 `eventq_index`，`Throttle` 的 `_em` 就是创建它的那个
+  `Switch`（`Switch.cc` 里 `throttles.emplace_back(...", this, ...)`），
+  `Consumer::scheduleEvent()` 用 `em->schedule()`
+  （`Consumer.cc:56-60`）天然就落在 `em` 自己的 `eventq_index` 对应
+  的 `EventQueue` 上——**不需要新写一个"轻量 holder 对象"，只要在
+  拓扑创建时把正确的 `eventq_index` 赋给正确的 `Switch` 实例即可**。
+- 真正的障碍不是"Throttle 绑定不了单一 `_em`"，而是**拓扑本身的
+  结构**：查了 `configs/topologies/Crossbar.py`（也就是 A/H 节基线
+  实测用的 `--topology=Crossbar`）——它不是"一个共享 Switch 路由
+  全部 5 个节点"，而是**给每个 controller 建一个专属的 per-node
+  `Switch`，另外再加一个共享的中心 `xbar` `Switch`**
+  （`len(self.nodes) + 1` 个 router）。一条 L2→L1_i 的消息实际上过
+  `L2 endpoint → L2 自己的 Switch →`（`IntLink`，经
+  `SimpleNetwork::makeInternalLink`/`Switch::addOutPort` 加了
+  throttle）`→ 共享的 xbar Switch →`（`IntLink`，同样加了
+  throttle）`→ L1_i 自己的 Switch →`（`ExtLink`，经
+  `SimpleNetwork::makeExtOutLink`/`addOutPort` 加了 throttle）
+  `→ L1_i endpoint`。L2 自己的 Switch、L1_i 自己的 Switch 都是单一
+  归属，`eventq_index` 分别设成对应 domain 即可；**唯一有问题的是
+  中间那个所有节点共享的 `xbar` Switch**——它的 throttle 无法只
+  归属于某一侧。
+- 结论：**不用改 `Switch`/`Throttle` 的 C++ 代码**，需要做的是
+  拓扑层面的选择，见下面两个方案（用户要求两个都做成可配置的，
+  便于对比）：
+  1. **方案一（新拓扑，去掉共享 xbar 节点）**：写一个精简的
+     "L1↔L2 星形"拓扑，每个 L1_i 的 `Switch` 直接通过一条 `IntLink`
+     连到 L2 自己的 `Switch`，不再经过额外的共享中心节点——这样
+     每条 L2↔L1_i 路径只有两跳（各自的 Switch），两跳分别单一
+     归属，`eventq_index` 各自设置即可，完全对应 6.2 节"寄生在
+     发送方线程"的设计。
+  2. **方案二（复用现有 Crossbar 拓扑，把共享 xbar 当成独立的第 6
+     个 domain）**：不改拓扑代码，直接给 Crossbar.py 生成的那个
+     共享 `xbar` router 也单独分配一个 `eventq_index`（比如 5）。
+     这样链路变成 3 跳（L2 域 → xbar 域 → L1_i 域），每一跳仍然
+     只涉及一把锁（6.2 节的不变量对链长不敏感，多一跳只是多一次
+     "先释放、再交给下一跳"的顺序移交，不引入新的嵌套持锁），
+     但多了一次真正的跨线程移交开销，预期比方案一慢、但改动量
+     几乎为零，适合先用来验证机制本身是否work，再决定要不要换
+     方案一。
 
 ### 6.4 控制流（伪代码）
 
