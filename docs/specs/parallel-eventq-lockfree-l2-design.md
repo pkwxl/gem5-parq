@@ -1673,3 +1673,78 @@ futex 字的读取——都走 `RubySystem::functionalRead/Write`，它会
 这是 parti-gem5 选择 FS 模式的原因在我们自己的数据里的重演。方向 1
 是当前倾向（Consumer 锁体系已经存在，顺势延伸），但它是又一个
 "预期会撞到未知"的子阶段，动手前值得停一下。
+
+### 9.7 实现方向 1：Ruby functional 访问加锁——段错误消除，但撞上
+第二座大山（SE 的 mmap 仿真）
+
+按 9.6 的方向 1 实现（5 个文件，约 130 行）：
+
+- **改动 A（`MessageBuffer::functionalAccess`，统一收口点）**：函数体
+  拆成 `functionalAccessUnlocked()`，`functionalAccess()` 在调用它之前
+  取该 buffer 的 `m_consumer->lock()`（判空）。这一处就覆盖了 walk 会
+  碰到的**所有** MessageBuffer——controller 的缓冲、网络交换机的
+  port buffer、内部链路 buffer——因为每个 buffer 的增删
+  (`enqueue`/`dequeue`) 本来就在同一把 consumer 锁下执行。
+  `Consumer::lock()` 是同线程可重入的，所以当 walk 已经持有该 controller
+  的锁时（见改动 B），这里的再次加锁安全无死锁。
+- **改动 C（Sequencer 在途请求表 mutex，`m_reqTableMutex`，
+  `UncontendedMutex`）**：`functionalWrite()` 只读遍历整表时全程持有；
+  每一处结构性修改（`insertRequest` 的插入、
+  `writeCallback`/`readCallback`/`atomicCallback` 里的
+  `pop_front`/`erase`）各自短暂持有。**严格叶子锁**——绝不跨
+  `issueRequest`/`hitCallback`/`enqueue` 持有，因此永不与任何 Consumer
+  锁嵌套，也就不会与回调路径天然的 `ctrl→seq` 顺序成环。
+- **改动 B（`RubySystem` walk 里 controller 的 cache-state 操作）**：
+  `simpleFunctionalRead`/`partialFunctionalRead`/`functionalWrite` 三个
+  walk 里，`getAccessPermission` 和读写 cache 数据的
+  `functionalRead/Write(addr,…)`（这些碰的是 SLICC 状态而非 buffer，
+  改动 A 覆盖不到）各用 `cntrl->lock()/unlock()` 包住，一次一个
+  controller，碰它的 sequencer 之前先释放。
+
+端到端锁序：`seEmulLock → 任一时刻至多一把 Consumer 锁`，
+`m_reqTableMutex` 永远最内层——与 9.6 声明的不变量一致，无环。
+
+**结果**：
+- 串行基线逐字节不变（`simTicks=31555788000`，`--options="200000 1"`；
+  锁在无竞争时零行为差异）。
+- **`Sequencer::functionalWrite` 段错误消除**。此前 ll=20 完整小负载
+  在约 27s 处 SIGSEGV（139）于 `Sequencer::functionalWrite ←
+  RubySystem::functionalWrite ← VMA::fillMemPages`；改动后同一配置
+  （`--parallel-l2-eventq --sim-quantum=10ns --link-latency=20
+  --options="20000 1"`）跑到 **tick ~8.47e9**（远超此前所有 2e9
+  验证窗口）才失败，且失败点已不在 Ruby。
+- **撞上第二座、性质不同的大山：SE 的 mmap 仿真**。新失败是
+  SIGABRT（134），断言 `MemState::mapRegion` 的
+  `isUnmapped(start_addr, length)`（`mem_state.cc:182`），调用链
+  `TimingSimpleCPU → SESyscallFault::invoke → doSyscall →
+  mmapFunc<X86Linux64> → mapRegion`，前面还有一条
+  `Process::allocateMem: addr 0x7ffff7e34000 already mapped` 警告——
+  即一次 **非 MAP_FIXED 的 mmap 把已映射的区域又映射了一遍**。
+- **判定：是"时序发散"而非 gem5 自身结构的撕裂竞争**。依据：
+  (1) 系统调用全程在 `seEmulLock` 下串行（`se_workload.cc:75`
+  `SEWorkload::syscall` 整体加锁），mmap 仿真读改的
+  `getMmapEnd/setMmapEnd/MemState` 不可能被并发撕裂；
+  (2) 两次重跑崩在**同一个固定客户机地址** 0x7ffff7e34000（mmap
+  向下增长区，即 pthread 线程栈所在段）但**不同 tick**
+  （8466338000 vs 8466898500，差 ~56 万 tick）。同址+异 tick =
+  放宽的跨域时序改变了多线程客户机 pthread 创建/退出 + mmap 的
+  交错，使某个线程栈区被映射两次。这正是 9.6 预言的"SE 模式共享
+  进程/OS 状态不是为并行时序设计的"在 Ruby 之上再上一层的重演。
+
+**当前状态**：9.6 方向 1 达成其既定目标（消除 Ruby functional 访问
+段错误）。新暴露的 mmap/MemState 墙是一个**性质不同、独立的**子问题
+（不在 Ruby，不是 seEmulLock 能覆盖的撕裂，而是客户机行为随时序发散）。
+按既定协作节奏，在这个"又一处预期外未知"的边界停下，未继续动手修
+MemState——候选方向（尚未决策）至少有：把线程栈/mmap 生命周期也纳入
+某种时序规整（quantum snap 线程创建/退出，类似 9.6 对 activateContext
+的处理），或接受 SE 模式在此类多线程负载下的不确定性并转向 parti-gem5
+所选的 FS 模式。
+
+**回归复测（确认没打破已跑通的配置、也没引入死锁）**：ll=1、Q=500
+完整小负载（`--parallel-l2-eventq --sim-quantum=0.5ns
+--options="20000 1"`）跑到底，`Validating...Success!`，
+`simTicks=6389611500`——与 9.6 加锁前的可过结果逐 tick 一致，
+用时 374s（落在此前记录的 56–620s 沙盒负载波动区间内），说明
+functional 加锁在真实并行运行下既未改变时序、也未在跨域 walk 上
+造成死锁（walk 全程只持叶子/短锁，屏障处不持 controller 锁，
+持锁者要么在跑要么在屏障且不持锁，恒能推进）。
