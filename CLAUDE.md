@@ -72,6 +72,13 @@ cd tests
 ```
 Quick tests are the minimum bar for a PR. Run `long`/`very-long` mainly for significant/invasive changes.
 
+**Checkpoints**: gem5 has no persistent config for the output directory — it's set per-invocation via
+`-d`/`--outdir` (default `m5out`, relative to cwd; see `src/python/m5/main.py`). When running `gem5.opt` with
+checkpointing enabled (e.g. `--checkpoint-at-end`, scripted `m5.checkpoint()` calls), always pass an explicit
+`-d /tmp/<something>` rather than letting checkpoints land under the repo — `cpt.<tick>/` directories are
+large binary state dumps (`m5.cpt` + `.pmem` files), not source, and shouldn't be committed. `cpt.*/` is
+gitignored as a safety net, but prefer not to rely on that.
+
 ## Code style & formatting
 
 - C++: 4-space indents, no tabs, 79-col lines, no trailing whitespace. `ClassNames` UpperCamelCase, member
