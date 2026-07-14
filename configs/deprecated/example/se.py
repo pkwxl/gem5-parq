@@ -45,6 +45,7 @@ import os
 import sys
 
 import m5
+import m5.ticks
 from m5.defines import buildEnv
 from m5.objects import *
 from m5.params import NULL
@@ -136,6 +137,27 @@ Options.addSEOptions(parser)
 
 if "--ruby" in sys.argv:
     Ruby.define_options(parser)
+
+    # EXPERIMENTAL: see docs/specs/parallel-eventq-lockfree-l2-design.md.
+    # Splits a MESI_Two_Level + Crossbar SE-mode system into one EventQueue
+    # per L1 plus one shared EventQueue for L2/directory/memory, following
+    # the parti-gem5 N+1-thread partitioning. Only "option 2" from the
+    # design doc (reuse Crossbar.py, give the shared xbar router its own
+    # extra EventQueue) is implemented so far.
+    parser.add_argument(
+        "--parallel-l2-eventq",
+        action="store_true",
+        help="Run with per-L1 + shared-L2 EventQueues instead of one "
+        "single EventQueue. Requires --ruby --topology=Crossbar "
+        "--num-l2caches=1 --num-dirs=1 and the MESI_Two_Level protocol.",
+    )
+    parser.add_argument(
+        "--sim-quantum",
+        type=str,
+        default="10us",
+        help="Simulation quantum for --parallel-l2-eventq PDES mode. "
+        "Default: %(default)s",
+    )
 
 args = parser.parse_args()
 
@@ -281,6 +303,47 @@ if args.ruby:
 
         # Connect the cpu's cache ports to Ruby
         ruby_port.connectCpuPorts(system.cpu[i])
+
+    if args.parallel_l2_eventq:
+        if (
+            args.topology != "Crossbar"
+            or args.num_l2caches != 1
+            or args.num_dirs != 1
+            or buildEnv["PROTOCOL"] != "MESI_Two_Level"
+        ):
+            fatal(
+                "--parallel-l2-eventq only supports the MESI_Two_Level "
+                "protocol with --topology=Crossbar --num-l2caches=1 "
+                "--num-dirs=1"
+            )
+
+        # Domain assignment: one EventQueue per L1 (index == cpu id),
+        # one shared EventQueue for L2 + directory + memory, and (since
+        # Crossbar.py routes every link through one shared central "xbar"
+        # router that can't be pinned to either side, see design doc
+        # section 6.3 option 2) one extra EventQueue just for that xbar.
+        l2_domain = args.num_cpus
+        xbar_domain = args.num_cpus + 1
+
+        domain_of_cntrl = {}
+        for i in range(args.num_cpus):
+            domain_of_cntrl[getattr(system.ruby, "l1_cntrl%d" % i)] = i
+        domain_of_cntrl[system.ruby.l2_cntrl0] = l2_domain
+        domain_of_cntrl[system.ruby.dir_cntrl0] = l2_domain
+        for mem_ctrl in system.mem_ctrls:
+            domain_of_cntrl[mem_ctrl] = l2_domain
+
+        for cntrl, domain in domain_of_cntrl.items():
+            for obj in cntrl.descendants():
+                obj.eventq_index = domain
+
+        domain_of_router = {}
+        for ext_link in system.ruby.network.ext_links:
+            domain_of_router[ext_link.int_node] = domain_of_cntrl[
+                ext_link.ext_node
+            ]
+        for router in system.ruby.network.routers:
+            router.eventq_index = domain_of_router.get(router, xbar_domain)
 else:
     MemClass = Simulation.setMemClass(args)
     system.membus = SystemXBar()
@@ -295,4 +358,11 @@ if args.wait_gdb:
     system.workload.wait_for_remote_gdb = True
 
 root = Root(full_system=False, system=system)
+
+if args.ruby and args.parallel_l2_eventq:
+    m5.ticks.fixGlobalFrequency()
+    root.sim_quantum = m5.ticks.fromSeconds(
+        m5.util.convert.anyToLatency(args.sim_quantum)
+    )
+
 Simulation.run(args, root, system, FutureClass)
