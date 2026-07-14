@@ -228,17 +228,22 @@ MessageBuffer::enqueue(MsgPtr message, Tick current_time, Tick delta,
     // wakeup() enqueues into one of its own buffers (recycle,
     // reanalyzeMessages, enqueueDeferredMessages).
     //
-    // Fast path: a given EventQueue is always serviced by exactly one OS
-    // thread for the life of the run, so if the calling thread is already
-    // servicing m_consumer's own EventQueue, no *other* thread can be
-    // touching m_consumer concurrently -- the lock is provably redundant
-    // and can be skipped. This is the common case for any intra-domain
-    // message (e.g. a controller talking to its own Sequencer/directory);
-    // only genuine cross-domain sends pay the lock.
+    // No same-domain fast path: a previous version of this code skipped
+    // the lock whenever the calling thread already served m_consumer's
+    // own EventQueue, on the reasoning that no *other* same-domain thread
+    // could be touching m_consumer concurrently. That's true but doesn't
+    // matter -- the same Consumer can also be reached by a genuinely
+    // cross-domain sender that *does* take this lock, and a lock only
+    // orders threads that both acquire it. The unlocked local writes had
+    // no happens-before relationship with the locked cross-domain reads,
+    // so a cross-domain thread could observe a stale
+    // m_wakeup_event.scheduled() flag and double-schedule the same Event
+    // object, corrupting its state (design doc section 8.5). Always
+    // locking here is the price of correctness until section 8.5's
+    // per-Consumer static classification (option b) is implemented, if
+    // ever.
     assert(m_consumer != NULL);
-    std::unique_lock<Consumer> consumer_lock(*m_consumer, std::defer_lock);
-    if (curEventQueue() != m_consumer->getObject()->eventQueue())
-        consumer_lock.lock();
+    std::unique_lock<Consumer> consumer_lock(*m_consumer);
 
     // record current time incase we have a pop that also adjusts my size
     if (m_time_last_time_enqueue < current_time) {
