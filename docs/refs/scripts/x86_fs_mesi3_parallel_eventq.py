@@ -78,6 +78,12 @@ PARALLEL_EVENTQ = os.environ.get("PARALLEL_EVENTQ", "0") == "1"
 # Comma-separated host CPU ids to pin the per-EventQueue threads to
 # (index i pins the thread driving event queue i), e.g. "0,1,2,3,4,5,6,7".
 HOST_PIN_CPUS = os.environ.get("HOST_PIN_CPUS", "")
+# Per-quantum global barrier mechanism: "cv" (default), "spin", or "hybrid".
+# "spin" only pays off with HOST_PIN_CPUS pinning (design-doc 10.4/12).
+EVENTQ_BARRIER_MODE = os.environ.get("EVENTQ_BARRIER_MODE", "cv")
+EVENTQ_BARRIER_SPIN_ITERS = int(
+    os.environ.get("EVENTQ_BARRIER_SPIN_ITERS", "0")
+)
 BOARD_CLK = "3GHz"
 RUBY_CLOCK = BOARD_CLK  # stdlib leaves RubySystem clk inheriting the board clk
 
@@ -198,12 +204,25 @@ class ParallelX86Board(X86Board):
                 int(c) for c in HOST_PIN_CPUS.split(",")
             ]
 
+        root.eventq_barrier_mode = EVENTQ_BARRIER_MODE
+        root.eventq_barrier_spin_iters = EVENTQ_BARRIER_SPIN_ITERS
+
         n_dom = mem_dom0 + n_dir  # 0..(mem_dom0+n_dir-1)
         print(
             f"[parallel-eventq] 3-level split: {n_dom} EventQueues "
             f"(cores 1..{n}, L3={l3_dom}, mem={mem_dom0}..{mem_dom0 + n_dir - 1}), "
             f"sim_quantum={quantum} ticks"
             + (f", host-pin={HOST_PIN_CPUS}" if HOST_PIN_CPUS else "")
+            + (
+                f", barrier={EVENTQ_BARRIER_MODE}"
+                + (
+                    f"@{EVENTQ_BARRIER_SPIN_ITERS}"
+                    if EVENTQ_BARRIER_MODE == "hybrid"
+                    else ""
+                )
+                if EVENTQ_BARRIER_MODE != "cv"
+                else ""
+            )
         )
         return root
 

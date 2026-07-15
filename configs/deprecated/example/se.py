@@ -166,6 +166,23 @@ if "--ruby" in sys.argv:
         "simulation threads to (index i pins the thread driving event "
         "queue i), e.g. 0,1,2,3,4,5. Requires --parallel-l2-eventq.",
     )
+    parser.add_argument(
+        "--eventq-barrier-mode",
+        type=str,
+        default="cv",
+        choices=["cv", "spin", "hybrid"],
+        help="Per-quantum global barrier mechanism for --parallel-l2-eventq. "
+        "'cv' (default) uses the condition-variable barrier; 'spin' busy-waits "
+        "(only sensible with --eventq-host-cpus pinning); 'hybrid' spins "
+        "--eventq-barrier-spin-iters times then sleeps.",
+    )
+    parser.add_argument(
+        "--eventq-barrier-spin-iters",
+        type=int,
+        default=0,
+        help="Hybrid barrier: spin iterations before falling back to the "
+        "condition variable.",
+    )
 
 args = parser.parse_args()
 
@@ -409,5 +426,7 @@ if args.ruby and args.parallel_l2_eventq:
         root.eventq_host_cpus = [
             int(c) for c in args.eventq_host_cpus.split(",")
         ]
+    root.eventq_barrier_mode = args.eventq_barrier_mode
+    root.eventq_barrier_spin_iters = args.eventq_barrier_spin_iters
 
 Simulation.run(args, root, system, FutureClass)
