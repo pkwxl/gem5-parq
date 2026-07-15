@@ -2092,3 +2092,108 @@ Q)*Q`，故所有既往 SE/串行结果不变；只有 startTick≠0（即检查
 `src/sim/simulate.cc`（建 barrier 处置锚点）、`src/cpu/simple/timing.cc`
 （snap 对齐到锚点）。崩溃日志见 `/tmp/fs3-restore-par.log`；修复后日志
 `/tmp/fs3-restore-par-fix.log`。
+
+## 12. 可选自旋屏障：把 9.3 出路 2 落地并实测
+
+### 12.1 动机与设计
+
+9.2 实测每 quantum 的 cv 屏障成本 ~25.6µs，9.3 出路 2 预测换成自旋屏障
+可降到 ~2µs（一个数量级）。10.4 已确立自旋的前置条件——绑核（10 节）+
+无超线程 + 核数富余——本节据此落地。做成**可选的屏障模式**（不是硬替换），
+以便同一二进制在同一 Q 下 A/B 对比、并挑出加速最大的那个，符合本项目
+"先测再断言"的一贯做法。
+
+- `Root.eventq_barrier_mode`（`Param.String`，默认 `"cv"`）+
+  `eventq_barrier_spin_iters`（`Param.Unsigned`，hybrid 用），管线完全镜像
+  10 节的 `eventq_host_cpus`：`Root.py` → `root.cc`（字符串映射到枚举）→
+  `eventq.{hh,cc}` 全局 `eventqBarrierMode`/`eventqBarrierSpinIters` →
+  `BaseGlobalEvent` 构造 `Barrier` 时读取。
+- 三种模式（`src/base/barrier.hh`）：
+  - **`cv`**：原 `std::condition_variable` 路径，逐字节不动（默认）。
+  - **`spin`**：sense-reversing 原子屏障——`spinLeft.fetch_sub`，最后到达者
+    （返回 1）重置计数、`spinGen`（release）自增放行，其余线程在 `spinGen`
+    （acquire）上 `_mm_pause()` 自旋。`fetch_sub(acq_rel)` + `spinGen`
+    release/acquire 给出和 cv 版 mutex 相同的 full-barrier happens-before；
+    保住"恰好一个 `wait()` 返回 true"的契约（`global_event.cc:133/147`
+    靠它只跑一次 `_globalEvent->process()`）。
+  - **`hybrid`**：先自旋 `spin_iters` 次，再退回 cv 睡眠——放行时最后到达者
+    额外 `notify_all` 唤醒已挂起者。为长/不均衡 quantum 或宿主争抢兜底。
+- **基线中性（结构性）**：默认 `cv` 时 cv 路径逐字节不变；且**串行模式
+  （单队列）永不自旋**（`fetch_sub` 立即返回 1），故即便选 `spin`，串行结果
+  也不变。配置入口：`se.py --eventq-barrier-mode/--eventq-barrier-spin-iters`；
+  FS 脚本 `EVENTQ_BARRIER_MODE`/`EVENTQ_BARRIER_SPIN_ITERS` 环境变量。
+- 改动文件：`src/base/barrier.hh`、`src/sim/eventq.{hh,cc}`、`src/sim/root.cc`、
+  `src/sim/Root.py`、`src/sim/global_event.cc`；配置
+  `configs/deprecated/example/se.py`、
+  `docs/refs/scripts/x86_fs_mesi3_parallel_eventq.py`。
+
+### 12.2 正确性验证（SE，`build/X86/gem5.opt`）
+
+- **串行 cv 基线逐字节不变**：`--options="200000 1"` → `simTicks=31555788000`，
+  `Validating...Success!`。
+- **自旋是时序中性的机制替换**：精确模式（ll=1、Q=500、
+  `--options="20000 1"`，绑核 8-13）下 `cv`/`spin`/`hybrid` 三种模式
+  **全部** `simTicks=6389611500`、`Validating...Success!`——换屏障机制不改任何
+  事件时序/顺序（跨域顺序由量子网格 + async 合并决定，与线程"如何等待"无关）。
+  若 spin 给出不同的 simTicks，那才是真 bug（漏了 happens-before）；实测一致。
+
+### 12.3 A/B 实测（SE，2e9 tick 窗口，两臂都绑核 8-13，屏障模式是唯一变量）
+
+ABAB 交错跑消宿主 load 漂移（沿用 10.3 方法）。两个工作点：
+
+**加速区 ll=20、Q=10000（10ns）**（2×10⁵ 次同步，3 轮中位数）：
+
+| 模式 | wall 中位数 | vs 串行 | 每-quantum 屏障成本 |
+|------|-------------|---------|---------------------|
+| 串行 | 5.46 s | 1.00x | — |
+| cv | 9.26 s | 0.59x（比串行慢） | (9.26−5.46)/2e5 ≈ **19.0µs** |
+| **spin** | **6.06 s** | **0.90x（接近平价）** | 0.60/2e5 ≈ **3.0µs** |
+| hybrid@200 | 6.98 s | 0.78x | 1.52/2e5 ≈ 7.6µs |
+
+spin 比 cv 快 **1.53x**；把并行从 0.59x 抬到 **0.90x 串行**（接近平价）。
+
+**最大屏障压力 ll=1、Q=500（0.5ns）**（4×10⁶ 次同步，2 轮中位数）：
+
+| 模式 | wall 中位数 | 每-quantum 成本 |
+|------|-------------|-----------------|
+| cv | ~102.5 s（107.5/97.6） | 102.5/4e6 ≈ **25.6µs**——与 9.2 独立实测**完全吻合** |
+| **spin** | **~15.0 s（15.1/15.0）** | 15.0/4e6 ≈ **3.8µs**（含有用工作） |
+
+spin 比 cv 快 **6.8x**。
+
+**结论**：spin 把每-quantum 屏障成本从实测 ~25.6µs 降到 ~3µs（正是 9.3 预测的
+数量级），两个工作点各自独立印证。纯 **spin 是最大加速模式**（与 9.3/10.4
+预测一致），hybrid 居中——`hybrid` 的价值在纯 spin 会过度烧核的场景（长/
+不均衡 quantum、宿主争抢），本沙箱这两个工作点都是短 quantum，故纯 spin 胜。
+注意 0.90x 仍未过 1：加速区 Q 被 9.4 修正后的正确性上限（ll=20 → Q≤10000）
+夹住，屏障不再是主瓶颈后，下一步该往 9.3 出路 1/3（更真实链路延迟抬 Q 上限、
+每域更多工作摊固定成本）走，而不是继续抠屏障。
+
+### 12.4 FS A/B 状态：受阻，且撞上 APIC 修复之后的下一堵墙（与自旋无关）
+
+FS 8-EventQueue 自旋 A/B **未完成**，两个原因如实记录：
+
+1. **重编 `build/X86_MESI_Three_Level/gem5.opt` 被 ETXTBSY 阻塞**：11.5 的串行
+   参考跑（`/tmp/fs3-restore-serial`，旧二进制）仍在执行同一 MESI 二进制文件，
+   Linux 不允许 relink 正在执行的可执行文件。
+2. **11.5 修复后的并行重放长跑（`/tmp/fs3-restore-par-fix`，旧二进制）在 ROI
+   里跑了 3h20m 后段错误**（SIGSEGV，exit 139），**未出 stats**。回溯：
+
+   ```
+   statistics::pythonDump()               <- 调 libpython(PyImport_ImportModule)
+   statistics::StatEvent::process()
+   GlobalEvent::BarrierEvent::process()   <- 一个 GlobalEvent 屏障
+   EventQueue::serviceOne()
+   ...SimulatorThreads::runUntilLocalExit lambda   <- 从属线程(__clone)
+   ```
+
+   即：一次 stats dump（`StatEvent`，本身是个跨所有队列的 GlobalEvent）在**从属
+   EventQueue 线程**上执行了 `pythonDump()`，从**非主线程**触碰 CPython 解释器
+   （未持 GIL）→ 段错误。这是 11.5 的 APIC 开机墙之后 FS 并行的**下一堵墙**，
+   **与本节自旋屏障无关**（该跑用的是不含自旋的旧二进制）；且它会打到**任何**
+   FS 并行跑在 stats-dump 时刻，不分屏障模式。修法方向（未实现、待决策）：把
+   `StatEvent`/`pythonDump` 强制回主线程（queue 0）执行，或在 dump 时 stop-the-
+   world 到主线程。日志 `/tmp/fs3-restore-par-fix.log`。
+
+故 FS 自旋 A/B 的前置是先解 12.4.2 这堵 pythonDump 跨线程墙（并腾出 MESI 二进制
+重编）。SE 侧的结论（12.3）已经是干净、可复现、和理论吻合的完整证据。
