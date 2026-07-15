@@ -10,15 +10,11 @@
       "Bash(*)",
       "Read(//tmp/**)",
       "Edit(//tmp/**)",
-      "Write(//tmp/**)",
       "Read(//workspace/**)",
       "Edit(//workspace/gem5/**)",
-      "Write(//workspace/gem5/**)",
       "Edit(//workspace/shm/**)",
-      "Write(//workspace/shm/**)",
       "Read(/home/wxl/**)",
-      "Edit(/home/wxl/**)",
-      "Write(/home/wxl/**)"
+      "Edit(/home/wxl/**)"
     ],
     "deny": [
       "Bash(git push *)",
