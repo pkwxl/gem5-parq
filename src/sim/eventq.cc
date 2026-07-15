@@ -37,6 +37,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "base/barrier.hh"
 #include "base/logging.hh"
 #include "base/trace.hh"
 #include "cpu/smt.hh"
@@ -49,6 +50,9 @@ Tick simQuantum = 0;
 Tick simQuantumStart = 0;
 
 std::vector<int> eventqHostCpus;
+
+BarrierMode eventqBarrierMode = BarrierMode::Cv;
+unsigned eventqBarrierSpinIters = 0;
 
 //
 // Main Event Queues

@@ -74,6 +74,17 @@ class Root(SimObject):
         [], "host CPUs to pin eventq threads to"
     )
 
+    # Mechanism used by the per-quantum global barrier in a multi-eventq
+    # simulation. "cv" (default) preserves the historical condition-variable
+    # behaviour; "spin" busy-waits (only sensible with eventq_host_cpus
+    # pinning); "hybrid" spins eventq_barrier_spin_iters times then sleeps.
+    eventq_barrier_mode = Param.String(
+        "cv", "quantum barrier mechanism: cv | spin | hybrid"
+    )
+    eventq_barrier_spin_iters = Param.Unsigned(
+        0, "hybrid barrier: spin iterations before falling back to the cv"
+    )
+
     full_system = Param.Bool("if this is a full system simulation")
 
     # Time syncing prevents the simulation from running faster than real time.

@@ -60,6 +60,7 @@ namespace gem5
 
 class EventQueue;       // forward declaration
 class BaseGlobalEvent;
+enum class BarrierMode; // defined in base/barrier.hh
 
 //! Simulation Quantum for multiple eventq simulation.
 //! The quantum value is the period length after which the queues
@@ -81,6 +82,16 @@ extern Tick simQuantumStart;
 //! pinned to (index i pins the thread driving main event queue i).
 //! Empty means no pinning.
 extern std::vector<int> eventqHostCpus;
+
+//! Mechanism used by the per-quantum global barrier (BaseGlobalEvent).
+//! Cv is the default and leaves the serial/single-eventq behaviour
+//! unchanged; Spin/Hybrid trade a busy-wait for the futex sleep and are
+//! only appropriate under host-thread pinning (see eventqHostCpus).
+extern BarrierMode eventqBarrierMode;
+
+//! For BarrierMode::Hybrid: spin iterations before falling back to the
+//! condition variable.
+extern unsigned eventqBarrierSpinIters;
 
 //! Current number of allocated main event queues.
 extern uint32_t numMainEventQueues;

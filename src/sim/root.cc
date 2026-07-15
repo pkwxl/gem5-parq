@@ -39,6 +39,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "base/barrier.hh"
 #include "base/hostinfo.hh"
 #include "base/logging.hh"
 #include "base/trace.hh"
@@ -189,6 +190,17 @@ Root::Root(const RootParams &p, int)
     simQuantum = p.sim_quantum;
     eventqHostCpus.assign(p.eventq_host_cpus.begin(),
                           p.eventq_host_cpus.end());
+
+    if (p.eventq_barrier_mode == "cv")
+        eventqBarrierMode = BarrierMode::Cv;
+    else if (p.eventq_barrier_mode == "spin")
+        eventqBarrierMode = BarrierMode::Spin;
+    else if (p.eventq_barrier_mode == "hybrid")
+        eventqBarrierMode = BarrierMode::Hybrid;
+    else
+        fatal("eventq_barrier_mode must be one of cv|spin|hybrid, got '%s'",
+              p.eventq_barrier_mode);
+    eventqBarrierSpinIters = p.eventq_barrier_spin_iters;
 
     // Some of the statistics are global and need to be accessed by
     // stat formulas. The most convenient way to implement that is by

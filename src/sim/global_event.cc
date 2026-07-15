@@ -37,7 +37,7 @@ namespace gem5
 std::mutex BaseGlobalEvent::globalQMutex;
 
 BaseGlobalEvent::BaseGlobalEvent(Priority p, Flags f)
-    : barrier(numMainEventQueues),
+    : barrier(numMainEventQueues, eventqBarrierMode, eventqBarrierSpinIters),
       barrierEvent(numMainEventQueues, NULL)
 {
 }
