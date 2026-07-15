@@ -1936,3 +1936,159 @@ numactl 绑内存）记录于此，供有独占宿主时复测。
 ~21-26µs/quantum → 期望 ~2µs）的**前置条件**：自旋 + 超配/被抢占
 = 灾难（自旋线程烧掉被等线程需要的核），绑核 + 无超线程 + 核数
 富余则自旋是安全的。本节落地后，自旋屏障成为已解锁的下一步。
+
+## 11. 迁移到 FS 模式：3-level 检查点重放，撞上 APIC 中断跨域唤醒墙
+
+### 11.1 背景与做法
+
+9.9 的结论是 SE 模式对多线程客户机的 OS/线程语义仿真不足，正是
+parti-gem5 选 FS 模式的理由。本节起把并行 EventQueue 切分搬到 FS
+模式（真实客户机内核负责线程生命周期/arena/TLS，gem5 不再仿真这些）。
+
+为避开"Atomic-on-Ruby 跑 Timing 速度、开机要几小时"的问题，采用
+**跨层次检查点**：
+
+- `docs/refs/scripts/x86_fs_classic_save_ckpt.py`：在 **classic
+  NoCache Atomic**（真原子访存、无 Ruby 状态机）上开机，把 `threads`
+  基准 base64 塞进 `/root/threads`，在其计时区（ROI）**之前**的
+  `m5 exit` 处存检查点。检查点只带物理内存（`.pmem`）+ CPU 架构态
+  + 设备态，全部与缓存层次无关，因此可跨层次重放。
+- `docs/refs/scripts/x86_fs_mesi3_parallel_eventq.py`：用
+  `CHECKPOINT_DIR=...` 把该检查点重放进 **MESI_Three_Level** 并行
+  配置，直接落到 ROI，免重开机。`PARALLEL_EVENTQ=1` 开切分。
+
+**域映射（4 核、1 个共享 L3、2 个 DDR 通道 → 8 个 EventQueue）**：
+域 0 = DMA + 所有设备 + uncore；域 i+1（i=0..3）= 核 i + 其私有 L1
+（含 sequencer/L1 缓存/**local APIC**）+ 其私有 L2 + 对应路由器；
+域 5 = 共享 L3；域 6..7 = 各 directory + 其下游 DRAM MemCtrl + 路由器。
+`SIM_QUANTUM_TICKS=300`（正确性优先：卡在最小 *classic* 跨域边，即
+iobus/IOXBar 的 `forward_latency`=1 板周期=333 tick @3GHz 之下），
+`LINK_LATENCY=20` ruby 周期。
+
+**里程碑（已达成）**：classic 检查点成功生成于
+`/workspace/gem5-ckpt/x86-threads3-roi-classic`（`m5.cpt` 373KB +
+`board.physmem.store0.pmem` 87MB + IDE cow 3.6MB）。开机到 login 在
+本沙箱实际耗时约 5.5 小时（脚本注释预期"几分钟"，严重偏离——疑似
+宿主争抢 / Atomic-on-FS 比注释假设慢；但确实跑通、无错）。
+
+### 11.2 并行重放：`activateContext` 跨域调度 assert（新墙）
+
+`PARALLEL_EVENTQ=1` 重放**几乎立刻崩溃**（tick 5305999202821，
+客户机一行都没跑：`stats.txt` 空、console 无输出、未到
+`m5 resetstats`），退出码 134（SIGABRT）：
+
+```
+eventq.hh:759: EventQueue::schedule(...): Assertion `when >= getCurTick()' failed.
+```
+
+**回溯（自底向上）**：
+
+```
+doSimLoop → EventQueue::serviceOne              ← 某个设备/uncore 域线程
+NoncoherentXBar::recvTimingReq                   ← PIO xbar（域 0）
+RubyPort::PioResponsePort::recvTimingReq
+X86ISA::Interrupts::recvMessage                  ← APIC 投递一个中断
+BaseSimpleCPU::wakeup
+TimingSimpleCPU::activateContext                 ← 调度该 CPU 的 fetch 事件
+   → EventQueue::schedule(...)  ✗ when < 目标队列 curTick
+```
+
+**诊断——APIC 中断投递路径跨域**：中断消息在 PIO-xbar 线程
+（**域 0**）上被 service，却要唤醒 **核 i**（其 fetch 事件在
+**域 i+1**）。域 0 用**自己的** TLS `curTick` 算出 `when`，调度到
+域 i+1 的队列，而后者已推进过了那个 tick（最多领先一个 quantum）→
+`when < 目标 curTick`，正是跨域"调度到过去"。
+
+这与 9.6 修过的 SE 模式 `activateContext` 跨域墙**同一家族**，但
+**触发路径不同**：9.6 是 `clone3 → initState → activateContext`，
+9.6 的 quantum 边界 snap 没覆盖到**中断投递**这条路；而且这里是
+**PIO/xbar 这条 classic 边**在做跨域调用（与 parallel-eventq-fs-
+device-wall 记录的 FS 设备墙一致——Ruby int_link 的修复都不触及它）。
+
+### 11.3 串行重放对照（进行中 / 待补）
+
+同配置 `PARALLEL_EVENTQ=0` 单 EventQueue 重放**不可能触发**该 assert
+（单队列无跨域调度）。其作用：(1) 证明 classic→MESI_Three_Level
+跨层次检查点重放本身正确；(2) 产出并行跑必须逐字节匹配的参考
+`stats.txt`。本次运行**尚在 ROI 中**（`threads 200000 1` 在 Timing
+CPU + 详细 MESI-3 Ruby 上很慢，且 `chunk_size=1` 是最坏共享），
+结果 simTicks 待补。输出目录 `/tmp/fs3-restore-serial`。
+
+### 11.4 下一步候选（待抉择，留给新会话调试）
+
+1. **把 9.6 的激活 snap 延伸到中断路径**：让
+   `TimingSimpleCPU::activateContext`（或 `BaseSimpleCPU::wakeup`）
+   在被跨域调用时 snap 到 quantum 边界 / 改由属主线程调度——9.6 修法
+   的直接类比，只是对象换成 APIC 驱动的唤醒。属核心调度改动，需重做
+   正确性论证。
+2. **把 local APIC / 中断控制器放到与其核同一个域**，使
+   `recvMessage → wakeup` 不再跨域。需先确认 PIO xbar 那条边能否
+   根本不跨域（它是设备侧 classic port，可能只是把墙挪个位置）。
+3. 其它：stop-the-world quantum 边界、或把中断投递降级为经属主
+   队列的 one-shot kick 事件（8.8 kick 机制的复用）。
+
+崩溃日志 `/tmp/fs3-restore-par.log`。参见 memory
+[[parallel-eventq-fs-device-wall]]、[[parallel-eventq-l2-project-status]]。
+
+### 11.5 根因：不是"未覆盖的新路径"，是 9.6 snap 的量子网格锚点 bug
+
+新会话逐层核对 11.4 的三个候选后，发现 **11.2 对这堵墙的定性是错的**，
+三个候选没有一个正是对的修法：
+
+- **候选 2 直接死路**：`config.ini` 证实 local APIC（`interrupts`）**本来
+  就**和它的核同域（核 i → `eventq_index=i+1`）。崩溃与 APIC 自己的
+  `eventq_index` 无关——`recvMessage` 是被 PIO xbar（域 0）的
+  `serviceOne` **同步**调用的，跑在**域 0 的线程**上，改 APIC 的域改
+  不了这一点。
+- **候选 1 的前提（"9.6 的 snap 没覆盖中断路径"）也是错的**：中断路径
+  最终走到的正是 9.6 已经装好的那个 `activateContext` snap
+  （`timing.cc`），而且这次的二进制**包含**该 snap（07-14 23:44 编译，
+  晚于 9.6 的 `fd31250bf8` @09:55）。崩溃时 snap 分支**确实被走到**
+  （`curEventQueue()`=域 0 xbar 线程 ≠ `eventQueue()`=核的域 i+1）。
+
+**真正的 bug**：9.6 的 snap 算的是
+
+```cpp
+when = divCeil(curTick() + 1, simQuantum) * simQuantum;   // 网格：Q 的整数倍，锚在 0
+```
+
+但 barrier 网格并不锚在 0，而锚在**并行模式开始的那个 tick**：
+`simulate.cc` 在 `curTick() + simQuantum` 建 `GlobalSyncEvent`，
+`global_event.cc:161` 每次在 `curTick() + repeat` 重排——barrier 落在
+`startTick + k*Q`。**SE 模式仿真从 tick 0 起，两套网格重合**，所以每一次
+SE 跑都对；**FS 重放的 startTick 是检查点 tick（5305999202821 ≡ 121
+(mod 300)）**，两套网格错位 121 tick。于是在一个量子窗口
+`[base, base+300)`（base ≡ 121 mod 300）内：若中断在域 0 处于窗口前段
+（`a ≤ 178`）时投递，而目标核的域已推进过 `base+179`（`b > 179`），
+snap 会向下取整到最近的 300 的整数倍 `base+179`，落在目标队列
+`_curTick` 之后……不，之**前** → 目标队列上 `assert(when >= getCurTick())`
+失败。正是那个开机即崩、tick 卡在 5305999202821 的现象。全树只有
+`timing.cc` 这一个量子 snap 点（grep 确认）。
+
+**修法（候选 1 的正确、且更小的形态）**：把 snap 对齐到 **barrier
+网格**——这本就是 9.6 注释写的原意（"不早于目标合并这次插入的那个
+barrier"）。新增全局锚点 `simQuantumStart`（`eventq.{hh,cc}`），在
+`simulate.cc` 建 `GlobalSyncEvent` 处置为 `curTick()`；snap 改为
+
+```cpp
+when = simQuantumStart +
+       divCeil(curTick() + 1 - simQuantumStart, simQuantum) * simQuantum;
+```
+
+**基线中性（可证，无需复测）**：当 `simQuantumStart == 0`（串行；以及从
+tick 0 起跑的 SE 模式）该式**逐字节退化回**旧式 `divCeil(curTick()+1,
+Q)*Q`，故所有既往 SE/串行结果不变；只有 startTick≠0（即检查点重放）
+时行为才不同。串行参考跑（旧二进制，`/tmp/fs3-restore-serial`）因此仍
+有效。
+
+**验证**：重编 `build/X86_MESI_Three_Level/gem5.opt`，同一并行重放命令
+（输出 `/tmp/fs3-restore-par-fix`）——**开机即崩的 assert 消失**：进程
+起了全部 8 个 EventQueue 线程、~366% CPU 真并行、越过 tick
+5305999202821 的中断投递墙、日志零 assert/abort，进入 ROI 继续跑。
+后续是否撞上更下一层的墙（真实客户机 ROI 在 Timing+MESI-3 上很慢）
+待这次长跑给出——串行参考 `simTicks` 也仍在 ROI 中、待补。
+
+改动 4 文件：`src/sim/eventq.{hh,cc}`（`simQuantumStart` 全局）、
+`src/sim/simulate.cc`（建 barrier 处置锚点）、`src/cpu/simple/timing.cc`
+（snap 对齐到锚点）。崩溃日志见 `/tmp/fs3-restore-par.log`；修复后日志
+`/tmp/fs3-restore-par-fix.log`。
