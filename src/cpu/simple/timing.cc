@@ -221,17 +221,24 @@ TimingSimpleCPU::activateContext(ThreadID thread_num)
         Tick when;
         if (inParallelMode && curEventQueue() != eventQueue()) {
             // Cross-domain activation (clone starting a thread on another
-            // CPU, futex wake): this thread's curTick -- and therefore
+            // CPU, futex wake, or an APIC interrupt delivered on a device
+            // domain's thread): this thread's curTick -- and therefore
             // clockEdge(), which is computed from it and also mutates this
             // CPU's Clocked cache -- can be up to one quantum away from
             // the target queue's time, so an activation tick derived from
             // it can land in the target's past (observed as eventq.hh's
-            // schedule() assert; design doc section 9.6). Snap to the next
-            // quantum boundary instead: never behind any queue, and no
+            // schedule() assert; design doc sections 9.6, 11.5). Snap to the
+            // next barrier boundary instead: never behind any queue, and no
             // earlier than the barrier where the target merges this
-            // cross-thread insertion anyway.
+            // cross-thread insertion anyway. The barrier grid is anchored at
+            // simQuantumStart (curTick() when parallel mode began), which is
+            // tick 0 in SE mode but an arbitrary checkpoint tick after an FS
+            // restore -- snapping to bare multiples of simQuantum would then
+            // land off the barrier grid and still assert.
             assert(simQuantum > 0);
-            when = divCeil(curTick() + 1, simQuantum) * simQuantum;
+            when = simQuantumStart +
+                   divCeil(curTick() + 1 - simQuantumStart, simQuantum) *
+                       simQuantum;
         } else {
             when = clockEdge(Cycles(0));
         }

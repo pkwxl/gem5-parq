@@ -286,6 +286,14 @@ simulate(Tick num_cycles)
                 "host hardware threads; expect severe barrier stalls",
                 numMainEventQueues, std::thread::hardware_concurrency());
 
+        // Anchor the quantum grid at the tick parallel mode begins. Barrier
+        // boundaries then sit at simQuantumStart + k*simQuantum, matching the
+        // GlobalSyncEvent created just below. After a checkpoint restore this
+        // start tick is not a multiple of simQuantum, so cross-domain snap
+        // sites must align to this anchor rather than to multiples of the
+        // quantum from tick 0 (see timing.cc activateContext).
+        simQuantumStart = curTick();
+
         quantum_event.reset(
             new GlobalSyncEvent(curTick() + simQuantum, simQuantum,
                                 EventBase::Progress_Event_Pri, 0));

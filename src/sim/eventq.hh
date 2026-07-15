@@ -68,6 +68,15 @@ class BaseGlobalEvent;
 //! Queue B should be at least simQuantum ticks away in future.
 extern Tick simQuantum;
 
+//! Tick at which the current parallel-mode quantum grid is anchored, i.e.
+//! curTick() at the point simulate() created the GlobalSyncEvent. Barrier
+//! boundaries sit at simQuantumStart + k*simQuantum. In serial mode / when
+//! simulation starts at tick 0 this is 0, but after a checkpoint restore the
+//! start tick is arbitrary, so anything snapping to the quantum grid (e.g.
+//! cross-domain activation ticks) must anchor to this, not to multiples of
+//! simQuantum from 0.
+extern Tick simQuantumStart;
+
 //! Host CPU ids the per-event-queue simulation threads should be
 //! pinned to (index i pins the thread driving main event queue i).
 //! Empty means no pinning.
