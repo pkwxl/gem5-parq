@@ -268,4 +268,18 @@ print(
 )
 
 simulator = Simulator(board=board)
+
+# STAT_DUMP_PERIOD (ticks) schedules a periodic mid-run stats dump. Each dump
+# is a GlobalEvent whose process() calls pythonDump() -> CPython; used to
+# exercise/repro the "stats dump on a subordinate EventQueue thread" wall
+# (design doc 12.4) quickly instead of waiting for the ROI-end dump. Default
+# 0 = off (no behaviour change).
+_stat_period = int(os.environ.get("STAT_DUMP_PERIOD", "0"))
+if _stat_period:
+    import m5.stats as _m5stats
+
+    simulator._instantiate()  # build C++ objects + populate mainEventQueue
+    _m5stats.periodicStatDump(_stat_period)
+    print(f"[parallel-eventq] periodic stat dump every {_stat_period} ticks")
+
 simulator.run()

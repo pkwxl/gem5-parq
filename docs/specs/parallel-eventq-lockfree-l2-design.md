@@ -2197,3 +2197,55 @@ FS 8-EventQueue 自旋 A/B **未完成**，两个原因如实记录：
 
 故 FS 自旋 A/B 的前置是先解 12.4.2 这堵 pythonDump 跨线程墙（并腾出 MESI 二进制
 重编）。SE 侧的结论（12.3）已经是干净、可复现、和理论吻合的完整证据。
+
+### 12.5 pythonDump 跨线程墙：根因 + 修复 + 实测（已解决）
+
+**根因确认**（读码）：`GlobalEvent::BarrierEvent::process()`
+（`global_event.cc`）原本让**最后到达屏障的那个线程**执行
+`_globalEvent->process()`（`if (globalBarrier()) ...`）。多队列下这个线程是
+不确定的——可能是任一从属 EventQueue 线程。而 `StatEvent`（一个 GlobalEvent，
+`stat_control.cc`，由 `m5 dumpstats` pseudo-op 或 `periodicStatDump` 调度）的
+`process()` → `statistics::dump()` → `pythonDump()`
+（`src/python/pybind11/stats.cc`）会 `py::module_::import("m5.stats")`——一次
+CPython 调用。**关键约束**：`simulate()` 的 pybind 绑定（`event.cc:108`）
+**没有** `gil_scoped_release`，故主线程在整个事件循环期间**持有 GIL**；从属线程
+从来不是 Python 线程、也不持 GIL。因此从属线程跑 `pythonDump()` 直接段错误
+（就是 12.4.2 的回溯）。这排除了"在 pythonDump 里 `gil_scoped_acquire`"的修法：
+从属线程会阻塞在主线程持有的 GIL 上，而主线程正卡在同一个屏障的第二道
+`globalBarrier()` 等它——**死锁**。
+
+**修复**（`src/sim/global_event.cc`，一处）：把 GlobalEvent 的单一执行者从
+"最后到达者"改成"驱动 main event queue 0 的线程"——多队列下这就是持 GIL 的主
+（Python）线程：
+
+```cpp
+globalBarrier();                              // 全部到达
+if (curEventQueue() == mainEventQueue[0])     // 只有 queue-0/主线程
+    _globalEvent->process();
+globalBarrier();                              // 等 process 完成
+```
+
+`curEventQueue()` 是每线程 TLS（`doSimLoop(eq)` 里 set），queue-0 线程恒等于
+`mainEventQueue[0]`，唯一。**串行中性**：serial 下 queue 0 是唯一队列，与旧
+"最后到达者"完全等价（且 SE 精确/基线复验逐字节不变，见下）。只改
+`GlobalEvent`，**不碰** `GlobalSyncEvent`（量子屏障热路径），因为后者的
+`process()` 只是重排自身、不碰 Python。这本质上是一个上游都该修的隐藏 bug：
+任何多队列跑 + 中途 Python stat dump，只要最后到达者是从属线程就会崩。
+
+**验证**：
+- **SE 无回归**（`build/X86/gem5.opt` 重编）：serial cv 仍 31555788000；并行精确
+  cv/spin/hybrid 仍全部 6389611500 Validating Success——改动对正常并行运行零影响。
+- **FS 实测（真靶子）**：给 FS 脚本加了 `STAT_DUMP_PERIOD` 环境开关（默认关，
+  调 `m5.stats.periodicStatDump`），把崩溃点从 ROI 末（旧跑 3h20m 才到）提前到
+  重放后几秒。修复后的 `build/X86_MESI_Three_Level/gem5.opt`（用改名规避
+  ETXTBSY——把串行参考跑占用的旧二进制 `mv` 成 `gem5.opt.serialref`，运行中的
+  进程按 inode 继续、重编落到腾空的路径，串行参考跑不受影响）跑
+  `PARALLEL_EVENTQ=1 HOST_PIN_CPUS=8..15 STAT_DUMP_PERIOD=1000000`：8 个 EventQueue
+  线程真并行，**连续 52 次 stat dump 全部成功、零段错误**（跑到手动停）。旧行为
+  下每次 dump 落到从属线程的概率 ~7/8，52 次全躲开 queue 0 的概率 (1/8)^52 ≈ 0——
+  故这是对修复的确定性证明。日志 `/tmp/fs3-pydump-fix.log`。
+
+**FS 自旋 A/B 现在解锁**（尚未跑）：pythonDump 墙已除、MESI 二进制已带自旋+本修复
+重编好。剩下就是那组多小时的 FS cv-vs-spin 长跑本身，以及串行参考跑
+（pid 1540862，`/tmp/fs3-restore-serial`，旧二进制、串行中性、仍在 ROI 中）给出
+对照 simTicks——都还 TBD。
