@@ -129,8 +129,17 @@ BaseGlobalEvent::BarrierEvent::~BarrierEvent()
 void
 GlobalEvent::BarrierEvent::process()
 {
-    // wait for all queues to arrive at barrier, then process event
-    if (globalBarrier()) {
+    // Wait for all queues to arrive at the barrier, then run the event on
+    // the thread driving main event queue 0. In a multi-eventq run that
+    // thread is the main (Python) thread, which holds the GIL; other queues
+    // are driven by subordinate threads with no Python thread state. A
+    // GlobalEvent whose process() calls into CPython (e.g. a stats dump via
+    // pythonDump()) segfaults if run on a subordinate thread, so the runner
+    // must be deterministic (queue 0), not whichever thread happens to
+    // arrive last. In serial mode queue 0 is the only queue, so this is a
+    // no-op relative to the old "last arriver" selection.
+    globalBarrier();
+    if (curEventQueue() == mainEventQueue[0]) {
         _globalEvent->process();
     }
 
