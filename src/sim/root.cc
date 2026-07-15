@@ -187,6 +187,8 @@ Root::Root(const RootParams &p, int)
     lastTime.setTimer();
 
     simQuantum = p.sim_quantum;
+    eventqHostCpus.assign(p.eventq_host_cpus.begin(),
+                          p.eventq_host_cpus.end());
 
     // Some of the statistics are global and need to be accessed by
     // stat formulas. The most convenient way to implement that is by

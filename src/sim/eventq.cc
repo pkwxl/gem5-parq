@@ -47,6 +47,8 @@ namespace gem5
 
 Tick simQuantum = 0;
 
+std::vector<int> eventqHostCpus;
+
 //
 // Main Event Queues
 //

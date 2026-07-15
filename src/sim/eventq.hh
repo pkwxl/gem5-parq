@@ -68,6 +68,11 @@ class BaseGlobalEvent;
 //! Queue B should be at least simQuantum ticks away in future.
 extern Tick simQuantum;
 
+//! Host CPU ids the per-event-queue simulation threads should be
+//! pinned to (index i pins the thread driving main event queue i).
+//! Empty means no pinning.
+extern std::vector<int> eventqHostCpus;
+
 //! Current number of allocated main event queues.
 extern uint32_t numMainEventQueues;
 

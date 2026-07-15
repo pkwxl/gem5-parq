@@ -42,7 +42,13 @@
 
 #include "sim/simulate.hh"
 
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 #include <atomic>
+#include <cstring>
 #include <thread>
 
 #include "base/logging.hh"
@@ -106,7 +112,14 @@ class SimulatorThreads
                     [this](EventQueue *eq) {
                         thread_main(eq);
                     }, mainEventQueue[i]);
+                if (!eventqHostCpus.empty())
+                    pinThread(threads.back().native_handle(),
+                              eventqHostCpus[i], i);
             }
+            // The main thread drives queue 0 and takes part in every
+            // quantum barrier, so pin it as well.
+            if (!eventqHostCpus.empty())
+                pinSelf(eventqHostCpus[0]);
         }
 
         // This method is called from the main thread. All subordinate
@@ -141,6 +154,42 @@ class SimulatorThreads
     }
 
   protected:
+    /**
+     * Pin the thread driving event queue qid to host CPU cpu. Failure
+     * is only a warning: the requested CPU may be outside the
+     * container/cgroup cpuset, and an unpinned thread is still correct.
+     */
+    void
+    pinThread(std::thread::native_handle_type handle, int cpu, uint32_t qid)
+    {
+#if defined(__linux__)
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(cpu, &cpuset);
+        int err = pthread_setaffinity_np(handle, sizeof(cpuset), &cpuset);
+        if (err)
+            warn("eventq %u: failed to pin thread to host CPU %d (%s)",
+                 qid, cpu, std::strerror(err));
+        else
+            inform("eventq %u: pinned thread to host CPU %d", qid, cpu);
+#else
+        warn_once("eventq host-CPU pinning requested but not supported "
+                  "on this platform");
+#endif
+    }
+
+    //! Pin the calling thread (the main thread, driving queue 0).
+    void
+    pinSelf(int cpu)
+    {
+#if defined(__linux__)
+        pinThread(pthread_self(), cpu, 0);
+#else
+        warn_once("eventq host-CPU pinning requested but not supported "
+                  "on this platform");
+#endif
+    }
+
     /**
      * The main function for all subordinate threads (i.e., all threads
      * other than the main thread).  These threads start by waiting on
@@ -226,6 +275,16 @@ simulate(Tick num_cycles)
     if (numMainEventQueues > 1) {
         fatal_if(simQuantum == 0,
                  "Quantum for multi-eventq simulation not specified");
+
+        fatal_if(!eventqHostCpus.empty() &&
+                 eventqHostCpus.size() < numMainEventQueues,
+                 "eventq_host_cpus has %d entries but there are %d event "
+                 "queues", eventqHostCpus.size(), numMainEventQueues);
+
+        warn_if(numMainEventQueues > std::thread::hardware_concurrency(),
+                "%d event-queue threads oversubscribe the %d available "
+                "host hardware threads; expect severe barrier stalls",
+                numMainEventQueues, std::thread::hardware_concurrency());
 
         quantum_event.reset(
             new GlobalSyncEvent(curTick() + simQuantum, simQuantum,

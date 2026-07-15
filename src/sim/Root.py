@@ -68,6 +68,12 @@ class Root(SimObject):
     # Needs to be set explicitly for a multi-eventq simulation.
     sim_quantum = Param.Tick(0, "simulation quantum")
 
+    # Host CPU ids to pin the per-event-queue simulation threads to
+    # (index i pins the thread driving event queue i). Empty = no pinning.
+    eventq_host_cpus = VectorParam.Int(
+        [], "host CPUs to pin eventq threads to"
+    )
+
     full_system = Param.Bool("if this is a full system simulation")
 
     # Time syncing prevents the simulation from running faster than real time.
