@@ -158,6 +158,14 @@ if "--ruby" in sys.argv:
         help="Simulation quantum for --parallel-l2-eventq PDES mode. "
         "Default: %(default)s",
     )
+    parser.add_argument(
+        "--eventq-host-cpus",
+        type=str,
+        default=None,
+        help="Comma-separated host CPU ids to pin the per-EventQueue "
+        "simulation threads to (index i pins the thread driving event "
+        "queue i), e.g. 0,1,2,3,4,5. Requires --parallel-l2-eventq.",
+    )
 
 args = parser.parse_args()
 
@@ -397,5 +405,9 @@ if args.ruby and args.parallel_l2_eventq:
             max_quantum,
         )
     root.sim_quantum = quantum
+    if args.eventq_host_cpus is not None:
+        root.eventq_host_cpus = [
+            int(c) for c in args.eventq_host_cpus.split(",")
+        ]
 
 Simulation.run(args, root, system, FutureClass)
