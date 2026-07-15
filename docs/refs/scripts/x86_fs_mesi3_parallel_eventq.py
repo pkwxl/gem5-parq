@@ -282,4 +282,13 @@ if _stat_period:
     _m5stats.periodicStatDump(_stat_period)
     print(f"[parallel-eventq] periodic stat dump every {_stat_period} ticks")
 
-simulator.run()
+# MAX_TICKS (ticks) bounds the run to a fixed window from the restore point
+# (a MAX_TICK exit dumps stats from the main thread and stops), for wall-clock
+# A/B of the barrier modes without running the whole multi-hour ROI. Default
+# 0 = run to a real exit event.
+_max_ticks = int(os.environ.get("MAX_TICKS", "0"))
+if _max_ticks:
+    print(f"[parallel-eventq] bounded run: {_max_ticks} ticks from restore")
+    simulator.run(max_ticks=_max_ticks)
+else:
+    simulator.run()

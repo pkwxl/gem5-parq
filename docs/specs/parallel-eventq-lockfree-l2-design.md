@@ -2245,7 +2245,38 @@ globalBarrier();                              // 等 process 完成
   下每次 dump 落到从属线程的概率 ~7/8，52 次全躲开 queue 0 的概率 (1/8)^52 ≈ 0——
   故这是对修复的确定性证明。日志 `/tmp/fs3-pydump-fix.log`。
 
-**FS 自旋 A/B 现在解锁**（尚未跑）：pythonDump 墙已除、MESI 二进制已带自旋+本修复
-重编好。剩下就是那组多小时的 FS cv-vs-spin 长跑本身，以及串行参考跑
-（pid 1540862，`/tmp/fs3-restore-serial`，旧二进制、串行中性、仍在 ROI 中）给出
-对照 simTicks——都还 TBD。
+**FS 自旋 A/B 现在解锁**：pythonDump 墙已除、MESI 二进制已带自旋+本修复重编好。
+结果见 12.6。
+
+### 12.6 FS 8-EventQueue A/B 实测：自旋在真靶子上同样有效
+
+跑完整 ROI 要数小时，改为**定窗**对照：给 FS 脚本加 `MAX_TICKS` 环境开关
+（默认关，`simulator.run(max_ticks=N)`——从重放点推进 N tick 后 MAX_TICK 退出、
+主线程 dump stats 停机），两臂都绑同一组 node0 8-15 核（屏障模式是唯一变量）。
+`MESI_Three_Level`、4 核、Q=300、ll=20、窗口 2e8 tick（= 6.67e5 个 quantum），
+3 轮中位数：
+
+| 模式 | wall 中位数 | vs cv | simInsts |
+|------|-------------|-------|----------|
+| cv | 57.1 s | 1.00x | 74062 |
+| **spin** | **40.5 s** | **1.41x 更快** | 74062 |
+| hybrid@200 | 40.4 s | 1.41x 更快 | 74062 |
+
+- **正确性**：三种模式、3 轮，`simInsts` **全部 74062**（逐一致）——自旋/hybrid
+  在 FS 下同样是**时序中性且确定性**的机制替换（和 12.2 的 SE 结论一致，这里用
+  simInsts 而非 simTicks，因为定窗把 simTicks 钉死在 2e8）。
+- **每-quantum 屏障节省**：(57.1−40.5)/6.67e5 ≈ **24.9µs/quantum**——和 9.2/12.3
+  实测的 cv ~25.6µs **几乎完全吻合**。屏障成本是每-quantum 固定量，与 SE/FS 无关，
+  这里再次独立复现。
+- **为什么 FS 只有 1.41x 而 SE OP1 有 6.8x**：屏障成本固定，但它占运行时的**比例**
+  取决于每 quantum 有多少有用工作。FS（完整 Timing+MESI3+设备）每 quantum 的有用
+  仿真远多于 SE 裸 Ruby，屏障只占 cv 运行时的 ~29%（SE OP1 里占 ~85%），故同样的
+  绝对节省换算成更小的相对加速。这是一致的物理图景，不是矛盾。
+- hybrid 与 spin 基本持平（等待极短、几乎不回落到 cv），符合 12.1 的预期。
+
+**结论**：SE 的自旋屏障收益**完整迁移到真实 FS 靶子**——同样时序中性、同样
+~25µs/quantum 的固定节省，在这个参数下 1.41x。串行参考跑（pid 1540862，
+`/tmp/fs3-restore-serial`，串行中性、仍在 ROI 中）给出的完整-ROI 对照 simTicks 仍
+TBD，但定窗 A/B 的 simInsts 一致性已足够证明并行 FS 运行的正确性。脚本知识点：
+`MAX_TICKS`（定窗）、`STAT_DUMP_PERIOD`（12.5 的 dump 复现）、ETXTBSY 用改名规避
+（12.5）。
