@@ -34,6 +34,9 @@ this file, for anything related to this work. New investigations get their own `
 - Known operational pitfall specific to this project: never send `SIGUSR1`/`SIGUSR2` to a running
   parallel-`EventQueue` gem5 process (async stat dump on a non-main thread without the GIL segfaults it) —
   see `docs/specs/S-007-spin-barrier-and-milestone.md` §14 for the safe way to read a live tick instead.
+- Host CPUs `54-55,92-111` are kernel-isolated (`isolcpus=`, see `/proc/cmdline`) for clean A/B timing.
+  `54-55` is on NUMA node 0 (node 0 spans 0-55) — pin the serial arm there. `92-111` is on NUMA node 1
+  (node 1 spans 56-111) — pin the parallel-spin arm there.
 
 ## Branches
 
