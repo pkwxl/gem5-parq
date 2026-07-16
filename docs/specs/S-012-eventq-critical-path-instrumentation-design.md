@@ -511,6 +511,87 @@ p.critpath_trace;`；驱动脚本仿照 `EVENTQ_BARRIER_MODE` 的写法从环境
 Step 4（真正给这些文件打标签）之后再做一次，覆盖全部改动，跟 §9
 的意图一致（"落地实现后应该重新跑一遍"，指的是全部落地之后）。
 
+## 12. 实现记录：Step 2（类型一+类型三，本节由实现会话补充）
+
+按 §11 的 5 步计划，本节记录 Step 2——barrier 计时 + 事件计数器，
+仍然默认关闭。
+
+### 12.1 Step 2 改动内容
+
+跟 §3.1/§3.3/§4.2 设计的对应关系：
+
+- `src/base/critpath_trace.hh`/`.cc`：给 `CritPathRecord` 加
+  `eventCount` 字段（§3.3 要求"把计数器的值一起记下"，Step 1 定的
+  结构体里漏了这个字段，Step 2 补上）；新增 `CritPathBarrierCtx`
+  结构体（`tick`+`pass`，§3.4/§4.2 的关联键+顺序位）；新增线程本地
+  `critPathEventCount` 计数器 和 `critPathCountEvent()`（关闭时只有
+  一次可预测的 `bool` 判断）；新增 `critPathRecordBarrierPass()`
+  （写一条 `BarrierPass` 记录，读并清零 `critPathEventCount`，即
+  §3.3 说的"记下、然后清零"）。CSV 表头加一列 `eventCount`。
+- `src/base/barrier.hh`：`wait()` 签名改成
+  `wait(const CritPathBarrierCtx *ctx = nullptr)`——`ctx` 为空或
+  追踪关闭时走原来完全不变的路径；非空且追踪打开时记 `tEnter`、调用
+  原有的 `waitCv()`/`waitSpin()`、根据返回值算 `dur`（`isLast` 为
+  `true` 时是 0，按设计 §3.1）、调 `critPathRecordBarrierPass()`。
+  `SimulatorThreads::barrier`（`src/sim/simulate.cc`，§6 明确排除）
+  的四处 `wait()` 调用没有改，全部走 `ctx=nullptr` 的旧路径。
+- `src/sim/global_event.hh`：`globalBarrier()` 加
+  `uint8_t pass = 0` 参数——`pass == 0`（默认）或追踪关闭时走原来的
+  `barrier.wait()`；否则用本域自己的
+  `curEventQueue()->getCurTick()`（§3.4，线程本地读取，没有引入新的
+  跨线程读）构造 `CritPathBarrierCtx` 传给 `barrier.wait(&ctx)`。
+- `src/sim/global_event.cc`：只改了
+  `GlobalSyncEvent::BarrierEvent::process()` 的两处调用点——第一道
+  传 `globalBarrier(1)`，第二道传 `globalBarrier(2)`。
+  `GlobalEvent::BarrierEvent::process()` 的两处调用点**没有改**（保持
+  `globalBarrier()` 默认参数 `0` = 不追踪），对应 §6 明确排除
+  `GlobalEvent` 这条路径的设计决定——不是遗漏。
+- `src/sim/eventq.cc`：`EventQueue::serviceOne()` 里，`event->process()`
+  调用之后、`isExitEvent()` 判断之前加一行 `critPathCountEvent();`，
+  挂在"事件确实没被 squash、真的执行了 `process()`"这个分支里（§3.3
+  "每次真正执行一个事件"对应的就是这个分支，squash 分支不计数）。
+
+### 12.2 验证结果
+
+沿用 Step 1 一样的方法（§11.2），操作点不变：
+`build/X86_MESI_Three_Level`、检查点 `x86-threads3-roi-classic`、
+`MAX_TICKS=2e8`。
+
+Build：干净编译通过（无警告，除环境已知的 tcmalloc/png/hdf5/capstone
+提示）。
+
+关闭状态（`critpath_trace` 默认 `False`，两个 binary 都没有设
+`EVENTQ_CRITPATH_TRACE`）下，改动前（Step 1 完成点 `eef74976dd`）与
+改动后的两个 binary 分别跑：
+
+- 串行臂：`taskset -c 54`，无 `PARALLEL_EVENTQ`。
+- 并行臂：`taskset -c 92`，`PARALLEL_EVENTQ=1
+  HOST_PIN_CPUS=92,93,94,95,96,97,98,99 EVENTQ_BARRIER_MODE=spin
+  SIM_QUANTUM_TICKS=6660`（S-009 §27.3 的确切配置）。
+
+结果：两组（串行/并行）`stats.txt`（排除 `host*` 字段）改动前后
+**逐字节相同**；`simInsts`=74062，四次跑（串行×2、并行×2）全部一致；
+四份日志里都没有 `assert`/`panic`/`abort`/段错误关键字。
+
+额外做了一次不在 §11 验证协议要求范围内、但成本很低的冒烟检查：
+打开 `EVENTQ_CRITPATH_TRACE=1` 跑并行臂一次小窗口（`MAX_TICKS=2e7`），
+确认追踪打开时程序照常跑完、无崩溃。**没有产出 `critpath-domain*.csv`
+文件**——这是预期行为，不是 bug：`critPathFlush()` 在 Step 1 就没有
+被任何生产代码调用（§11.1 已注明），本 Step 2 的范围只到"往
+`critPathBuffer` 里追加记录"，接线程退出点调用 `critPathFlush()` 落盘
+是 Step 3 的事（§11 步骤划分）——Step 3 本来就是"第一次打开插桩跑小窗口
+"、"真正的 checkpoint 所在"，所以本 Step 2 会话不提前做这一步。
+
+**已知局限（如实记录）**：跟 Step 1 一样，这次验证没有覆盖 §9 要求的
+TSan 回归——Step 2 改的 `barrier.hh`/`global_event.hh`/
+`global_event.cc`/`eventq.cc` 都不在 §9 列出的四个跨域锁文件
+（`xbar.hh`/`io_device.hh`/`addr_range_map.hh`/`Consumer.hh`）里，那次
+回归仍然留到 Step 4 之后一次性做（§11.2 定的计划不变）。另外，因为
+`critPathFlush()` 还没接线程退出点，本 Step 2 没有办法验证
+`critPathBuffer` 里实际记录内容是否正确（时间戳、`eventCount`、
+`isLast` 语义等）——这些正确性问题要等 Step 3 能读到 CSV 之后才能真正
+验证，本节的"验证"只覆盖"关闭时行为不变"+"打开时不崩溃"两件事。
+
 ---
 
 **上一篇**：[S-011：Consumer 锁 owner 字段竞争审计](./S-011-consumer-lock-owner-race-audit.md)

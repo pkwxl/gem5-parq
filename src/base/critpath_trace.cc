@@ -15,6 +15,24 @@ bool g_critPathTraceEnabled = false;
 
 thread_local uint32_t critPathDomainId = 0;
 thread_local std::vector<CritPathRecord> critPathBuffer;
+thread_local uint64_t critPathEventCount = 0;
+
+void
+critPathRecordBarrierPass(const CritPathBarrierCtx &ctx, bool isLast,
+                           CritPathClock::duration dur)
+{
+    CritPathRecord r;
+    r.tick = ctx.tick;
+    r.domainId = critPathDomainId;
+    r.kind = CritPathRecordKind::BarrierPass;
+    r.barrierPass = ctx.pass;
+    r.isLast = isLast;
+    r.eventCount = critPathEventCount;
+    r.dur = dur;
+    critPathBuffer.push_back(r);
+
+    critPathEventCount = 0;
+}
 
 void
 critPathFlush()
@@ -27,7 +45,8 @@ critPathFlush()
     OutputStream *os = simout.create(name, false, true);
     std::ostream *s = os->stream();
 
-    *s << "kind,tick,domainId,barrierPass,isLast,dur_ns,lockTag\n";
+    *s << "kind,tick,domainId,barrierPass,isLast,eventCount,dur_ns,"
+          "lockTag\n";
     for (const auto &r : critPathBuffer) {
         *s << (r.kind == CritPathRecordKind::BarrierPass ?
                    "barrier" : "lockwait")
@@ -35,6 +54,7 @@ critPathFlush()
            << "," << r.domainId
            << "," << (unsigned)r.barrierPass
            << "," << (r.isLast ? 1 : 0)
+           << "," << r.eventCount
            << "," << std::chrono::duration_cast<
                         std::chrono::nanoseconds>(r.dur).count()
            << "," << (unsigned)r.lockTag

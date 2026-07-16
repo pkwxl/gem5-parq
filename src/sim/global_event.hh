@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "base/barrier.hh"
+#include "base/critpath_trace.hh"
 #include "sim/eventq.hh"
 
 namespace gem5
@@ -90,7 +91,14 @@ class BaseGlobalEvent : public EventBase
 
         friend class BaseGlobalEvent;
 
-        bool globalBarrier()
+        // `pass` identifies which of the two per-quantum barrier calls
+        // this is (S-012 design §3.1/§4.2): 1 or 2 from
+        // GlobalSyncEvent::BarrierEvent::process()'s two call sites, or
+        // the default 0 from GlobalEvent::BarrierEvent::process()'s
+        // call sites -- GlobalEvent is explicitly out of scope for this
+        // instrumentation (design §6), so 0 means "don't trace this
+        // call" rather than being a third barrier ordinal.
+        bool globalBarrier(uint8_t pass = 0)
         {
             // This method will be called from the process() method in
             // the local barrier events
@@ -101,7 +109,11 @@ class BaseGlobalEvent : public EventBase
             // while waiting on the barrier to prevent deadlocks if
             // another thread wants to lock the event queue.
             EventQueue::ScopedRelease release(curEventQueue());
-            return _globalEvent->barrier.wait();
+            if (pass == 0 || !critPathTracing())
+                return _globalEvent->barrier.wait();
+            const CritPathBarrierCtx ctx{curEventQueue()->getCurTick(),
+                                          pass};
+            return _globalEvent->barrier.wait(&ctx);
         }
 
       public:

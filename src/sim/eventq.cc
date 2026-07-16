@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "base/barrier.hh"
+#include "base/critpath_trace.hh"
 #include "base/logging.hh"
 #include "base/trace.hh"
 #include "cpu/smt.hh"
@@ -254,6 +255,7 @@ EventQueue::serviceOne()
         if (debug::Event)
             event->trace("executed");
         event->process();
+        critPathCountEvent();
         if (event->isExitEvent()) {
             assert(!event->flags.isSet(Event::Managed) ||
                    !event->flags.isSet(Event::IsMainQueue)); // would be silly

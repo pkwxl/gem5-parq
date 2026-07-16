@@ -5,15 +5,17 @@
 
 /**
  * @file
- * S-012 critical-path instrumentation scaffolding (design doc:
+ * S-012 critical-path instrumentation: shared types/state (design doc:
  * docs/specs/S-012-eventq-critical-path-instrumentation-design.md).
  *
- * This header only declares the shared types/state; nothing appends to
- * critPathBuffer yet (that lands with the Barrier::wait() and
- * UncontendedMutex slow-path instrumentation described in the design's
- * §4.1/§4.2 -- separate, later steps). With critpath_trace off (the
- * default), the only per-thread cost this scaffolding adds is the
- * one-time write of critPathDomainId at thread entry (§4.3).
+ * As of Step 2, Barrier::wait() (src/base/barrier.hh) appends
+ * BarrierPass records and EventQueue::serviceOne() (src/sim/eventq.cc)
+ * drives the per-quantum event counter (design §4.2/§3.3). The
+ * UncontendedMutex slow-path LockWait instrumentation (§4.1) is still
+ * unimplemented -- that's Step 4. With critpath_trace off (the
+ * default), the added per-thread cost is: the one-time write of
+ * critPathDomainId at thread entry (§4.3), one predictable bool check
+ * per barrier wait, and one predictable bool check per serviced event.
  */
 
 #ifndef __BASE_CRITPATH_TRACE_HH__
@@ -69,6 +71,11 @@ struct CritPathRecord
     uint8_t barrierPass = 0;  // 1 or 2: which of the two per-quantum
                               // globalBarrier() calls this is.
     bool isLast = false;
+    // Events this domain ran (serviceOne() calls that actually invoked
+    // process(), design §3.3) since the previous BarrierPass record on
+    // this domain; critPathEventCount is reset to 0 right after being
+    // copied in here.
+    uint64_t eventCount = 0;
 
     // For BarrierPass: time spent blocked in wait() (0 if isLast).
     // For LockWait: time spent in the UncontendedMutex slow path.
@@ -76,6 +83,21 @@ struct CritPathRecord
 
     // LockWait fields (kind == LockWait; design §3.2).
     CritPathLockTag lockTag = CritPathLockTag::None;
+};
+
+/**
+ * Per-call context that globalBarrier() (design §4.2, src/sim/
+ * global_event.hh) passes into Barrier::wait() so the record it
+ * produces can be joined across domains. Barrier itself has no notion
+ * of "domain" or "quantum" -- it just carries what the caller already
+ * knows. Domain id is not part of this context: it is read from the
+ * thread-local critPathDomainId at record time instead of being passed
+ * down, since it never changes for the life of the thread (§4.3).
+ */
+struct CritPathBarrierCtx
+{
+    Tick tick;       // curEventQueue()->getCurTick() at the call site.
+    uint8_t pass;    // 1 or 2 -- design §3.1.
 };
 
 /**
@@ -105,6 +127,36 @@ extern thread_local uint32_t critPathDomainId;
 
 /** Per-domain, single-writer record buffer (design §4.4). */
 extern thread_local std::vector<CritPathRecord> critPathBuffer;
+
+/**
+ * Events this domain has run since the last BarrierPass record (design
+ * §3.3). Only serviceOne()'s "actually ran process()" path increments
+ * this; critPathRecordBarrierPass() reads and resets it.
+ */
+extern thread_local uint64_t critPathEventCount;
+
+/**
+ * Call from EventQueue::serviceOne() (design §3.3) right after an event
+ * that wasn't squashed has been processed. A no-op branch (predictable,
+ * off the hot path's critical dependency chain) when tracing is off.
+ */
+inline void
+critPathCountEvent()
+{
+    if (critPathTracing())
+        ++critPathEventCount;
+}
+
+/**
+ * Record one BarrierPass entry for the calling thread's domain (design
+ * §3.1/§4.2): called from Barrier::wait() when it was given a non-null
+ * CritPathBarrierCtx and tracing is on. Reads critPathDomainId and
+ * critPathEventCount (resetting the latter to 0) as a side effect --
+ * this is the one designated point where the per-quantum event counter
+ * gets consumed.
+ */
+void critPathRecordBarrierPass(const CritPathBarrierCtx &ctx, bool isLast,
+                                CritPathClock::duration dur);
 
 /**
  * Write this thread's critPathBuffer to

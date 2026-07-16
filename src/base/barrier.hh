@@ -46,6 +46,8 @@
 #include <immintrin.h>
 #endif
 
+#include "base/critpath_trace.hh"
+
 namespace gem5
 {
 
@@ -126,13 +128,30 @@ class Barrier
      * Note: in serial mode (numWaiting == 1) the first and only arriver
      * completes the barrier immediately without ever waiting, so the choice
      * of mode has no observable effect on a single-threaded run.
+     *
+     * `ctx`, if non-null, identifies this call for S-012 critical-path
+     * instrumentation (design doc §4.2): the caller (globalBarrier(),
+     * src/sim/global_event.hh) supplies the quantum-boundary tick and
+     * which of the two per-quantum barriers this is. Barrier has no
+     * notion of "domain" or "quantum" on its own -- ctx is exactly the
+     * (and only the) information the caller already has that Barrier
+     * doesn't. A null ctx (the default; every non-instrumented caller,
+     * e.g. SimulatorThreads::barrier, design §6) or tracing being off
+     * takes the original, unmodified path.
      */
     bool
-    wait()
+    wait(const CritPathBarrierCtx *ctx = nullptr)
     {
-        if (mode == BarrierMode::Cv)
-            return waitCv();
-        return waitSpin();
+        if (!ctx || !critPathTracing())
+            return (mode == BarrierMode::Cv) ? waitCv() : waitSpin();
+
+        const auto t0 = critPathNow();
+        const bool isLast =
+            (mode == BarrierMode::Cv) ? waitCv() : waitSpin();
+        const auto dur =
+            isLast ? CritPathClock::duration{} : (critPathNow() - t0);
+        critPathRecordBarrierPass(*ctx, isLast, dur);
+        return isLast;
     }
 
   private:

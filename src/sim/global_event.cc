@@ -153,13 +153,13 @@ void
 GlobalSyncEvent::BarrierEvent::process()
 {
     // wait for all queues to arrive at barrier, then process event
-    if (globalBarrier()) {
+    if (globalBarrier(1)) {
         _globalEvent->process();
     }
 
     // second barrier to force all queues to wait for event processing
     // to finish before continuing
-    globalBarrier();
+    globalBarrier(2);
     curEventQueue()->handleAsyncInsertions();
 }
 
