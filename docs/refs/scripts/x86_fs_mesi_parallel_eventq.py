@@ -5,7 +5,7 @@ Full-system X86 + Ruby MESI_Two_Level + N Timing cores, with an optional
 N-cores -> N+1-EventQueues parallel split (the parallel-EventQueue / shared-L2
 project). This is the FS analogue of the SE parallel path in
 ``configs/deprecated/example/se.py`` (`--parallel-l2-eventq`); read that and
-``docs/specs/parallel-eventq-lockfree-l2-design.md`` (sections 6.3, 8.x, 9.x)
+``docs/specs/INDEX.md`` (S-001 §6.3, S-003 §8.x, S-004 §9.x)
 for the authoritative reasoning behind every choice here.
 
 Run

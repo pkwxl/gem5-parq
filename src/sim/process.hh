@@ -132,7 +132,7 @@ class Process : public SimObject
 
     /*
      * Global SE-mode emulation lock (design doc
-     * docs/specs/parallel-eventq-lockfree-l2-design.md section 9.6).
+     * docs/specs/S-004-first-speedup-measurement-and-fixes.md §9.6).
      * When CPUs are split across EventQueues (multi-threaded simulation),
      * syscall emulation and fault fixup mutate state shared between all
      * of a process's thread contexts -- the futex map, fd tables, memory

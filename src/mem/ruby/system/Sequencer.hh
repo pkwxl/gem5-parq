@@ -250,7 +250,7 @@ class Sequencer : public RubyPort
     // strict leaf lock: only ever held around the container operations
     // themselves, never across issueRequest()/hitCallback()/enqueue(), so it
     // never nests with a Consumer wakeup lock. See
-    // docs/specs/parallel-eventq-lockfree-l2-design.md section 9.6.
+    // docs/specs/S-004-first-speedup-measurement-and-fixes.md §9.6.
     UncontendedMutex m_reqTableMutex;
     // UnadressedRequestTable contains "unaddressed" requests,
     // guaranteed not to alias each other

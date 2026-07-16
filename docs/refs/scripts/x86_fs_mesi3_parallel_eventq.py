@@ -9,7 +9,7 @@ This is the 3-level successor to x86_fs_mesi_parallel_eventq.py. The move from a
 shared L2 (MESI_Two_Level) to private-L2 + shared-L3 lets the eventq split follow
 the physical hierarchy: each core's whole private stack (L1+L2) rides one domain,
 the shared L3 gets its own, and each memory controller gets its own. Read
-``docs/specs/parallel-eventq-lockfree-l2-design.md`` (6.3, 8.x, 9.x) and the SE
+``docs/specs/INDEX.md`` (S-001 §6.3, S-003 §8.x, S-004 §9.x) and the SE
 path in ``configs/deprecated/example/se.py`` for the reasoning this inherits.
 
 REQUIRES a MESI_Three_Level build:

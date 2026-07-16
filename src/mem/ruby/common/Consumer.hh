@@ -91,7 +91,7 @@ class Consumer
 
     /*
      * Per-consumer wakeup mutex (design doc:
-     * docs/specs/parallel-eventq-lockfree-l2-design.md, sections 2.3/6.2).
+     * docs/specs/S-001-design-background-and-proposal.md §2.3/§6.2).
      * Any thread enqueueing into one of this Consumer's inbound
      * MessageBuffers, and this Consumer's own wakeup() dispatch, must hold
      * this lock for the duration -- it is what makes "wakeup() scans all

@@ -203,7 +203,7 @@ class MessageBuffer : public SimObject
     // Actual body of functionalAccess(); functionalAccess() wraps this call
     // in the consumer's wakeup lock so the walk cannot race the owning
     // domain thread mutating m_prio_heap / m_stall_msg_map. See
-    // docs/specs/parallel-eventq-lockfree-l2-design.md section 9.6.
+    // docs/specs/S-004-first-speedup-measurement-and-fixes.md §9.6.
     uint32_t functionalAccessUnlocked(Packet *pkt, bool is_read,
                                        WriteMask *mask);
 

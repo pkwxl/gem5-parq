@@ -578,7 +578,7 @@ MessageBuffer::functionalAccess(Packet *pkt, bool is_read, WriteMask *mask)
     // holds this consumer's lock (e.g. AbstractController::functionalRead-
     // Buffers). m_consumer may be NULL for buffers with no consumer, in which
     // case nothing can be concurrently mutating this buffer. See
-    // docs/specs/parallel-eventq-lockfree-l2-design.md section 9.6.
+    // docs/specs/S-004-first-speedup-measurement-and-fixes.md §9.6.
     if (m_consumer == nullptr)
         return functionalAccessUnlocked(pkt, is_read, mask);
 

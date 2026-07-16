@@ -544,7 +544,7 @@ RubySystem::simpleFunctionalRead(PacketPtr pkt)
     // address in read only, read write and busy states.
     // Each controller's access-permission read touches its SLICC state, so
     // take its wakeup lock for the duration (one controller at a time). See
-    // docs/specs/parallel-eventq-lockfree-l2-design.md section 9.6.
+    // docs/specs/S-004-first-speedup-measurement-and-fixes.md §9.6.
     for (auto& cntrl : netCntrls[request_net_id]) {
         cntrl->lock();
         access_perm = cntrl-> getAccessPermission(line_address);
@@ -684,7 +684,7 @@ RubySystem::partialFunctionalRead(PacketPtr pkt)
     // Build lists of controllers that have line. Each permission read touches
     // the controller's SLICC state, so hold its wakeup lock for the duration
     // (one controller at a time). See
-    // docs/specs/parallel-eventq-lockfree-l2-design.md section 9.6.
+    // docs/specs/S-004-first-speedup-measurement-and-fixes.md §9.6.
     for (auto ctrl : m_abs_cntrl_vec) {
         ctrl->lock();
         AccessPermission perm = ctrl->getAccessPermission(line_address);
@@ -814,7 +814,7 @@ RubySystem::functionalWrite(PacketPtr pkt)
         // mid-access. The lock is held for one controller at a time and
         // released before touching its sequencer, keeping the walk to a
         // single object lock at any moment. See
-        // docs/specs/parallel-eventq-lockfree-l2-design.md section 9.6.
+        // docs/specs/S-004-first-speedup-measurement-and-fixes.md §9.6.
         num_functional_writes += cntrl->functionalWriteBuffers(pkt);
 
         cntrl->lock();

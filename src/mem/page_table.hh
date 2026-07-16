@@ -70,8 +70,8 @@ class EmulationPageTable : public Serializable
 
     /*
      * In SE mode with per-CPU EventQueues (multi-threaded simulation,
-     * design doc docs/specs/parallel-eventq-lockfree-l2-design.md section
-     * 9.6), TLB-miss lookups run concurrently on every CPU's thread while
+     * docs/specs/S-004-first-speedup-measurement-and-fixes.md §9.6),
+     * TLB-miss lookups run concurrently on every CPU's thread while
      * syscall/fault handling (already serialized by Process::seEmulLock)
      * mutates the table. Readers take this shared, writers exclusive.
      * Note the Entry pointers lookup() hands out stay valid across

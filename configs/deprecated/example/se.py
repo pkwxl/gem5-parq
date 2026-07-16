@@ -138,12 +138,13 @@ Options.addSEOptions(parser)
 if "--ruby" in sys.argv:
     Ruby.define_options(parser)
 
-    # EXPERIMENTAL: see docs/specs/parallel-eventq-lockfree-l2-design.md.
+    # EXPERIMENTAL: see docs/specs/INDEX.md (S-001 for the design, S-003 for
+    # this option's implementation history).
     # Splits a MESI_Two_Level + Crossbar SE-mode system into one EventQueue
     # per L1 plus one shared EventQueue for L2/directory/memory, following
-    # the parti-gem5 N+1-thread partitioning. Only "option 2" from the
-    # design doc (reuse Crossbar.py, give the shared xbar router its own
-    # extra EventQueue) is implemented so far.
+    # the parti-gem5 N+1-thread partitioning. Only "option 2" from S-001
+    # §6.3 (reuse Crossbar.py, give the shared xbar router its own extra
+    # EventQueue) is implemented so far.
     parser.add_argument(
         "--parallel-l2-eventq",
         action="store_true",

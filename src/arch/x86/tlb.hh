@@ -115,7 +115,7 @@ namespace X86ISA
          * MemState::unmapRegion -> BaseMMU::flushAll -> TLB::flushAll while
          * this CPU's thread concurrently looks up / inserts entries. Held as
          * a leaf lock by every method that mutates or reads those structures.
-         * See docs/specs/parallel-eventq-lockfree-l2-design.md section 9.8.
+         * See docs/specs/S-004-first-speedup-measurement-and-fixes.md §9.8.
          */
         UncontendedMutex tlbLock;
 
