@@ -20,11 +20,15 @@ FS 定窗 A/B，测出在当前工作点（Q=300/ll=20）并行**比串行慢 ~3
 ~0.92x，接近打平但到不了 1x，与 SE 侧"0.90x 封顶"的既有结论一致；要拿到
 项目目标的真实加速，出路 1 和出路 3（每域塞更多工作）大概率要一起做。
 S-009 把"抬高 Q"这一步的设计做完了（**未实现**）：精确定位到卡住 Q=300 的
-不是 IOXBar 的参数，而是 `RubyPort.cc` 里两处硬编码 `curTick()+1 ruby 周期`
-的跨域 PIO 响应调度，设计是把 S-006 §11.5 已经验证过的 grid-anchored snap
-模式搬过去；同时发现一个和 Q 大小无关的独立问题——这条经典 Port 路径从没
-做过跨域线程安全审计（不像 Ruby 自己的 `Consumer`），S-009 §18 标记为
-实现前必须先查。下一步是这份设计的实现+审计，按工作方式需要先请示。仍然
+是 `PacketQueue::schedSendEvent`（`RubyPort.cc` 的 PIO 转发和每一个经典
+PIO 设备共享的同一个调度入口）里跨域调用时用错线程 curTick() 的问题，不是
+IOXBar 的参数；设计是在这一个共享点套用 S-006 §11.5 已经验证过的
+grid-anchored snap，一次改动覆盖所有调用点（§19）。审计还确认了一个和 Q
+大小无关、独立的真实问题——这条经典 Port 路径（IOXBar 的
+`reqLayers`/`respLayers`/`routeTo`、下游设备状态）完全没做跨域线程安全
+保护，多核并发 PIO 会产生真实数据竞争（不是理论风险，§18），修起来和
+S-002/S-003 给 Ruby 加锁的工作量相当，是目前最大的未完成项。下一步是这两块
+的实现，按工作方式需要先请示。仍然
 悬而未决、不阻塞当前结论的项：TLB 加锁后的热路径开销未测量、精确模式下
 一个恒定的一 ruby 周期偏差未查明根因（S-006 §9.6 附近提到）。FS 完整 ROI
 串行参考的 `simTicks` 曾经跑完过，但原始 `stats.txt` 已随一次宿主机重启从
@@ -43,7 +47,7 @@ S-009 把"抬高 Q"这一步的设计做完了（**未实现**）：精确定位
 | S-006 | [S-006-fs-mode-migration.md](./S-006-fs-mode-migration.md) | APIC 唤醒墙已修复 | 迁移到 FS 模式，跨层次检查点重放，APIC 中断跨域唤醒墙的根因（量子网格锚点 bug）与修复；2-level 首次尝试/域布线依据/Ruby 检查点与并行重放不兼容（§11.6-11.8，补记） |
 | S-007 | [S-007-spin-barrier-and-milestone.md](./S-007-spin-barrier-and-milestone.md) | **里程碑达成** | 自旋/混合屏障设计与 SE+FS 双靶实测；FS pythonDump 跨线程墙（已修复）；项目阶段性结论；并行运行下 `SIGUSR1` 崩溃的操作提示（§14） |
 | S-008 | [S-008-fs-serial-vs-parallel-current-position.md](./S-008-fs-serial-vs-parallel-current-position.md) | 测量完成；结论待 S-009 验证 | FS 定窗首次补齐串行臂：当前工作点并行比串行慢 ~3x（0.33x）；抬高 Q 的缺口算术投影只到 ~0.92x；完整 ROI 串行参考数字因宿主重启丢失、按未核实转述记录（§16） |
-| S-009 | [S-009-raise-fs-quantum-past-iobus-edge-design.md](./S-009-raise-fs-quantum-past-iobus-edge-design.md) | **设计稿，未实现** | 精确定位卡住 Q=300 的边（`RubyPort.cc` 里两处硬编码 1-ruby-周期跨域 PIO 响应调度，不是 IOXBar 参数）；设计把 S-006 §11.5 的 grid-anchored snap 搬过去（§19）；发现并标记一个独立的、未审计过的经典 Port 跨域线程安全问题（§18） |
+| S-009 | [S-009-raise-fs-quantum-past-iobus-edge-design.md](./S-009-raise-fs-quantum-past-iobus-edge-design.md) | **设计稿，未实现** | 精确定位卡住 Q=300 的是 `PacketQueue::schedSendEvent`（`RubyPort.cc` 的 PIO 转发 + 每个经典 PIO 设备共享），不是 IOXBar 参数；设计在这一个公共点套用 S-006 §11.5 的 grid-anchored snap（§19，一次改动覆盖所有调用点）；审计**确认**（不只是标记怀疑）这条经典 Port 路径存在真实的跨域数据竞争，修复量级堪比 S-002/S-003（§18） |
 
 ## 如何新增一份 spec
 

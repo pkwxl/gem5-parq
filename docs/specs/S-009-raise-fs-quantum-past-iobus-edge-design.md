@@ -1,9 +1,10 @@
 # S-009 — 设计：把 FS quantum 上限从 classic iobus 边抬到 Ruby 合法值（未实现）
 
-**状态：设计稿，未实现**。这是 S-008 §15.4 缺口算术投影之后，用户明确要求的下一步
-设计文档；本文档只做设计，不动代码。按项目工作方式，这是新架构territory（一个
-之前只在一个点上验证过的修复模式，现在要判断是否要推广/搬到第二个点），实现前
-再找用户对一遍这份设计。
+**状态：设计+审计已完成，未实现，无代码改动**。这是 S-008 §15.4 缺口算术投影之后，
+用户先要求做设计（17/19 节），再明确要求做跨域线程安全审计（18 节）；本文档只做
+设计和只读的代码审计，不动代码。审计把最初设计（"两个孤立调用点"）纠正成了一个
+更大范围的问题（共享基础设施 + 真实数据竞争，不是理论风险），17.2/17.3/18/19 节
+都已按审计结果原地更正，不是并列保留新旧两版结论。实现前再找用户对一遍这份设计。
 
 ## 17. 精确定位：Q=300 到底被哪条边摁住的
 
@@ -19,127 +20,234 @@ getCurTick()`——这个 `getCurTick()` 读的是**目标域**的时钟（`even
 
 ### 17.2 目前"合法"的边和"卡住"的边，分类整理
 
+**这一节是审计后的修正版——比最初设计稿里写的范围大得多，17.2/17.3 原文对
+"只有 RubyPort.cc 两处"的判断是错的，按工作方式原地更正，不留旧结论。**
+
 | 边 | 机制 | 延迟来源 | 现状 |
 |---|---|---|---|
 | Ruby int_link（核内 L1↔L2、核间到 L3/目录） | `MessageBuffer`/`Consumer` + per-consumer 锁（S-002/S-003 已加固） | `il.latency = LINK_LATENCY`（脚本里显式设成 20 周期 = 6660 tick，两臂对称） | **已经支持 Q 到 ~6660**，S-008 用的就是这个上限 |
 | 中断投递唤醒（IOAPIC/PIC → 目标核的 local APIC → `activateContext`） | 经 `Consumer::wakeup()`/`recvMessage` 同步跨线程调用，最终落到 `cpu/simple/timing.cc` 里一次 `schedule()` | S-006 §11.5 已经把这次 `schedule()` 的 `when` 改成**锚定 barrier 网格**的 snap 公式，不再依赖任何具体延迟数值 | **已经对任意 Q 安全**——这条边不是 S-009 要修的对象，11.5 已经解决 |
-| **PIO/MMIO 响应**（Sequencer 的 `PioRequestPort`/`MemRequestPort` 收到来自 iobus/设备的响应，转发回自己域） | **直接 `curTick() + owner.m_ruby_system->clockPeriod()`**（`src/mem/ruby/system/RubyPort.cc:174-183` 和 `:185-207`，两处几乎一样） | **硬编码"1 个 ruby 周期之后"**，ruby 时钟 = 板钟 3GHz，1 周期 = 333 tick——**这正是脚本注释里"iobus forward_latency = 1 board cycle = 333 ticks"说的那条边**，只是延迟值不是来自 IOXBar 的 `Cycles` 参数，而是这两处硬编码的 `clockPeriod()` | **卡住 Q 的就是这条边**：Q=300 < 333，卡在边缘内侧，Q 抬过 333 这两处的 `schedule()` 就会撞上 `assert(when >= getCurTick())` |
+| **经典 Port 的每一次跨域 timing response/request 调度**（`RubyPort.cc` 的 `PioRequestPort`/`MemRequestPort`，**以及 iobus 下游每一个 `SimpleTimingPort` 设备**：UART、RTC、PIT、PIC、IOAPIC、`IsaFake` 等南桥全家桶） | **都收敛到同一个共享函数**：`PacketQueue::schedSendTiming`/`schedSendEvent`（`src/mem/packet_queue.cc:106-176`），`QueuedRequestPort::schedTimingReq`/`QueuedResponsePort::schedTimingResp`（`mem/qport.hh:94-95/150-151`）只是转发到这里；`SimpleTimingPort::recvTimingReq`（`mem/tport.cc:63-80`，几乎所有简单 PIO 设备的基类）自己也调用同一条链路 | **每个调用点各自的 `curTick() + X`**：`RubyPort.cc` 两处硬编码 `owner.m_ruby_system->clockPeriod()`（1 ruby 周期 ≈ 333 tick）；每个 `SimpleTimingPort` 设备是 `curTick() + recvAtomic() 返回的 latency`（**逐设备不同**，没有统一值） | **卡住 Q=300 的表面上是 `clockPeriod()`=333 那两处，但抬过 333 之后，下一个卡住的大概率是某个具体设备自己的 `recvAtomic()` 延迟**——17.2 的旧版本只看到了第一层，没看到这是一整类问题 |
 
 **为什么之前以为是 IOXBar 的 `forward_latency`/`response_latency` 参数**：这两个
 Cycles 参数（默认 2/1/2 周期）确实存在、也确实控制 IOXBar 内部转发排队的时序，
 但它们只影响 `pkt->headerDelay`/`payloadDelay` 的标注，**从不出现在任何跨域
 `schedule()` 调用里**——`NoncoherentXBar::recvTimingReq/recvTimingResp`
 （`src/mem/noncoherent_xbar.cc:101-177/179-`）只是直接同步调用下一跳端口，IOXBar
-自己不跨 eventq 调度任何东西。真正跨域调度、真正撞上 8.1 断言的，是上面这两处
-`RubyPort.cc` 里的 `curTick() + clockPeriod()`。所以**改 IOXBar 的参数不解决
-问题**——这条路线在最初的设计构想里是错的，读代码之后已经排除。
+自己不跨 eventq 调度任何东西。这个判断没错，但**下一步"所以只有 RubyPort.cc
+两处"是错的**——见下面 17.3。
 
-### 17.3 为什么这是"第三个同类 bug"，不是新问题
+### 17.3 更正：这不是两个点的 bug，是一整条经典 Port 链路共享的一个 bug
 
-这两处代码在写的时候显然假设"单 EventQueue、`curTick()` 全局一致"，"1 个周期
-之后"在那个世界里永远安全。这和 S-003 §8.1（`sim_quantum` 方向搞反）、S-006
-§11.5（`activateContext` 的 snap 没锚在 barrier 网格上）是**同一类根因**——
-为单线程世界写的、局部算出来的 `when`，不知道自己可能被跨域调用、也不知道
-两个域之间存在有界但非零的漂移。11.5 已经证明了修法：把 `when` 换成**锚定
-barrier 网格**的公式，而不是依赖某个具体延迟数值 >= Q。S-009 要做的就是把
-这个**已经验证过的修法**，原样搬到 `RubyPort.cc` 这两处。
-
-## 18. 一个独立的、目前完全没排查过的问题：这条边有没有做跨域线程安全
-
-`RubyPort::PioRequestPort::recvTimingResp` 之所以能被调用，前提是先有一次
-`PioResponsePort::recvTimingReq`（`RubyPort.cc:209-227`）——它在 iobus 那一侧
-被同步调用（如果响应来自跨域的 iobus/设备，调用发生在**域 0 的线程**上，直接
-操作 `owner`（Sequencer，域 i+1）的状态），然后 `owner.request_ports[i]->
-sendTimingReq(pkt)` 继续同步往下传。**整条 PIO 请求路径（域 i+1 的 Sequencer
-发起 → 直接同步调用到域 0 的 IOXBar → 再同步调用到域 0 的南桥/设备）都是裸
-虚函数调用，全程没有一处 `Consumer`/`MessageBuffer` 式的锁**——不像 Ruby 自己
-的 int_link 消息（S-002/S-003 专门为跨域访问加固过 `Consumer::lock()`），
-`RubyPort.cc`/`noncoherent_xbar.cc` 这条经典 Port 路径从没被这样审计过。
-
-`grep` 确认 `RubyPort.cc` 全文件没有任何 `lock()`/`mutex` 调用。
-
-**这不是 Q 大小的问题，是任意 Q（包括现在的 300）下都可能存在的问题**：
-一个域的线程直接读写另一个域 SimObject 的内部状态（IOXBar 的
-`reqLayers`/`respLayers`/`routeTo`，或者 Sequencer 自己的
-`request_ports`/`m_outstanding_count` 之类的簿记状态），没有锁保护。S-008
-的定窗测试碰巧没有暴露它（可能是这个窗口里 PIO 流量本身不够密、真正并发触达的
-概率低），不代表它不存在——这和 S-003 §8.4-8.6"崩溃是竞态、不是每次都触发"
-的教训完全一致。
-
-**建议**：S-009 实现阶段，在设计 17 节的 snap 修法的**同时**，需要专门审计这条
-路径上被跨域触达的每一处共享状态，参照 S-002/S-003 的方法论（先读代码定位所有
-读写点，判断是否需要 `Consumer` 式的锁，还是可以论证"实际不可能并发"）。这是
-**和抬高 Q 正交但同等重要**的一块工作，如实记录在这里，不因为 17 节的 snap 修法
-能让断言不炸就误以为路径本身安全了。
-
-## 19. 设计：把 11.5 的 grid-anchored snap 搬到 `RubyPort.cc` 这两处
-
-### 19.1 具体改动
+顺着 `RubyPort::PioResponsePort::recvTimingReq` 往下追（一次跨域 PIO 请求从
+Sequencer 域 i+1 发起，同域 `schedule()` 到 `memRequestPort`，`sendTimingReq`
+直接同步调用穿过 `NoncoherentXBar::recvTimingReq`（域 0，但仍在域 i+1 的线程
+上执行）、南桥、一直到具体设备（`UART`/`RTC`/`PIT`/`PIC`/`IOAPIC`/`IsaFake`
+等，几乎全部继承自 `PioDevice`，用 `SimpleTimingPort`）——**这些设备的
+`recvTimingReq` 全部走 `SimpleTimingPort::recvTimingReq`
+（`mem/tport.cc:63-80`）**：
 
 ```cpp
-// RubyPort.cc, 两处等价替换（PioRequestPort::recvTimingResp /
-// MemRequestPort::recvTimingResp），复用 S-006 §11.5 已经引入的
-// simQuantumStart/simQuantum 全局锚点（sim/eventq.{hh,cc}）：
-Tick when = curTick() + owner.m_ruby_system->clockPeriod();
-if (inParallelMode) {
-    when = std::max(when,
-        simQuantumStart +
-        divCeil(curTick() + 1 - simQuantumStart, simQuantum) * simQuantum);
+bool SimpleTimingPort::recvTimingReq(PacketPtr pkt) {
+    ...
+    Tick latency = recvAtomic(pkt);   // 设备自己算的处理延迟
+    schedTimingResp(pkt, curTick() + latency);
+    ...
 }
-owner.pioResponsePort.schedTimingResp(pkt, when);   // 或 port->schedTimingResp(pkt, when)
 ```
 
-**为什么加 `std::max` 而不是像 11.5 那样无条件替换**：11.5 那个点
-（`activateContext`）天然就是"跨域才会走到"的路径，无条件 snap 没有额外代价。
-这两处 `RubyPort.cc` 的调用**在串行模式（`inParallelMode==false`）下也会执行**
-（PIO 响应处理不区分串行/并行），如果无条件套用 barrier-网格公式，会把串行模式
-下的 PIO 响应延迟也悄悄改掉——这会破坏 S-002 到 S-008 一直保持的"串行基线
-`simTicks` 逐字节不变"这条底线。`std::max` + `inParallelMode` 判断保证串行模式
-**完全不变**（继续用原来的 `curTick()+clockPeriod()`），只有并行模式下、且原始
-`when` 不够安全时才会被抬高到网格边界——**并行模式下也不是无条件抬高**：如果
-`clockPeriod() >= 剩余到下一个网格边界的距离`，`std::max` 会保留原始值，只在
-真正需要时才多花时间等到网格边界，把不必要的额外延迟降到最小（这点比 11.5 的
-无条件版本更保守，值得在实现时一并考虑要不要把这个 `std::max` 优化回填到
-`timing.cc` 的原实现里，或者认为 11.5 那个点足够稀疏、不值得优化——留给实现
-阶段判断，不在这份设计里预先决定）。
+`curTick()` 这里读的是**调用线程**的 `curEventQueue()`，而调用线程是发起
+这次 PIO 请求的**域 i+1 的线程**（因为整条链路从 Sequencer 到设备都是裸同步
+虚函数调用，从未切换过线程）——**不是设备自己域（域 0）的 curTick()**。
+`schedTimingResp`/`schedTimingReq` 最终都落到 `PacketQueue::schedSendEvent`
+（`packet_queue.cc:154-176`）：
 
-### 19.2 为什么不是"抬高 IOXBar 参数"或"在 EventQueue::schedule 里做通用 snap"
+```cpp
+when = std::max(when, curTick() + 1);   // 同样读的是调用线程的 curTick()
+...
+em.schedule(&sendEvent, when);          // em 永远正确地指向设备自己的域
+                                         // （构造时绑定，不受调用线程影响）
+```
+
+`em`（目标域）永远是对的，**错的是 `when` 用了错误线程的 `curTick()` 去算**。
+`em.schedule()` 内部的 `EventQueue::schedule()` 断言检查的是 `em` 自己域的
+`getCurTick()`（`eventq.hh:784`）——如果域 0 恰好领先域 i+1 超过这次调用算出
+的延迟量，断言就会炸。**`RubyPort.cc` 的两处只是这一整条链路里"离 CPU 最近
+的那一跳"，恰好先被 S-008 的 Q=300→333 边界撞到；一旦 Q 抬过 333，下一个
+挡路的大概率是某个具体设备（南桥的 UART/RTC/PIT/PIC/IOAPIC/IsaFake 之类）
+自己 `recvAtomic()` 算出来的延迟，逐设备不同，没法用一张表穷举**。
+
+这仍然是"第三个同类 bug"（S-003 §8.1、S-006 §11.5 是第一、第二个）——为
+单 EventQueue 世界写的代码，局部 `curTick()+常量`，不知道自己可能被跨域
+调用——只是这次的病灶不是两个孤立调用点，而是**一整条链路共享的一个基础设施
+函数**（`PacketQueue::schedSendEvent`），这个定位直接决定了 19 节的设计要
+改在哪一层。
+
+## 18. 跨域线程安全审计（已完成排查——结论：确认存在真实的、结构性的数据竞争）
+
+这一节原来只是"标记待查"，现在审计做完了，结论比预期更明确：**这不是需要
+靠运气才会触发的潜伏 bug，是这个拓扑下架构性地必然可达的数据竞争**。
+
+### 18.1 排查方法
+
+`grep` 遍历这条链路涉及的每一个文件（`RubyPort.cc/.hh`、`noncoherent_xbar.cc`、
+`packet_queue.cc/.hh`、`qport.hh`、`tport.cc/.hh`，以及 `src/dev/x86/`、
+`src/dev/` 下 PIO 设备的 `.cc`），找 `mutex`/`lock`/`std::atomic` 等同步原语：
+**一个都没有**。然后顺着 17.3 追出来的完整调用链，逐段确认"这一段实际在哪个
+线程上执行、touch 了谁的状态"。
+
+### 18.2 竞争点在哪、为什么"结构性必然可达"而不是运气问题
+
+关键结构事实：**iobus（`self.iobus`）、南桥、南桥下所有设备，都是域 0 里
+唯一的一份实例——所有核（域 2..N+1）想做 PIO 都要经过同一组对象**。而
+17.3 已经确认：一次跨域 PIO 请求的整条链路（`Sequencer.memRequestPort/
+pioRequestPort → IOXBar → 南桥 → 具体设备 → 原路返回`）全程在**发起请求的
+那个核自己的域线程**上执行，从未真正切到域 0 的线程。
+
+推论：**如果核 2（域 3）和核 3（域 4）在同一个 quantum 窗口内都发起了一次
+PIO 请求**（现实场景：两个核都在处理各自的中断、都要读/写 IOAPIC 或 PIC 或
+RTC），它们的线程会**同时**、**各自独立地**执行到同一个 IOXBar 实例的
+`recvTimingReq`/`recvTimingResp`（`noncoherent_xbar.cc`），同时读写
+`reqLayers[]`/`respLayers[]`（每个目的端口一个 `Layer` 对象，记录"这个端口
+当前是否被占用/什么时候空闲"的忙闲状态机）和 `routeTo`（`std::unordered_map
+<RequestPtr, PortID>`，记录每个在途请求该往哪个端口送响应）——**这两个都是
+普通容器，没有锁，被两个不同线程同时读写**。`routeTo` 更明确：`recvTimingReq`
+里 `routeTo[pkt->req] = cpu_side_port_id`（插入），`recvTimingResp` 里
+`routeTo.erase(route_lookup)`（删除）——如果核 2、核 3 的请求前后脚落在同一个
+`unordered_map` 上，插入/删除/查找并发执行是**教科书式**的 STL 容器数据竞争
+（不是"低概率角落场景"，只要两个核都有 PIO 流量、时间上有重叠就会发生，
+只是不是每次都会崩——UB 的典型特征）。同样的论证对南桥下每个具体设备的内部
+状态（比如 PIC 的中断屏蔽寄存器、PIT 的计数器）也成立：**只要两个核都可能
+访问同一个设备，就有竞争**，跟 Q 的大小完全无关——即使 17.3 的 snap 修好了、
+断言不再炸，这个竞争依然在，只是从"崩溃"变成"静默数据损坏"，更难发现。
+
+**这和 S-002/S-003 为 Ruby 自己的 `Consumer`/`MessageBuffer` 做的事情性质
+完全一样，只是这次是对经典 Port 世界，而且经典 Port 世界目前完全没做**。
+S-008 的定窗测试没有暴露它，最合理的解释是：这个特定窗口/负载里多个核的
+PIO 流量在时间上恰好没有重叠到能让 `unordered_map` 的内部状态真正被破坏
+（竞争"发生"和"造成可观测后果"是两回事，尤其是像 `unordered_map` 这种在
+比较小的负载下不太容易触发内部重新哈希/结构调整的场景）——不是"审计后
+确认没问题"，是"目前的测试窗口没有强到足以稳定复现"。
+
+### 18.3 这对 S-009 范围意味着什么
+
+**19 节的 snap 修法只解决"断言会不会炸"（正确性的必要条件），完全不解决
+18.2 这个数据竞争（正确性的另一个必要条件）**。两者是正交的，缺一不可：
+只做 19 节，Q 抬高后要么断言炸（如果 snap 没覆盖到某个设备），要么断言不炸
+但静默产生错误结果（数据竞争造成的状态损坏，S-008 那种"逐字节 diff"的验证
+方法**不保证能测出来**——竞争是否触发取决于两个线程的相对时序，同一个配置
+跑多次结果可能不一样，这正是 S-003 §8.4-8.6 反复强调的教训）。
+
+**修复方向**（具体实现留给下一轮，这里只定方向）：给共享的经典 Port 状态
+加锁，参照 S-002 的方法——最小的加锁范围大概率是 IOXBar 实例本身一把锁
+（保护 `reqLayers`/`respLayers`/`routeTo`），加上每个可能被跨域触达的设备
+一把锁（或者证明某个具体设备实际不可能被多核并发访问，比如如果每个设备的
+地址范围本来就被设计成只有一个核会访问，需要读代码/读 x86 platform 的地址
+分配逐个论证，不能假设）。工作量和 S-002/S-003 当年给 Ruby 做的事情是同一
+量级，**不是"顺手在 19 节的 snap 旁边捎带做了"能打发的**。
+
+## 19. 设计更正：把 grid-anchored snap 放在 `PacketQueue::schedSendEvent` 这一个
+共享点，不是 `RubyPort.cc` 的两处
+
+**这一节也是审计后的修正版**：17.3 确认卡住 Q 的不是两个孤立调用点，是
+`RubyPort.cc` 和每一个 `SimpleTimingPort` 设备共享的同一条基础设施
+（`PacketQueue::schedSendEvent`）。原 19.1-19.2"按点修、不做通用方案"的
+结论建立在"只有两个点"这个已经被推翻的前提上，19.2 反对的"通用 snap"说的
+是在 `EventQueue::schedule()` 这一层做——那个反对理由（会连累 Ruby int_link
+已经验证安全的消息）依然成立，但 `PacketQueue::schedSendEvent` 是**另一个、
+更合适的公共点**，19.2 的反对理由不适用于这一层，见下面。
+
+### 19.1 为什么 `PacketQueue::schedSendEvent` 是对的落点
+
+这个函数（`packet_queue.cc:154-176`）是 `QueuedRequestPort`/
+`QueuedResponsePort`（因此也是 `SimpleTimingPort`，因此也是几乎所有经典
+PIO 设备）发送任何 timing 包的唯一入口，函数签名自带一个 `EventManager
+&em`——**永远正确地绑定着这个 port 所属对象自己的域**（构造时绑定，不受
+调用线程影响，17.3 已确认）。这意味着在这一个函数里，能同时拿到"目标域是
+哪个"（`em.eventQueue()`）和"当前实际在哪个线程上执行"
+（`curEventQueue()`，`sim/eventq.hh`），两者一比较就知道这次调用是不是
+跨域——**这正是 `EventQueue::schedule()` 那一层做不到的事**（19.2 原文的
+反对理由：那一层拿不到"这次调度本该有多少物理延迟"，没法只在真正跨域时才
+生效；`PacketQueue::schedSendEvent` 不受这个限制，因为它天然只服务经典
+Port 世界，永远不会被 Ruby 的 int_link 消息调用到——Ruby 的跨域消息走的是
+完全不同的 `MessageBuffer`/`Consumer` 路径，从不经过 `PacketQueue`）。
+
+### 19.2 具体改动
+
+```cpp
+// packet_queue.cc, PacketQueue::schedSendEvent，复用 S-006 §11.5 引入的
+// simQuantumStart/simQuantum 全局锚点（sim/eventq.{hh,cc}）：
+void
+PacketQueue::schedSendEvent(Tick when)
+{
+    if (waitingOnRetry) { ... }          // 不变
+
+    if (when != MaxTick) {
+        when = std::max(when, curTick() + 1);   // 原有逻辑，不变
+
+        // 新增：只在真正跨域时才生效，本地调用（curEventQueue() ==
+        // em.eventQueue()，包括串行模式——此时全局只有一个队列，这个判断
+        // 恒假）完全不受影响。
+        if (inParallelMode && curEventQueue() != em.eventQueue()) {
+            when = std::max(when,
+                simQuantumStart +
+                divCeil(when - simQuantumStart, simQuantum) * simQuantum);
+        }
+
+        if (!sendEvent.scheduled()) {
+            em.schedule(&sendEvent, when);
+        } else if (when < sendEvent.when()) {
+            em.reschedule(&sendEvent, when);
+        }
+    } else { ... }                        // 不变
+}
+```
+
+**一次改动，覆盖 17.2 表格里"经典 Port 跨域调度"那一整行**——`RubyPort.cc`
+的两处、每一个 `SimpleTimingPort` 设备，全部自动获得保护，不需要逐个找、
+逐个改。`RubyPort.cc` 原来的 `curTick() + owner.m_ruby_system->
+clockPeriod()` 这行代码**不需要动**：它算出来的 `when` 照样传给
+`schedTimingResp`→`schedSendTiming`→`schedSendEvent`，只是在 `schedSendEvent`
+这一层，如果这个 `when` 不够安全，会被兜底抬高到网格边界——原调用点完全不用
+知道自己是不是跨域，这是这个设计比 19.1 旧版本"每个调用点自己判断"更省事、
+也更不容易漏掉新设备/新调用点的地方。
+
+### 19.3 为什么不是"抬高 IOXBar 参数"或者"在 `EventQueue::schedule` 里做通用 snap"
 
 - **抬高 IOXBar 参数**：17.2 已经排除——IOXBar 的 `Cycles` 参数根本不出现在
-  跨域 `schedule()` 调用里，改了也不解决断言问题，纯属精力浪费。
-- **在 `EventQueue::schedule()` 的跨域分支里做通用 snap**（曾经考虑过的备选
-  方案）：架构上更"一次性解决所有未来同类 bug"，但代价是**任何**跨域
-  `schedule()` 调用都会被无条件抬到网格边界，包括 Ruby int_link 那些**已经
-  用真实延迟值（ll=20）保证安全、不需要也不应该被再延迟**的消息——会在
-  已经验证过时序中性的路径上引入新的、无由头的松弛，且没有办法用
-  `std::max` 精确到"只在真正需要时才生效"（`EventQueue::schedule()` 这一层
-  拿不到"这次调用原本该有多少物理延迟"这个信息，没法判断 `when` 是"本来就
-  该是网格边界"还是"发起方本来就精确算出了一个安全值，只是不巧比网格边界
-  早"）。19.1 的按点修复虽然要多找几个点，但每个点都能拿到足够的上下文做
-  `std::max` 式的最小干预，不会牵连已经验证正确的路径。**结论：按点修，不
-  做全局通用 snap**——除非 20 节的实验证明还有第三、第四个同类点，多到
-  按点修不经济，才重新考虑通用方案。
+  跨域 `schedule()` 调用里，改了也不解决断言问题。
+- **在 `EventQueue::schedule()` 的跨域分支里做通用 snap**：19.1 已经说明为
+  什么不选这一层——会连累 Ruby int_link 那些已经用真实延迟值（ll=20）保证
+  安全、不需要也不应该被再延迟的消息，且这一层拿不到"是否真的需要 snap"
+  所需的上下文。`PacketQueue::schedSendEvent` 没有这个问题，是更合适的
+  公共点。
 
-### 19.3 对既有 timing-neutral 不变式的影响
+### 19.4 对既有 timing-neutral 不变式的影响
 
-19.1 的 `std::max` 设计保证：
-1. 串行模式：完全不变（`inParallelMode==false` 分支永远不触发 snap）。
-2. 并行模式、Q 仍然 `<= clockPeriod()`（即今天的 Q=300 场景）：`std::max`
-   总是保留原始值（因为原始值已经安全），**行为不变**，S-008 已经验证过的
+19.2 的 `std::max` 设计保证：
+1. 串行模式：完全不变（`inParallelMode==false` 分支永远不触发 snap；就算
+   忘了这个判断，串行模式下 `curEventQueue() == em.eventQueue()` 恒成立，
+   条件也不会满足——两层保险）。
+2. 并行模式、这次调用原本的 `when` 已经足够安全（比如 Q 仍然小于这次调用的
+   物理延迟）：`std::max` 总是保留原始值，**行为不变**，S-008 已经验证过的
    "并行 stats.txt 与串行逐字节相同"这条结论不受影响。
-3. 并行模式、Q 被抬过 `clockPeriod()`（S-009 的目标场景）：PIO 响应会被
-   snap 到网格边界，比"真实"的 1-周期延迟晚最多接近一个 Q——**这是一次新的、
-   之前从未测过的真实时序松弛，不再是"机制替换、结果不变"，而是"真的会让
-   PIO 响应变慢"**。S-008 的缺口算术投影（0.33x → ~0.92x）是假设 simInsts
-   不变算出来的；这个假设在跨过这条边之后不再自动成立，必须重新测，不能
-   直接当结论用。
+3. 并行模式、Q 被抬过某次具体调用的物理延迟（S-009 的目标场景，17.3 已经
+   说明这条边界因设备而异，不是单一数值）：这次响应会被 snap 到网格边界，
+   比"真实"延迟晚最多接近一个 Q——**这是一次新的、之前从未测过的真实时序
+   松弛，不再是"机制替换、结果不变"，而是"真的会让某些经典 Port 响应变
+   慢"**。S-008 的缺口算术投影（0.33x → ~0.92x）是假设 simInsts 不变算出
+   来的；这个假设在跨过这条边之后不再自动成立，必须重新测，不能直接当
+   结论用。
 
 ## 20. 实验协议（供实现阶段参考，本次不执行）
 
-1. 先做 18 节的线程安全审计（读代码 + 有必要的话在 debug 构建里加断言/
-   TSan 跑一遍 S-008 的定窗场景，确认这条路径在当前 Q=300 下没有静默竞态）。
-2. 实现 19.1 的两处 snap。用 S-003 §8.7 验证计划的方法论：先跑几次确认
-   `assert(when >= getCurTick())` 不再在 Q > 333 时触发。
+1. 18 节的线程安全审计已经完成、确认了真实竞争；实现阶段要先给共享的经典
+   Port 状态（IOXBar 的 `reqLayers`/`respLayers`/`routeTo`，以及可能被
+   多核并发访问的具体设备）加锁（18.3 的修复方向），这一步和下面的 snap
+   工作量相当，不是小任务，需要单独规划、可能需要 TSan 验证加锁是否完备。
+2. 实现 19.2 的 `PacketQueue::schedSendEvent` 改动。用 S-003 §8.7 验证计划
+   的方法论：先跑几次确认 `assert(when >= getCurTick())` 不再在 Q 抬高后
+   触发。
 3. **不要一步跳到 Q=6660**：先小幅抬（比如 Q=1000）确认没有新的、之前没
    见过的墙（S-006 §11.4-11.5 的教训——每次拓扑/参数变化都可能踩到新墙，
    宁可多花一轮先在小 Q 增量上排除掉，再往上抬）。
@@ -162,22 +270,32 @@ owner.pioResponsePort.schedTimingResp(pkt, when);   // 或 port->schedTimingResp
 
 ## 22. 风险与未决问题
 
-- **18 节的线程安全问题是本设计最大的不确定性**：如果审计发现真实竞态，
-  S-009 的范围会从"改两处 snap"扩大到"给经典 Port 路径也做一遍 S-002/S-003
-  那种加锁工作"，工作量和风险都会显著上升，需要重新过一遍范围和排期。
-- 19.1 的 `std::max` 判断依赖 `inParallelMode`/`simQuantumStart`/
-  `simQuantum` 三个全局量在 `RubyPort.cc` 里是否已经可见（`eventq.hh` 是
-  否已经被这个翻译单元包含）——实现时需要确认，不确认可能要多加一个头文件。
-- 是否还有第三个同类"硬编码 curTick()+常量"的跨域调度点，17.2 的表格是
-  基于目前读过的代码（`RubyPort.cc`、`noncoherent_xbar.cc`、
-  `cpu/simple/timing.cc`）整理的，不是穷举式 grep 全代码库的结果——实现前
-  应该对 `curTick() *(\+|-)` 附近跟着 `schedule\(` 的模式做一次全仓库
-  grep，确认没有漏掉的第四个点。
+- **18 节确认的数据竞争是目前最大的工作量来源**：加锁范围（IOXBar 一把锁
+  是否够、哪些设备需要各自的锁、哪些设备能论证不需要）需要在实现阶段逐一
+  过一遍南桥下的设备清单，量级和 S-002/S-003 当年给 Ruby 做的事情相当，
+  是本设计目前最大的不确定性和最大的工作量，不是"顺手做了"。
+- 19.2 的判断依赖 `inParallelMode`/`simQuantumStart`/`simQuantum` 三个
+  全局量在 `packet_queue.cc` 里是否已经可见（`eventq.hh` 是否已经被这个
+  翻译单元包含，以及 `curEventQueue()`/`em.eventQueue()` 的比较在这个
+  上下文里是否线程安全——`curEventQueue()` 读的是调用线程自己的 TLS，
+  `em.eventQueue()` 读的是构造时绑定、之后不再变的指针，两者都不涉及跨
+  线程的可变共享状态，预期安全，但实现时要确认）——实现时需要确认。
+- 17.2/17.3 的调用链分析基于目前读过的代码（`RubyPort.cc`、
+  `noncoherent_xbar.cc`、`packet_queue.cc`、`qport.hh`、`tport.cc`、
+  `cpu/simple/timing.cc`），不是穷举式 grep 全代码库的结果——19.2 的设计
+  由于落点在共享基础设施而不是逐个调用点，理论上不再需要穷举每个调用点，
+  但仍然应该在实现前对 `schedTimingReq\(|schedTimingResp\(` 全仓库
+  grep 一次，确认没有绕过 `PacketQueue`/`QueuedPort` 机制、自己直接调
+  `EventQueue::schedule()` 的例外情况（比如某些设备可能没有用
+  `SimpleTimingPort`/`QueuedResponsePort`，而是自己手写了 `recvTimingReq`
+  的调度逻辑）。
 
 ## 检查点
 
-这份文档到此为止。**下一步（18 节审计 + 19 节实现）按项目工作方式需要单独
-请示**——审计可能发现范围比预期大，实现阶段大概率需要现场调试（S-003/S-006
-的历史经验：新拓扑/新参数几乎每次都撞上没预见到的墙），不属于"照既定设计
-执行"，请求用户确认是否现在开始，还是先做 18 节审计、审计结果出来后再决定
-19-20 节要不要做、怎么做。
+这份文档到此为止。**下一步（18 节的加锁工作 + 19 节的 `PacketQueue`
+改动）按项目工作方式需要单独请示**——18 节的加锁范围目前还没有逐个设备
+过一遍，工作量可能比预期大；19 节的改动虽然定位到了一个干净的公共点，
+实现阶段大概率仍会现场撞上没预见到的墙（S-003/S-006 的历史经验：新拓扑/
+新参数几乎每次都有意外）。请求用户确认：是先做 18 节的加锁范围排查（把
+"南桥下有哪些设备、哪些会被多核并发访问"这张清单列出来），还是直接开始
+19 节的 `PacketQueue` 改动（先解决断言，加锁工作单独排期）。
