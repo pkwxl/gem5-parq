@@ -9,6 +9,32 @@ simulation), used in academic and industrial research. The codebase mixes C++ (t
 `src/`) with Python (SimObject parameter declarations, the build system, config scripts, and the `gem5`
 standard library used to assemble simulations).
 
+## Primary research goal (this fork)
+
+This fork's main ongoing project is speeding up multi-core Ruby simulation by splitting gem5's single
+`EventQueue` into one queue per cache/coherence domain (private per-core L1/L2 domains + a shared
+LLC/directory domain), run on separate host threads, synchronized by a quantum barrier — following the
+parti-gem5 approach (relaxed cross-domain timing, not lock-free structures). Target: real wall-clock speedup
+over the existing single-`EventQueue` serial simulator while staying timing-accurate (or with a
+well-quantified, deliberate relaxation).
+
+Full design history, decisions, and empirical results live in `docs/specs/INDEX.md` — start there, not with
+this file, for anything related to this work. New investigations get their own `docs/specs/S-NNN-slug.md`
+(see the index for the numbering convention); don't append to an existing spec file for a new topic.
+
+**Working style for this project** (empirically validated over many sessions, not just a preference):
+- Report inconvenient measurements plainly, and write them into the relevant `docs/specs/S-NNN` file
+  immediately, in the same session — not just mentioned in chat and left for later. Whenever a result
+  contradicts a stated goal or an earlier claim (including one made earlier in the same session), correct
+  the doc right away.
+- Even after a broad go-ahead ("start implementing X"), pause and offer a checkpoint before starting a new
+  sub-phase that's qualitatively riskier than what came before (new architecture territory, first-of-its-kind
+  test, likely to need live debugging rather than following an existing plan) — broad authorization for the
+  overall task doesn't imply authorization to run through every risky sub-phase unattended.
+- Known operational pitfall specific to this project: never send `SIGUSR1`/`SIGUSR2` to a running
+  parallel-`EventQueue` gem5 process (async stat dump on a non-main thread without the GIL segfaults it) —
+  see `docs/specs/S-007-spin-barrier-and-milestone.md` §14 for the safe way to read a live tick instead.
+
 ## Branches
 
 - `stable`: latest official release only. **Do not develop on `stable`.**
