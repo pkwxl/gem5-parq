@@ -44,6 +44,7 @@
 
 #include "base/addr_range.hh"
 #include "base/addr_range_map.hh"
+#include "base/critpath_trace.hh"
 #include "mem/packet.hh"
 #include "sim/serialize.hh"
 
@@ -141,8 +142,9 @@ class PhysicalMemory : public Serializable
     // Name for debugging
     std::string _name;
 
-    // Global address map
-    AddrRangeMap<AbstractMemory*, 1> addrMap;
+    // Global address map. Tagged CacheLock (S-012 design §4.1): shared
+    // across every domain's memory accesses (S-010 §7).
+    AddrRangeMap<AbstractMemory*, 1> addrMap{CritPathLockTag::CacheLock};
 
     // All address-mapped memories
     std::vector<AbstractMemory*> memories;

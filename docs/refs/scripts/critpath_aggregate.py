@@ -13,9 +13,15 @@ last-arriver result.
 CSV schema (written by critPathFlush(), one header line then data rows):
     kind,tick,domainId,barrierPass,isLast,eventCount,dur_ns,lockTag
 
-Only kind == "barrier" rows exist as of Step 3 (lockwait rows land in
-Step 4, design §4.1); this script ignores any other kind defensively
-rather than assuming the file only ever contains barrier rows.
+Step 4 (design §4.1) adds kind == "lockwait" rows: one per
+UncontendedMutex slow-path acquisition on a tagged (LayerLock/PioLock/
+CacheLock/ConsumerLock) instance. dur_ns there is the slow-path wait
+time; lockTag is the CritPathLockTag ordinal (1=LayerLock, 2=PioLock,
+3=CacheLock, 4=ConsumerLock -- 0/None never appears, design §4.1's
+`tag != None` guard). This script's barrier-histogram path (unknown 1)
+ignores lockwait rows and vice versa for the lock-wait summary (unknown
+2, §7's second bullet) -- each is filtered by `kind` independently
+rather than assuming a file only ever contains one kind.
 
 Join key (design §3.4): (tick, barrierPass). Every domain's BarrierPass
 record for the same quantum boundary and the same one-of-two-per-quantum
@@ -66,6 +72,91 @@ def load_records(outdir):
                     int(row["eventCount"]),
                     int(row["dur_ns"]),
                 )
+
+
+LOCK_TAG_NAMES = {1: "LayerLock", 2: "PioLock", 3: "CacheLock",
+                  4: "ConsumerLock"}
+
+
+def load_lockwait_records(outdir):
+    """Yield (tick, domainId, lockTag, dur_ns) for every lockwait-kind row
+    across all critpath-domain*.csv files in outdir."""
+    paths = sorted(glob.glob(os.path.join(outdir, "critpath-domain*.csv")))
+    if not paths:
+        sys.exit(f"no critpath-domain*.csv files found under {outdir}")
+
+    for path in paths:
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row["kind"] != "lockwait":
+                    continue
+                yield (
+                    int(row["tick"]),
+                    int(row["domainId"]),
+                    int(row["lockTag"]),
+                    int(row["dur_ns"]),
+                )
+
+
+def read_host_seconds(outdir):
+    """Best-effort read of the (single, whole-run) hostSeconds stat from
+    <outdir>/stats.txt, for normalizing lock-wait time (design §7's second
+    bullet). Returns None if stats.txt is missing or the field isn't
+    found -- normalization is then skipped, not fatal."""
+    path = os.path.join(outdir, "stats.txt")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == "hostSeconds":
+                try:
+                    return float(parts[1])
+                except ValueError:
+                    return None
+    return None
+
+
+def aggregate_lockwait(outdir):
+    # per_domain_tag[(domainId, lockTag)] = [dur_ns, ...]
+    per_domain_tag = defaultdict(list)
+    for _tick, domain_id, lock_tag, dur_ns in load_lockwait_records(outdir):
+        per_domain_tag[(domain_id, lock_tag)].append(dur_ns)
+    return per_domain_tag
+
+
+def print_lockwait_summary(per_domain_tag, host_seconds):
+    if not per_domain_tag:
+        print("\n=== lock-wait summary (unknown 2) ===\n"
+              "  no lockwait records found (either critpath_trace was off, "
+              "the run predates Step 4, or no tagged UncontendedMutex ever "
+              "took its slow path in this window)")
+        return
+
+    domains = sorted({d for d, _t in per_domain_tag})
+    domain_totals = defaultdict(int)
+    print("\n=== lock-wait summary (unknown 2) ===")
+    print(f"{'domain':>8} {'lockTag':>14} {'count':>10} "
+          f"{'total_ns':>14} {'avg_ns':>10}")
+    for domain_id in domains:
+        for lock_tag in sorted(t for d, t in per_domain_tag if d == domain_id):
+            durs = per_domain_tag[(domain_id, lock_tag)]
+            total = sum(durs)
+            domain_totals[domain_id] += total
+            name = LOCK_TAG_NAMES.get(lock_tag, str(lock_tag))
+            print(f"{domain_id:>8} {name:>14} {len(durs):>10} "
+                  f"{total:>14} {total / len(durs):>10.1f}")
+
+    print(f"\n{'domain':>8} {'total lock-wait ns':>20}"
+          + ("  % of hostSeconds" if host_seconds else ""))
+    for domain_id in domains:
+        total = domain_totals[domain_id]
+        line = f"{domain_id:>8} {total:>20}"
+        if host_seconds:
+            pct = 100.0 * total / (host_seconds * 1e9)
+            line += f"  {pct:>16.3f}%"
+        print(line)
 
 
 def aggregate(outdir):
@@ -158,6 +249,10 @@ def main():
 
     print_histogram(last_arriver_count, last_arriver_events, spread_ns,
                      only_pass=args.only_pass)
+
+    per_domain_tag = aggregate_lockwait(args.outdir)
+    host_seconds = read_host_seconds(args.outdir)
+    print_lockwait_summary(per_domain_tag, host_seconds)
 
 
 if __name__ == "__main__":

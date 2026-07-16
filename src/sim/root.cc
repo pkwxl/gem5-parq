@@ -204,6 +204,7 @@ Root::Root(const RootParams &p, int)
     eventqBarrierSpinIters = p.eventq_barrier_spin_iters;
 
     g_critPathTraceEnabled = p.critpath_trace;
+    g_critPathTraceReserve = p.critpath_trace_reserve;
 
     // Some of the statistics are global and need to be accessed by
     // stat formulas. The most convenient way to implement that is by

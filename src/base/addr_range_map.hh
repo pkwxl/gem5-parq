@@ -48,6 +48,7 @@
 #include <utility>
 
 #include "base/addr_range.hh"
+#include "base/critpath_trace.hh"
 #include "base/types.hh"
 #include "base/uncontended_mutex.hh"
 
@@ -73,6 +74,19 @@ class AddrRangeMap
     typedef typename RangeMap::iterator iterator;
     typedef typename RangeMap::const_iterator const_iterator;
     /** @} */ // end of api_addr_range
+
+    /**
+     * `tag` is S-012 critical-path instrumentation (design §4.1):
+     * AddrRangeMap is a template shared by cross-domain instances
+     * (PhysicalMemory::addrMap, BaseXBar::portMap) and domain-private
+     * ones (e.g. RISC-V/GPU-compute uses, design §2.5). Only the two
+     * cross-domain instances pass CritPathLockTag::CacheLock here;
+     * every other instantiation keeps the default None, which is the
+     * unmodified, untraced cacheLock behaviour.
+     */
+    explicit AddrRangeMap(CritPathLockTag tag = CritPathLockTag::None)
+        : cacheLock(tag)
+    {}
 
     /**
      * Find entry that contains the given address range

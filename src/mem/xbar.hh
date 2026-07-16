@@ -50,6 +50,7 @@
 #include <unordered_map>
 
 #include "base/addr_range_map.hh"
+#include "base/critpath_trace.hh"
 #include "base/types.hh"
 #include "base/uncontended_mutex.hh"
 #include "mem/qport.hh"
@@ -317,7 +318,9 @@ class BaseXBar : public ClockedObject
     /** the width of the xbar in bytes */
     const uint32_t width;
 
-    AddrRangeMap<PortID, 3> portMap;
+    // Tagged CacheLock (S-012 design §4.1): shared across every domain's
+    // classic Port requests (S-010 §7).
+    AddrRangeMap<PortID, 3> portMap{CritPathLockTag::CacheLock};
 
     /**
      * Remember where request packets came from so that we can route
@@ -335,7 +338,7 @@ class BaseXBar : public ClockedObject
      * exclusion for routeTo/reqLayers/respLayers. Held for the full body of
      * the timing entry points, not scoped to individual field accesses.
      */
-    mutable UncontendedMutex layerLock;
+    mutable UncontendedMutex layerLock{CritPathLockTag::LayerLock};
 
     /** all contigous ranges seen by this crossbar */
     AddrRangeList xbarRanges;

@@ -789,6 +789,224 @@ L3/目录
   可信;如果以后拿 cv 模式的数据做同样分析,这个代理值会系统性偏大
   一点,不能直接跨模式比较。
 
+## 14. 实现记录：Step 4（类型二锁等待打点 + `reserve()` 落地）
+
+按 §11 的 5 步计划，本节记录 Step 4——§4.1 的 `UncontendedMutex` 标签
++ 慢路径计时，以及 §13.6 记录的 `reserve()` 遗留项。
+
+### 14.1 落地内容
+
+跟 §4.1/§4.4 设计的对应关系：
+
+- `src/base/critpath_trace.hh`/`.cc`：新增
+  `critPathRecordLockWait(CritPathLockTag tag, CritPathClock::duration
+  dur)`——跟 `critPathRecordBarrierPass()` 不同，这个函数自己读
+  `curTick()`（`sim/cur_tick.hh`）而不是靠调用方传 tick：
+  `UncontendedMutex` 在 `base/`，不能像 `globalBarrier()`
+  （`sim/global_event.hh`）那样直接调 `curEventQueue()->getCurTick()`
+  ——`sim/eventq.hh` 本身就 `#include "base/uncontended_mutex.hh"`，
+  反向包含会循环。`curTick()` 是同一个线程本地值的另一条读取路径
+  （`base/trace.hh`、`base/stats/storage.hh` 已经在用这条路径，不是
+  新开的先例）。同时新增 `g_critPathTraceReserve`/`critPathReserve()`
+  （§14.4）。
+- `src/base/uncontended_mutex.hh`：按 §4.1 给出的代码原样落地——
+  加 `const CritPathLockTag tag` 成员、`explicit
+  UncontendedMutex(CritPathLockTag t = CritPathLockTag::None)`
+  构造函数，`lock()` 从 `while(!testAndSet())` 改写成
+  `if(testAndSet()) return;` + `do{...}while(!testAndSet())`（纯行为
+  保持重构，§4.1 已经论证过等价性，§14.2 验证）。
+- 四个已知跨域锁改成显式打标签：`src/mem/xbar.hh` 的
+  `layerLock{CritPathLockTag::LayerLock}`，`src/dev/io_device.hh` 的
+  `pioLock{CritPathLockTag::PioLock}`，
+  `src/mem/ruby/common/Consumer.hh` 的
+  `m_wakeup_mutex{CritPathLockTag::ConsumerLock}`。
+- `src/base/addr_range_map.hh`：给 `AddrRangeMap` 加
+  `explicit AddrRangeMap(CritPathLockTag tag = CritPathLockTag::None)`
+  构造函数，透传给 `cacheLock`；`src/mem/physical.hh` 的 `addrMap` 和
+  `src/mem/xbar.hh` 的 `portMap` 两个跨域实例显式传
+  `CritPathLockTag::CacheLock`，其余实例（RISC-V/GPU-compute 等）维持
+  默认 `None`，不受影响。
+
+### 14.2 验证：关闭状态 stats.txt 逐字节相同（§4.1 强制要求的
+重构中立性检查）
+
+方法沿用 §11.2/§12.2/§13.2：`build/X86_MESI_Three_Level`、检查点
+`x86-threads3-roi-classic`、`MAX_TICKS=2e8`、`SIM_QUANTUM_TICKS=6660`、
+`EVENTQ_BARRIER_MODE=spin`、隔离核 92-99（并行臂 `taskset -c 92`，
+串行臂 `taskset -c 54`）。改动前二进制用 `git stash` 还原到 Step 3
+完成点（`cb91748e71`）在同一个 `build/X86_MESI_Three_Level` 目录里
+重新编译取得，改动后二进制是 `git stash pop` 换回来再编译一次；两次
+编译都只有环境已知的第三方库缺失警告。
+
+**一个需要如实记录的操作细节**：驱动脚本
+`docs/refs/scripts/x86_fs_mesi3_parallel_eventq.py` 本身也在这次改动
+里（新增 `EVENTQ_CRITPATH_RESERVE`/`root.critpath_trace_reserve`，
+§14.4），改动前的二进制没有 `critpath_trace_reserve` 这个 `Root`
+参数，用改动后的脚本跑会在 `_pre_instantiate()` 里
+`AttributeError: Invalid assignment for Class Root with parameter
+critpath_trace_reserve` 直接失败——这不是这次重构引入的行为回归，是
+"脚本版本要跟二进制版本对齐"这个一直存在但之前没有被踩到的前提（之前
+几步脚本没有随二进制一起变过）。改动前的二进制改用
+`git show cb91748e71:docs/refs/scripts/x86_fs_mesi3_parallel_eventq.py`
+取出的旧版脚本重新跑，问题消失。
+
+两组（串行/并行）`stats.txt`（排除 `host*` 字段）改动前后**逐字节
+相同**；`simInsts=74062`，四次跑（串行×2、并行×2）全部一致；四份
+日志里都没有 `assert`/`panic`/`abort`/段错误关键字；关闭状态下四次
+跑都没有产出任何 `critpath-domain*.csv`（`critPathFlush()` 在空
+缓冲区上正确地保持 no-op）。这确认了 §4.1 论证的"`do-while` 重构+
+标签比较在关闭时行为不变"在这次具体改动上成立。
+
+**另一个如实记录的操作细节（与本次代码改动无关，纯环境问题）**：
+第一轮验证跑撞上一个陈旧的 `/home/wxl/.cache/gem5/x86-ubuntu-24.04-
+img-4.0.0.lock.lock`——`src/python/gem5/utils/filelock.py` 用
+`O_CREAT|O_EXCL` 手工锁文件实现互斥，不是 `flock()`，进程被
+`SIGKILL`（本会话早前一次手动中断的 5 分钟超时跑）不会自动清理这个
+锁文件，导致之后所有需要这个资源的跑全部在 900 秒超时后失败。资源
+本身（`.gz`，约 1GB）已经完整，删掉这个空锁文件、重跑即可恢复——
+如果之后的会话在这个沙箱里撞到同样的 `FileLockException`，这是已知
+根因，不代表代码有问题。**这个沙箱当前被至少另一个并发的 Claude Code
+会话共用**（观察到一个跑
+`x86_fs_classic_save_ckpt_balanced.py`/重新编译
+`build/X86_MESI_Three_Level` 的独立进程树，`cwd` 打印指向不同的
+`scratchpad` 会话 ID）——这次锁文件残留大概率是本会话自己造成的，但
+以后如果 `build/X86_MESI_Three_Level` 被别的会话同时 `scons`，也要
+考虑一起构建撞车的可能性，本会话这次没有踩到后者，如实记录风险存在
+而非确认发生过。
+
+### 14.3 §9 要求的 TSan 回归：本次会话明确推迟，不是遗漏
+
+Step 4 是这四个文件（`xbar.hh`/`io_device.hh`/`addr_range_map.hh`/
+`Consumer.hh`）第一次被真正改动（构造函数签名变化），§9 论证过这时候
+应该重新跑一遍 S-009 §24.5/S-010 §11.2/S-011 §10.4 的 TSan A/B。这次
+实现会话就是否要在本次一并做这件事跟用户核对过——**用户选择推迟，
+记在这里作为明确的后续待办**，不是本会话疏漏：下一次涉及这几个文件
+或者准备用这份锁等待数据做定量结论之前，应该先补上
+`scons --with-tsan build/X86_MESI_Three_Level_TSAN/gem5.opt` +
+大窗口（参考 S-011 用的 `MAX_TICKS=1.3e9`）serial+spin 各至少一轮，
+确认新增的标签比较/`do-while` 重构没有在这四个文件上引入/去除任何
+TSan 报告。
+
+### 14.4 `reserve()` 落地（§13.6 记录的 Step 3 遗留项）
+
+按 §4.4"通过 Root 参数或环境变量传入"的要求：
+
+- `src/sim/Root.py`：新增 `critpath_trace_reserve =
+  Param.Unsigned(0, ...)`——0（默认）= 不预留，行为跟 Step 1-3 完全
+  一样。
+- `src/sim/root.cc`：`g_critPathTraceReserve = p.critpath_trace_reserve;`。
+- `src/base/critpath_trace.{hh,cc}`：`critPathReserve()`，
+  `g_critPathTraceReserve > 0` 时对当前线程的 `critPathBuffer`
+  调用一次 `reserve()`，否则 no-op。
+- `src/sim/simulate.cc`：在 `thread_main()` 设置
+  `critPathDomainId` 之后（线程入口，一次性）、以及 `simulate()`
+  里域 0 设置 `critPathDomainId = 0` 之后（每次 `simulate()`
+  重入都调一次，但 `reserve()` 在容量已经足够时是 no-op，重复调用
+  代价可忽略）各加一次 `critPathReserve()` 调用。
+- `docs/refs/scripts/x86_fs_mesi3_parallel_eventq.py`：新增
+  `EVENTQ_CRITPATH_RESERVE`（默认 `"0"`）→
+  `root.critpath_trace_reserve`。
+
+**如实记录一个限制**：本 Step 4 的 §14.5 打开插桩验证跑用的是默认
+`EVENTQ_CRITPATH_RESERVE=0`（没有专门设置非零值测试）——`reserve()`
+本身的代码路径跟着 §14.2 的关闭状态回归和 §14.5 的打开状态跑一起
+执行过（`critPathReserve()` 在 `g_critPathTraceReserve==0` 时直接
+返回，是已经覆盖到的 no-op 分支），但"设置了非零预算、真的跳过了
+vector 重新分配"这条路径本身**没有专门跑一次验证**——§13.3 记录的
+"没有专门测过重新分配本身有没有在时间线里留下痕迹"这个问题，落了
+`reserve()` 的地基，但还没有真的用非零预算跑一次去回答它,严格说
+仍然是留给以后(扩大窗口前)的待办,只是现在有了做这件事需要的参数
+管线。
+
+### 14.5 打开插桩：跟 §13.3 同一操作点，加锁等待记录
+
+协议不变（`EVENTQ_CRITPATH_TRACE=1`、Q=6660、spin、`MAX_TICKS=2e8`、
+隔离核 92-99、`x86-threads3-roi-classic`，`EVENTQ_CRITPATH_RESERVE`
+维持默认 0）。跑完无崩溃，退出码 0，`simInsts=74062`（跟关闭状态
+完全一致——打开插桩不改变模拟的指令级行为，只是这次没有像 §13.2
+那样做逐字节 `stats.txt` 比对，因为 §5 已经论证过"打开插桩时
+`hostSeconds` 不能拿来跟关闭状态比较"，但功能性的 `simInsts` 一致
+仍然是一个有意义的健全性检查）。
+
+8 个域各自产出的 `critpath-domain<N>.csv` 这次明显更大（约 2.2MB/域，
+对比 Step 3 的量级），因为除了 `barrier` 行还有本 Step 新增的
+`lockwait` 行：`grep -c "^lockwait"` 统计,8 个域里只有 3 个域出现过
+`lockwait` 行——域 1: 54 次,域 5: 2 次,域 6: 1 次,其余 5 个域
+(0/2/3/4/7)一次都没有。`(tick, barrierPass)` 分组的 `isLast=1`
+恰好一行这条不变量（跟 §13.3 一样)本次同样零违反。
+
+### 14.6 聚合脚本 v2 输出与未知数 2 的初步回答
+
+`docs/refs/scripts/critpath_aggregate.py` 这次扩展了
+`load_lockwait_records()`/`aggregate_lockwait()`/
+`print_lockwait_summary()`（按 §7 第二条"按域、按锁标签汇总类型二
+记录的总等待时长/次数，归一化到该域的 `hostSeconds`"实现——
+`hostSeconds` 从同目录 `stats.txt` 读取，找不到就跳过归一化而不是
+报错）。跑在同一个窗口上：
+
+```
+=== lock-wait summary (unknown 2) ===
+  domain        lockTag      count       total_ns     avg_ns
+       1   ConsumerLock         54         362392     6711.0
+       5   ConsumerLock          2           6839     3419.5
+       6   ConsumerLock          1           7245     7245.0
+
+  domain   total lock-wait ns  % of hostSeconds
+       1               362392             0.024%
+       5                 6839             0.000%
+       6                 7245             0.000%
+```
+
+（同一次跑的屏障直方图跟 §13.4 几乎完全一致——域 1 pass 1/2 分别是
+50.6%/47.3%,域 5 是 14.4%/14.3%,不重复贴表；两次独立跑之间的具体
+百分比小幅波动符合 §13.6/§8 记录的"单次运行,非统计量"预期。）
+
+**这份数据是未知数 2 的第一份直接证据，结论清晰**：
+
+- **`LayerLock`/`PioLock`/`CacheLock` 这三类锁在这个窗口里一次慢
+  路径都没有走过**——8 个域、30030 个 quantum 边界的整个窗口内，
+  三者的 `lockwait` 行数都是 0。这个窗口是纯 Ruby 协议流量为主的
+  FS ROI（classic 边只在 IOXBar/PIO 场景才会被踩到，§2.5 表格），
+  这个结果符合"这段 ROI 窗口里 classic 跨域路径本来就很少被踩到"的
+  预期，但目前只有这一次运行的数据，不能推广成"这三类锁在所有
+  workload 下都不构成关键路径"。
+  - **`ConsumerLock`（Ruby wakeup 跨域路径,S-011 已经修过 owner
+  竞争的那把锁)是唯一走过慢路径的锁,但绝对量极小**：域 1 慢路径
+  命中 54 次、累计 362392 ns（约 0.36 毫秒）,相对这次跑的
+  `hostSeconds=1.49` 秒是 0.024%——三个数量级以下的占比。
+- **这直接支持、而不是否定 §13.5 的初步归因**："域 1 是关键路径是
+  因为真的工作多，不是卡在跨域锁上"——现在有了类型二的直接数据：
+  域 1 慢路径累计阻塞时间（0.36ms）比它在屏障上贡献的到达时间差
+  （§13.4 记录的 pass 1 spread p50=11.9µs × 30030 个 quantum，量级
+  在几百毫秒）小了两个数量级还不止。§13.6 记录的"归因只到初步"这条
+  已知局限，到这里可以去掉了——**S-012 §1 提出的未知数 2（"是卡在
+  某把跨域锁上,还是纯粹计算量大"）在这次窗口里有了明确答案：不是
+  锁，是计算量**。
+- **域 5（L3）、域 6（一个目录+DRAM）也各有极少量 `ConsumerLock`
+  命中（2 次、1 次），域 0/2/3/4/7 一次都没有**——量级太小，不足以
+  支撑任何关于"哪个域更容易卡锁"的结论，如实记录观测到的原始计数
+  而不过度解读。
+
+### 14.7 已知局限（如实记录）
+
+- **TSan 回归推迟**（§14.3）——已跟用户确认是明确决定,不是遗漏,
+  但在"当前状态是否完全验证过"这个问题上,答案仍然是"还没有",这份
+  待办应该在下一次触达这几个文件或者要拿这份数据做定量结论之前
+  完成。
+- **`reserve()` 代码落地但未用非零值实跑验证**（§14.4）——`§13.3`
+  提出的"vector 重新分配本身有没有制造抖动"这个问题,`reserve()`
+  的管线已经打通,但还没有真的用它去回答这个问题。
+- **锁等待样本量很小**（§14.6）——57 次命中（54+2+1）不足以对
+  `ConsumerLock` 本身的等待时长分布做任何统计意义上的论证,只能
+  支持"绝对量远小于屏障 spread"这个数量级上的粗略比较。
+- **单次运行,非统计量**——跟 §13.6/§8 一致,本节数字应该当作"这一次
+  运行大致是这样"读。
+- **`hostSeconds` 归一化用的是开着 `critpath_trace` 跑出来的
+  `hostSeconds`**（§14.6 表格）——§5 已经论证过这个值不能跨"开/关
+  插桩"比较,但拿它作为同一次跑内部"锁等待时间占这次跑总时间的
+  比例"的分母是自洽的,不涉及跨运行比较,这里的用法没有违反 §5 的
+  警告。
+
 ---
 
 **上一篇**：[S-011：Consumer 锁 owner 字段竞争审计](./S-011-consumer-lock-owner-race-audit.md)

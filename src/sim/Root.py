@@ -92,6 +92,13 @@ class Root(SimObject):
     critpath_trace = Param.Bool(
         False, "enable S-012 critical-path instrumentation"
     )
+    # Per-domain critPathBuffer capacity to reserve up front (records), so
+    # push_back's occasional reallocation doesn't add a stray blip to the
+    # timed instrumentation window (design §4.4). 0 (default) = no
+    # reservation, i.e. ordinary std::vector growth -- same as Steps 1-3.
+    critpath_trace_reserve = Param.Unsigned(
+        0, "S-012 critPathBuffer capacity to reserve per domain (records)"
+    )
 
     full_system = Param.Bool("if this is a full system simulation")
 

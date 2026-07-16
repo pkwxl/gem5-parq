@@ -41,6 +41,7 @@
 #ifndef __DEV_IO_DEVICE_HH__
 #define __DEV_IO_DEVICE_HH__
 
+#include "base/critpath_trace.hh"
 #include "base/uncontended_mutex.hh"
 #include "mem/tport.hh"
 #include "params/BasicPioDevice.hh"
@@ -119,7 +120,7 @@ class PioDevice : public ClockedObject
 {
   private:
     /** See the PioPort<PioDevice>::recvAtomic specialization above. */
-    mutable UncontendedMutex pioLock;
+    mutable UncontendedMutex pioLock{CritPathLockTag::PioLock};
 
   protected:
     System *sys;

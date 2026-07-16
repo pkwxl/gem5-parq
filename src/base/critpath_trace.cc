@@ -7,11 +7,13 @@
 
 #include "base/cprintf.hh"
 #include "base/output.hh"
+#include "sim/cur_tick.hh"
 
 namespace gem5
 {
 
 bool g_critPathTraceEnabled = false;
+size_t g_critPathTraceReserve = 0;
 
 thread_local uint32_t critPathDomainId = 0;
 thread_local std::vector<CritPathRecord> critPathBuffer;
@@ -32,6 +34,25 @@ critPathRecordBarrierPass(const CritPathBarrierCtx &ctx, bool isLast,
     critPathBuffer.push_back(r);
 
     critPathEventCount = 0;
+}
+
+void
+critPathRecordLockWait(CritPathLockTag tag, CritPathClock::duration dur)
+{
+    CritPathRecord r;
+    r.tick = curTick();
+    r.domainId = critPathDomainId;
+    r.kind = CritPathRecordKind::LockWait;
+    r.dur = dur;
+    r.lockTag = tag;
+    critPathBuffer.push_back(r);
+}
+
+void
+critPathReserve()
+{
+    if (g_critPathTraceReserve > 0)
+        critPathBuffer.reserve(g_critPathTraceReserve);
 }
 
 void

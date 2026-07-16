@@ -8,14 +8,18 @@
  * S-012 critical-path instrumentation: shared types/state (design doc:
  * docs/specs/S-012-eventq-critical-path-instrumentation-design.md).
  *
- * As of Step 2, Barrier::wait() (src/base/barrier.hh) appends
- * BarrierPass records and EventQueue::serviceOne() (src/sim/eventq.cc)
- * drives the per-quantum event counter (design §4.2/§3.3). The
- * UncontendedMutex slow-path LockWait instrumentation (§4.1) is still
- * unimplemented -- that's Step 4. With critpath_trace off (the
- * default), the added per-thread cost is: the one-time write of
- * critPathDomainId at thread entry (§4.3), one predictable bool check
- * per barrier wait, and one predictable bool check per serviced event.
+ * As of Step 4, Barrier::wait() (src/base/barrier.hh) appends
+ * BarrierPass records, EventQueue::serviceOne() (src/sim/eventq.cc)
+ * drives the per-quantum event counter (design §4.2/§3.3),
+ * UncontendedMutex::lock()'s slow path (src/base/uncontended_mutex.hh)
+ * appends LockWait records for the four tagged cross-domain instances
+ * (design §4.1), and critPathFlush() is wired to each domain's thread
+ * exit / atexit (Step 3). With critpath_trace off (the default), the
+ * added per-thread cost is: the one-time write of critPathDomainId at
+ * thread entry (§4.3), one predictable bool check per barrier wait, one
+ * predictable bool check per serviced event, and one predictable bool
+ * check (`tag != None`, itself almost always false since only 4 tagged
+ * instances exist) per UncontendedMutex slow-path acquisition.
  */
 
 #ifndef __BASE_CRITPATH_TRACE_HH__
@@ -159,17 +163,45 @@ void critPathRecordBarrierPass(const CritPathBarrierCtx &ctx, bool isLast,
                                 CritPathClock::duration dur);
 
 /**
+ * Record one LockWait entry for the calling thread's domain (design
+ * §3.2/§4.1): called from UncontendedMutex::lock()'s slow path when
+ * the mutex carries a non-None tag and tracing is on. Reads
+ * critPathDomainId and, unlike critPathRecordBarrierPass(), reads the
+ * join-key tick itself via curTick() (design §3.4) rather than taking
+ * it from the caller -- UncontendedMutex lives in base/ and can't
+ * include sim/eventq.hh (circular: eventq.hh already includes
+ * uncontended_mutex.hh for its own untagged mutexes), so unlike
+ * globalBarrier() (sim/global_event.hh) it cannot read
+ * curEventQueue()->getCurTick() itself either. curTick() (sim/
+ * cur_tick.hh, already an accepted base/ dependency -- see base/
+ * trace.hh, base/stats/storage.hh) is the same thread-local value.
+ */
+void critPathRecordLockWait(CritPathLockTag tag, CritPathClock::duration dur);
+
+/**
  * Write this thread's critPathBuffer to
  * "<outdir>/critpath-domain<critPathDomainId>.csv" and clear it. A
- * no-op if the buffer is empty -- true for every domain until later
- * steps wire up the call sites that actually append records.
- *
- * Not yet called from any production code path (design §4.4's flush
- * call sites land with the instrumentation that produces records to
- * flush); exists now so that step lands with the rest of the
- * scaffolding in one place.
+ * no-op if the buffer is empty. Wired to each domain's thread-exit /
+ * atexit (src/sim/simulate.cc, Step 3).
  */
 void critPathFlush();
+
+/**
+ * Buffer-capacity budget (in records), configured via the Root param
+ * critpath_trace_reserve (design §4.4's "预留容量" follow-up, landed
+ * in Step 4 -- see S-012 §13.6/§14). 0 (the default) means no
+ * reservation: critPathBuffer grows the normal std::vector way,
+ * exactly as it did through Step 3.
+ */
+extern size_t g_critPathTraceReserve;
+
+/**
+ * Reserve capacity for this thread's critPathBuffer if a nonzero
+ * budget was configured. Call once at thread entry, right after
+ * critPathDomainId is set (§4.3) and before any record can be pushed.
+ * A no-op when g_critPathTraceReserve is 0.
+ */
+void critPathReserve();
 
 } // namespace gem5
 

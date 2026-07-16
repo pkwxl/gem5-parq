@@ -204,6 +204,7 @@ class SimulatorThreads
     thread_main(EventQueue *queue, uint32_t domainId)
     {
         critPathDomainId = domainId;
+        critPathReserve();
 
         /* Wait for all initialisation to complete */
         barrier.wait();
@@ -322,6 +323,7 @@ simulate(Tick num_cycles)
 
     simulatorThreads->runUntilLocalExit();
     critPathDomainId = 0;
+    critPathReserve();
     Event *local_event = doSimLoop(mainEventQueue[0]);
     assert(local_event);
 

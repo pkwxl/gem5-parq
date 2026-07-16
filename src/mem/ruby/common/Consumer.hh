@@ -51,6 +51,7 @@
 #include <iostream>
 #include <set>
 
+#include "base/critpath_trace.hh"
 #include "base/uncontended_mutex.hh"
 #include "sim/clocked_object.hh"
 
@@ -152,7 +153,7 @@ class Consumer
     std::set<Tick> m_inflight_ticks;
     Event::Priority m_ev_prio;
 
-    UncontendedMutex m_wakeup_mutex;
+    UncontendedMutex m_wakeup_mutex{CritPathLockTag::ConsumerLock};
     std::atomic<EventQueue *> m_wakeup_mutex_owner{nullptr};
     unsigned m_wakeup_mutex_depth = 0;
 

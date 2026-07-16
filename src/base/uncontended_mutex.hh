@@ -32,6 +32,8 @@
 #include <condition_variable>
 #include <mutex>
 
+#include "base/critpath_trace.hh"
+
 namespace gem5
 {
 
@@ -57,6 +59,17 @@ class UncontendedMutex
     std::mutex m;
     std::condition_variable cv;
 
+    /**
+     * S-012 critical-path instrumentation (design §2.5/§4.1): identifies
+     * which cross-domain UncontendedMutex instance this is, for the
+     * slow-path LockWait records below. `None` (the default) means
+     * "don't trace this instance" -- every UncontendedMutex not
+     * explicitly tagged at construction (including
+     * EventQueue::service_mutex/async_queue_mutex, design §6) keeps
+     * this value and takes the exact original, untimed lock() path.
+     */
+    const CritPathLockTag tag;
+
     bool
     testAndSet(int expected, int desired)
     {
@@ -64,7 +77,9 @@ class UncontendedMutex
     }
 
   public:
-    UncontendedMutex() : flag(0) {}
+    explicit UncontendedMutex(CritPathLockTag t = CritPathLockTag::None)
+        : flag(0), tag(t)
+    {}
 
     void
     lock()
@@ -77,7 +92,21 @@ class UncontendedMutex
          * The flag will be updated to more than 1, so the thread with lock
          * knows that there is another thread waiting for the lock.
          */
-        while (!testAndSet(0, 1)) {
+        if (testAndSet(0, 1))
+            return;
+
+        // S-012 design §4.1: only time/record the slow path, and only for
+        // the handful of instances explicitly tagged at construction --
+        // `tag != None` is almost always false (it's false for every
+        // untraced UncontendedMutex, including the hot service_mutex/
+        // async_queue_mutex path, design §6), so this adds one
+        // predictable branch to the slow path and nothing to the fast
+        // path above.
+        const bool tracing = tag != CritPathLockTag::None && critPathTracing();
+        const auto t0 =
+            tracing ? critPathNow() : CritPathClock::time_point{};
+
+        do {
             std::unique_lock<std::mutex> ul(m);
             /*
              * It is possible that just before we obtain the mutex lock, the
@@ -88,7 +117,10 @@ class UncontendedMutex
             if (flag++ == 0)
                 break;
             cv.wait(ul);
-        }
+        } while (!testAndSet(0, 1));
+
+        if (tracing)
+            critPathRecordLockWait(tag, critPathNow() - t0);
     }
 
     void
