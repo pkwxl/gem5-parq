@@ -48,6 +48,7 @@
 #endif
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -211,6 +212,12 @@ class SimulatorThreads
             doSimLoop(queue);
             barrier.wait();
         }
+
+        // Outside the timed region (design §4.4): the thread is exiting
+        // for good (terminateThreads() joins it right after), so flush
+        // this domain's buffer now. A no-op if empty (tracing was off
+        // or nothing was recorded).
+        critPathFlush();
     }
 
     std::atomic<bool> terminate;
@@ -254,8 +261,17 @@ simulate(Tick num_cycles)
     DPRINTF(EnteringEventQueue, "Entering event queue @ %d. Starting "
         "simulation...\n", curTick());
 
-    if (!simulatorThreads)
+    if (!simulatorThreads) {
         simulatorThreads.reset(new SimulatorThreads(numMainEventQueues));
+
+        // Domain 0 (this thread) never "exits" the way subordinate
+        // threads do (design §4.4) -- simulate() returns and is
+        // re-entered many times from Python. Flush its critPathBuffer
+        // exactly once, at process exit, for symmetry with the
+        // subordinate threads' one-shot flush at thread exit. Registered
+        // only on the first simulate() call.
+        std::atexit(critPathFlush);
+    }
 
     if (!simulate_limit_event) {
         // If the simulate_limit_event is not set, we set it to MaxTick.
