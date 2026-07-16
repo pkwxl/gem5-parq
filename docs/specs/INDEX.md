@@ -48,7 +48,11 @@ S-002/S-003 给 Ruby 加锁的工作量相当。§23 逐设备排查发现竞争
 一个恒定的一 ruby 周期偏差未查明根因（S-006 §9.6 附近提到）。FS 完整 ROI
 串行参考的 `simTicks` 曾经跑完过，但原始 `stats.txt` 已随一次宿主机重启从
 `/tmp` 丢失，只剩交接文档里未核实的转述数字（S-008 §16）——如果需要拿这
-几个数字做定量结论，应重新跑一次。
+几个数字做定量结论，应重新跑一次。**S-011（草案）**记录了同一轮 TSan A/B
+里第二多的报告类别——S-002 引入的 per-consumer 锁自己的 owner 记账字段无
+同步读写，跟 `_curTick` 那种"设计上接受的陈旧读"不是一回事，论证了一个
+具体可能的误判窗口，但还没确认这个窗口在实际调用模式下是否可达，也没有
+设计修法，需要用户定下一步。
 
 ## Specs 列表
 
@@ -64,10 +68,11 @@ S-002/S-003 给 Ruby 加锁的工作量相当。§23 逐设备排查发现竞争
 | S-008 | [S-008-fs-serial-vs-parallel-current-position.md](./S-008-fs-serial-vs-parallel-current-position.md) | 测量完成；结论待 S-009 验证 | FS 定窗首次补齐串行臂：当前工作点并行比串行慢 ~3x（0.33x）；抬高 Q 的缺口算术投影只到 ~0.92x；完整 ROI 串行参考数字因宿主重启丢失、按未核实转述记录（§16） |
 | S-009 | [S-009-raise-fs-quantum-past-iobus-edge-design.md](./S-009-raise-fs-quantum-past-iobus-edge-design.md) | **设计稿，未实现** | 精确定位卡住 Q=300 的是 `PacketQueue::schedSendEvent`（`RubyPort.cc` 的 PIO 转发 + 每个经典 PIO 设备共享），不是 IOXBar 参数；设计在这一个公共点套用 S-006 §11.5 的 grid-anchored snap（§19，一次改动覆盖所有调用点）；审计**确认**这条经典 Port 路径存在真实的跨域数据竞争（§18），§23 逐设备排查发现竞争有两种形状（核 vs 核、核 vs 域0自己的线程），找到两个通用加锁落点（`BaseXBar`/`PioDevice`）+ PIT/RTC/IDE 的手工接线；两个通用点已实现+TSan 扩时长 A/B 干净（§24），PIT/RTC/IDE 仍留待下一轮；§24.5 发现的 `AddrRangeMap` 竞争已拆分单独立文，见 S-010 |
 | S-010 | [S-010-addr-range-map-cache-race.md](./S-010-addr-range-map-cache-race.md) | **已实现+TSan 验证；性能 A/B 待做** | 起点是 S-009 §24.5 TSan A/B 报告数量最多的一类（1500+ 次）：`AddrRangeMap<AbstractMemory*,1>`（`PhysicalMemory::addrMap`）的 LRU 查找缓存在 `find()`/`addNewEntryToCache()` 间无锁跨域读写，和 S-004 §9.8 X86 TLB 竞争同一个模式；全仓库 8 处 `AddrRangeMap` 实例化排查（§7）额外发现 `BaseXBar::portMap` 也有同一种竞争、且被 S-009 §24.1 的 `layerLock` 漏保护了三个调用入口（§7.2）；修法是在 `AddrRangeMap` 内部加 `cacheLock`（容器级，不是逐调用点，§10），非 TSan 正确性 A/B + TSan 扩时长 A/B（Q=300 小窗口 + MAX_TICKS=1.3e9 serial×2/spin×2，§11）均干净——四份 stats.txt 逐字节相同，76 次 TSan 警告的 `#0` 帧全部落在已知背景噪声（`_curTick`/`Event::Flags`/`Consumer::lock`），无一落在 `AddrRangeMap`/`portMap`；仍未测热路径开销 |
+| S-011 | [S-011-consumer-lock-owner-race-audit.md](./S-011-consumer-lock-owner-race-audit.md) | **草案，未完整审计，未修** | S-010 §11.2 TSan A/B 里第二多的报告类别（66 次）：`Consumer::lock()`/`unlock()`（S-002 引入的 per-consumer 可重入锁）自己的记账字段 `m_wakeup_mutex_owner` 无同步读写；跟同一轮报告里的 `_curTick`/`Event::Flags` 不是一回事——那两个是项目自己"放宽跨域时序"的设计取舍、陈旧读可容忍，这里读的是"我现在持锁吗"，需要精确答案；§3 用一份实测的完整 TSan 调用栈（跨域 `MessageBuffer::enqueue()` 撞见目标 `Switch` 自己域的 `wakeup()`）论证了一个具体的、有物理意义的窗口：曾经合法持有过某个 consumer 锁的线程，在窗口期内可能误读到自己的历史 owner 值，跳过真锁直接走重入快路径，而实际当前持有者是另一个线程；§4 列了三个待确认的开放问题（可达性、触发概率量级、修法方向），都还没做，需要用户定下一步 |
 
 ## 如何新增一份 spec
 
-1. 取下一个未使用的编号（当前最大是 `S-007`，下一份是 `S-008`），**不要**
+1. 取下一个未使用的编号（当前最大是 `S-011`，下一份是 `S-012`），**不要**
    回填或重排已有编号，哪怕新主题在逻辑上是某个旧编号的延续。
 2. 命名 `S-NNN-slug.md`，独立成文——不要把新主题塞进某个已有 `S-NNN`
    文件的正文里，哪怕它是那份文档里某个未解决问题的直接后续（用交叉引用
