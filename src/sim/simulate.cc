@@ -51,6 +51,7 @@
 #include <cstring>
 #include <thread>
 
+#include "base/critpath_trace.hh"
 #include "base/logging.hh"
 #include "base/pollevent.hh"
 #include "base/trace.hh"
@@ -109,9 +110,9 @@ class SimulatorThreads
             // We'll call these the "subordinate" threads.
             for (uint32_t i = 1; i < numQueues; i++) {
                 threads.emplace_back(
-                    [this](EventQueue *eq) {
-                        thread_main(eq);
-                    }, mainEventQueue[i]);
+                    [this](EventQueue *eq, uint32_t domainId) {
+                        thread_main(eq, domainId);
+                    }, mainEventQueue[i], i);
                 if (!eventqHostCpus.empty())
                     pinThread(threads.back().native_handle(),
                               eventqHostCpus[i], i);
@@ -199,8 +200,10 @@ class SimulatorThreads
      * repeated until the simulation terminates.
      */
     void
-    thread_main(EventQueue *queue)
+    thread_main(EventQueue *queue, uint32_t domainId)
     {
+        critPathDomainId = domainId;
+
         /* Wait for all initialisation to complete */
         barrier.wait();
 
@@ -302,6 +305,7 @@ simulate(Tick num_cycles)
     }
 
     simulatorThreads->runUntilLocalExit();
+    critPathDomainId = 0;
     Event *local_event = doSimLoop(mainEventQueue[0]);
     assert(local_event);
 

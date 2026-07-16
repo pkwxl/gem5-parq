@@ -85,6 +85,14 @@ class Root(SimObject):
         0, "hybrid barrier: spin iterations before falling back to the cv"
     )
 
+    # S-012 critical-path instrumentation (per-domain barrier/lock-wait
+    # timing records written to <outdir>/critpath-domain<N>.csv on exit).
+    # Default off: no change to any already-validated hot path or result
+    # (docs/specs/S-012-eventq-critical-path-instrumentation-design.md §5).
+    critpath_trace = Param.Bool(
+        False, "enable S-012 critical-path instrumentation"
+    )
+
     full_system = Param.Bool("if this is a full system simulation")
 
     # Time syncing prevents the simulation from running faster than real time.

@@ -434,6 +434,83 @@ p.critpath_trace;`；驱动脚本仿照 `EVENTQ_BARRIER_MODE` 的写法从环境
 正确性回归确认插桩关闭时行为不变，再打开插桩按 §7 协议跑一次小窗口
 验证插桩本身产出合理的数据，最后才是扩大窗口做正式的关键路径分析。
 
+## 11. 实现记录：Step 1（脚手架，本节由实现会话补充）
+
+用户过了一遍本设计后，确认按 5 步实现（不是一次性全做）：
+
+1. **Step 1**（本节记录的就是这一步）——脚手架，默认关闭：新增
+   `critpath_trace.{hh,cc}`（枚举、时钟别名、记录结构体、线程本地域号
+   +缓冲区、落盘函数骨架）、`Root.py`/`root.cc` 的 `critpath_trace`
+   开关、驱动脚本 `EVENTQ_CRITPATH_TRACE`、`simulate.cc` 的域号线程本地
+   变量接线（§4.3）。
+2. Step 2——类型一+类型三：`Barrier::wait()` 计时、`globalBarrier()`
+   第一道/第二道参数、`serviceOne()` 事件计数器。
+3. Step 3——第一次打开插桩跑小窗口（真正的 checkpoint 所在）：验证
+   缓冲区容量估算、时间戳粒度、CSV 格式是否可用，产出"谁最后到达
+   屏障"的第一份直方图。
+4. Step 4——类型二：`UncontendedMutex` 打标签+慢路径计时、
+   `AddrRangeMap` 构造函数传参。
+5. Step 5——§9 的 TSan+正确性回归（覆盖全部改动）+ 正式关键路径分析
+   跑，外加 2-3 次重复跑评估 §8 提到的跑间非确定性对直方图稳定性的
+   影响。
+
+用户明确要求**本次会话只做 Step 1**，Step 2-5 留给后续会话（各自
+独立 checkpoint）。
+
+### 11.1 Step 1 改动内容
+
+跟 §4 设计的对应关系：
+
+- `src/base/critpath_trace.hh`/`.cc`（新文件，`src/base/SConscript`
+  加一行 `Source('critpath_trace.cc')`）：`CritPathLockTag`/
+  `CritPathRecordKind` 枚举、`CritPathClock`（`std::chrono::steady_clock`
+  别名）、`CritPathRecord` 结构体、`g_critPathTraceEnabled`（全局开关，
+  §4.5）、`critPathDomainId`/`critPathBuffer`（线程本地，§4.3/§4.4）、
+  `critPathFlush()`（把当前线程的 `critPathBuffer` 写成
+  `<outdir>/critpath-domain<N>.csv`，用 `simout.create()`）。
+  **`critPathFlush()` 在这一步还没有被任何生产代码调用**——Step 1
+  的范围只到"骨架存在"，真正产生记录、需要在线程退出点调用它，是
+  Step 2/3 的事（届时缓冲区才会非空）。
+- `src/sim/Root.py`：新增 `critpath_trace = Param.Bool(False, ...)`。
+- `src/sim/root.cc`：`Root::Root()` 里加
+  `g_critPathTraceEnabled = p.critpath_trace;`。
+- `docs/refs/scripts/x86_fs_mesi3_parallel_eventq.py`：新增
+  `EVENTQ_CRITPATH_TRACE`（环境变量读法照抄 `EVENTQ_BARRIER_MODE` 的
+  先例，§2.7），赋给 `root.critpath_trace`，仅在 `PARALLEL_EVENTQ`
+  分支内设置（跟 `eventq_barrier_mode` 等其它旋钮同一个位置）。
+- `src/sim/simulate.cc`：`thread_main` 签名加 `uint32_t domainId` 参数，
+  入口设 `critPathDomainId = domainId;`；子线程 lambda 多传一个 `i`；
+  主线程在 `doSimLoop(mainEventQueue[0])` 前设
+  `critPathDomainId = 0;`。
+
+### 11.2 验证结果
+
+按 §7 协议的操作点（`build/X86_MESI_Three_Level`、检查点
+`x86-threads3-roi-classic`、`MAX_TICKS=2e8`）：build 成功（无警告，
+除环境已知的 tcmalloc/png/hdf5/capstone 提示）。
+
+关闭状态（`critpath_trace` 默认 `False`，两个 binary 都没有设
+`EVENTQ_CRITPATH_TRACE`）下，改动前（stash 到 `8d96a95f9e`）与改动后
+的两个 binary 分别跑：
+
+- 串行臂：`taskset -c 54`，无 `PARALLEL_EVENTQ`。
+- 并行臂：`taskset -c 92`，`PARALLEL_EVENTQ=1
+  HOST_PIN_CPUS=92,93,94,95,96,97,98,99 EVENTQ_BARRIER_MODE=spin
+  SIM_QUANTUM_TICKS=6660`（S-009 §27.3 的确切配置）。
+
+结果：两组（串行/并行）`stats.txt`（排除 `host*` 字段）改动前后
+**逐字节相同**；`simInsts`=74062，两组一致；两组日志里都没有
+`assert`/`panic`/`abort`/段错误关键字。这确认了 §5 的论证（关闭时不
+改变任何已验证结果）在这一步的具体改动上成立，不是只凭代码走查就
+采信。
+
+**已知局限（如实记录）**：这次验证只覆盖了 Step 1 本身引入的改动
+（脚手架 + 线程入口的一次性域号写入），还没有做 §9 要求的 TSan
+回归——因为 Step 1 还没有触达 §9 列的四个文件（`xbar.hh`/
+`io_device.hh`/`addr_range_map.hh`/`Consumer.hh`），那次回归应该等
+Step 4（真正给这些文件打标签）之后再做一次，覆盖全部改动，跟 §9
+的意图一致（"落地实现后应该重新跑一遍"，指的是全部落地之后）。
+
 ---
 
 **上一篇**：[S-011：Consumer 锁 owner 字段竞争审计](./S-011-consumer-lock-owner-race-audit.md)

@@ -84,6 +84,9 @@ EVENTQ_BARRIER_MODE = os.environ.get("EVENTQ_BARRIER_MODE", "cv")
 EVENTQ_BARRIER_SPIN_ITERS = int(
     os.environ.get("EVENTQ_BARRIER_SPIN_ITERS", "0")
 )
+# S-012 critical-path instrumentation switch (off by default: no behaviour
+# change). See docs/specs/S-012-eventq-critical-path-instrumentation-design.md.
+EVENTQ_CRITPATH_TRACE = os.environ.get("EVENTQ_CRITPATH_TRACE", "0") == "1"
 BOARD_CLK = "3GHz"
 RUBY_CLOCK = BOARD_CLK  # stdlib leaves RubySystem clk inheriting the board clk
 
@@ -207,6 +210,7 @@ class ParallelX86Board(X86Board):
 
         root.eventq_barrier_mode = EVENTQ_BARRIER_MODE
         root.eventq_barrier_spin_iters = EVENTQ_BARRIER_SPIN_ITERS
+        root.critpath_trace = EVENTQ_CRITPATH_TRACE
 
         n_dom = mem_dom0 + n_dir  # 0..(mem_dom0+n_dir-1)
         print(
@@ -224,6 +228,7 @@ class ParallelX86Board(X86Board):
                 if EVENTQ_BARRIER_MODE != "cv"
                 else ""
             )
+            + (", critpath_trace=1" if EVENTQ_CRITPATH_TRACE else "")
         )
         return root
 
