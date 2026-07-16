@@ -101,6 +101,8 @@ NoncoherentXBar::~NoncoherentXBar()
 bool
 NoncoherentXBar::recvTimingReq(PacketPtr pkt, PortID cpu_side_port_id)
 {
+    std::lock_guard<UncontendedMutex> lock(layerLock);
+
     // determine the source port based on the id
     ResponsePort *src_port = cpuSidePorts[cpu_side_port_id];
 
@@ -179,6 +181,8 @@ NoncoherentXBar::recvTimingReq(PacketPtr pkt, PortID cpu_side_port_id)
 bool
 NoncoherentXBar::recvTimingResp(PacketPtr pkt, PortID mem_side_port_id)
 {
+    std::lock_guard<UncontendedMutex> lock(layerLock);
+
     // determine the source port based on the id
     RequestPort *src_port = memSidePorts[mem_side_port_id];
 
@@ -237,6 +241,8 @@ NoncoherentXBar::recvTimingResp(PacketPtr pkt, PortID mem_side_port_id)
 void
 NoncoherentXBar::recvReqRetry(PortID mem_side_port_id)
 {
+    std::lock_guard<UncontendedMutex> lock(layerLock);
+
     // responses never block on forwarding them, so the retry will
     // always be coming from a port to which we tried to forward a
     // request

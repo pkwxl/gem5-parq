@@ -41,6 +41,7 @@
 #ifndef __DEV_IO_DEVICE_HH__
 #define __DEV_IO_DEVICE_HH__
 
+#include "base/uncontended_mutex.hh"
 #include "mem/tport.hh"
 #include "params/BasicPioDevice.hh"
 #include "params/PioDevice.hh"
@@ -93,6 +94,21 @@ class PioPort : public SimpleTimingPort
 };
 
 /**
+ * PioPort<PioDevice>::recvAtomic is given an explicit specialization
+ * (io_device.cc) that takes PioDevice::pioLock: under the parallel-EventQueue
+ * split, this can be entered by a synchronous cross-domain call chain running
+ * on a different domain's host thread than the one that owns this device
+ * (S-009 S18/S23), and device->read()/write() need mutual exclusion against
+ * both that path and the device's own domain-local event callbacks (which
+ * must take the same lock themselves). PioPort<Interrupts>
+ * (arch/x86/interrupts.hh) is a different instantiation and is deliberately
+ * left unspecialized: the local APIC it serves is private to one domain and
+ * is never reached by another domain's thread through this port.
+ */
+template <>
+Tick PioPort<PioDevice>::recvAtomic(PacketPtr pkt);
+
+/**
  * This device is the base class which all devices senstive to an address range
  * inherit from. There are three pure virtual functions which all devices must
  * implement getAddrRanges(), read(), and write(). The magic do choose which
@@ -101,6 +117,10 @@ class PioPort : public SimpleTimingPort
  */
 class PioDevice : public ClockedObject
 {
+  private:
+    /** See the PioPort<PioDevice>::recvAtomic specialization above. */
+    mutable UncontendedMutex pioLock;
+
   protected:
     System *sys;
 

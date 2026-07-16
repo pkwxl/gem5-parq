@@ -47,6 +47,22 @@
 namespace gem5
 {
 
+template <>
+Tick
+PioPort<PioDevice>::recvAtomic(PacketPtr pkt)
+{
+    // Technically the packet only reaches us after the header delay,
+    // and typically we also need to deserialise any payload.
+    Tick receive_delay = pkt->headerDelay + pkt->payloadDelay;
+    pkt->headerDelay = pkt->payloadDelay = 0;
+
+    std::lock_guard<UncontendedMutex> lock(device->pioLock);
+    const Tick delay =
+        pkt->isRead() ? device->read(pkt) : device->write(pkt);
+    assert(pkt->isResponse() || pkt->isError());
+    return delay + receive_delay;
+}
+
 PioDevice::PioDevice(const Params &p)
     : ClockedObject(p), sys(p.system), pioPort(this)
 {}

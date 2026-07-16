@@ -51,6 +51,7 @@
 
 #include "base/addr_range_map.hh"
 #include "base/types.hh"
+#include "base/uncontended_mutex.hh"
 #include "mem/qport.hh"
 #include "params/BaseXBar.hh"
 #include "sim/clocked_object.hh"
@@ -325,6 +326,16 @@ class BaseXBar : public ClockedObject
      * constant.
      */
     std::unordered_map<RequestPtr, PortID> routeTo;
+
+    /**
+     * Under the parallel-EventQueue split, this crossbar can be entered by a
+     * synchronous cross-domain call chain running on a different domain's
+     * host thread (S-009 S 18/S 23) while sharing this same object with every
+     * other domain's calls; no other part of the class provides mutual
+     * exclusion for routeTo/reqLayers/respLayers. Held for the full body of
+     * the timing entry points, not scoped to individual field accesses.
+     */
+    mutable UncontendedMutex layerLock;
 
     /** all contigous ranges seen by this crossbar */
     AddrRangeList xbarRanges;
