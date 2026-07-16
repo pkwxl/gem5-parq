@@ -46,12 +46,26 @@
 
 #include "mem/bridge.hh"
 
+#include "base/intmath.hh"
 #include "base/trace.hh"
 #include "debug/Bridge.hh"
 #include "params/Bridge.hh"
 
 namespace gem5
 {
+
+Tick
+BridgeBase::crossDomainSnap(Tick when) const
+{
+    if (inParallelMode && curEventQueue() != eventQueue()) {
+        assert(simQuantum > 0);
+        when = std::max(when,
+            simQuantumStart +
+                divCeil(when - simQuantumStart, simQuantum) *
+                    simQuantum);
+    }
+    return when;
+}
 
 BridgeBase::BridgeResponsePort::BridgeResponsePort(
     const std::string& _name, BridgeBase& _bridge,
@@ -222,7 +236,7 @@ BridgeBase::BridgeRequestPort::schedTimingReq(PacketPtr pkt, Tick when)
     // should already be an event scheduled for sending the head
     // packet.
     if (transmitList.empty()) {
-        bridge.schedule(sendEvent, when);
+        bridge.schedule(sendEvent, bridge.crossDomainSnap(when));
     }
 
     assert(transmitList.size() != reqQueueLimit);
@@ -238,7 +252,7 @@ BridgeBase::BridgeResponsePort::schedTimingResp(PacketPtr pkt, Tick when)
     // should already be an event scheduled for sending the head
     // packet.
     if (transmitList.empty()) {
-        bridge.schedule(sendEvent, when);
+        bridge.schedule(sendEvent, bridge.crossDomainSnap(when));
     }
 
     transmitList.emplace_back(pkt, when);

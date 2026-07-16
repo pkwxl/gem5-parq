@@ -40,6 +40,7 @@
 
 #include "mem/packet_queue.hh"
 
+#include "base/intmath.hh"
 #include "base/trace.hh"
 #include "debug/Drain.hh"
 #include "debug/PacketQueue.hh"
@@ -166,6 +167,29 @@ PacketQueue::schedSendEvent(Tick when)
         // one tick in the future
         when = std::max(when, curTick() + 1);
         // @todo Revisit the +1
+
+        // Cross-domain send (e.g. RubyPort PIO forwarding a response from
+        // a device domain's thread into this port's own domain, or any
+        // other classic PioDevice reached via a QueuedRequestPort/
+        // QueuedResponsePort): em.eventQueue() is bound at construction to
+        // this port's own domain and never changes, so comparing it
+        // against curEventQueue() (the calling thread's TLS) reliably
+        // detects a cross-domain call here, unlike EventQueue::schedule()
+        // which cannot tell whether this particular schedule needs
+        // snapping (design doc S-009 sections 17-19). Snap to the next
+        // barrier boundary for the same reason as timing.cc's
+        // activateContext snap: `when` was computed from the calling
+        // thread's curTick(), which can be up to one quantum ahead of the
+        // target domain's clock, so it can land in the target's past. The
+        // grid is anchored at simQuantumStart, not 0, to stay valid after
+        // an FS restore where parallel mode begins mid-simulation.
+        if (inParallelMode && curEventQueue() != em.eventQueue()) {
+            assert(simQuantum > 0);
+            when = std::max(when,
+                simQuantumStart +
+                    divCeil(when - simQuantumStart, simQuantum) *
+                        simQuantum);
+        }
 
         if (!sendEvent.scheduled()) {
             em.schedule(&sendEvent, when);

@@ -94,7 +94,8 @@ LINK_LATENCY = 20  # ruby cycles
 # domain edge, the iobus (IOXBar) forward_latency = 1 board cycle = 333 ticks at
 # 3GHz; 300 clears it. Kills the speedup (design-doc 9.1 regime) but proves the
 # 3-level split boots FS correctly. None -> derive the largest Ruby-legal value.
-SIM_QUANTUM_TICKS = 300
+# Env override lets S-009 SS20's Q-ramp protocol run without editing this file.
+SIM_QUANTUM_TICKS = int(os.environ.get("SIM_QUANTUM_TICKS", "300"))
 
 # Cache geometry: private 32KiB L1 (i/d), private 1MiB L2 per core, shared 8MiB L3.
 L1I_SIZE, L1I_ASSOC = "32KiB", 8

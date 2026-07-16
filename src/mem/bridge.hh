@@ -332,6 +332,21 @@ class BridgeBase : public ClockedObject
     /** Request port of the bridge. */
     BridgeRequestPort memSidePort;
 
+  private:
+    /**
+     * Snap `when` to the barrier grid if scheduling this send would
+     * cross a parallel-EventQueue domain boundary (S-009 grid-anchored
+     * snap, design doc sections 19/26 -- same fix as
+     * PacketQueue::schedSendEvent, needed here too because BridgeBase
+     * schedules its own sendEvent directly and never goes through
+     * PacketQueue). A cross-domain schedule uses the calling thread's
+     * own curTick(), which can be up to one quantum ahead of this
+     * bridge's own domain, so an unsnapped `when` can land in this
+     * domain's past. Same-domain schedules (including all of serial
+     * mode) are unaffected: `when` is returned unchanged.
+     */
+    Tick crossDomainSnap(Tick when) const;
+
   protected:
     /**
      * Get a list of the non-overlapping address ranges the bridge is
