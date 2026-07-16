@@ -57,7 +57,8 @@ class I8254 : public BasicPioDevice
 
       public:
         X86Intel8254Timer(const std::string &name, I8254 * _parent) :
-            Intel8254Timer(_parent, name), parent(_parent)
+            Intel8254Timer(_parent, name, &_parent->getPioLock()),
+            parent(_parent)
         {}
     };
 

@@ -33,10 +33,25 @@ S-002/S-003 给 Ruby 加锁的工作量相当。§23 逐设备排查发现竞争
 不需要两个核同时做 PIO 就会触发）——后者推翻了"只在 RubyPort 跨域入口
 加一把锁"的简化方案。找到两个通用加锁落点（`BaseXBar`、`PioDevice`），
 外加 PIT/RTC 各一处、IDE 一条 controller↔disk 共享锁路径的手工接线（IDE
-这条工作量最大、最不确定）。**§24 已经实现并验证了两个通用点**：TSan
+这条工作量最大、最不确定）。**§24 实现并验证了两个通用点**：TSan
 （本沙盒的限制已解除，§24.2）扩时长 A/B（MAX_TICKS=1.3e9）显示两把新锁
-干净，四份 stats.txt 逐字节相同；PIT/RTC/IDE 仍按计划留到下一轮。**§24.5
-额外发现一个不在 S-009 范围内、量级可能更大的独立竞争**——
+干净，四份 stats.txt 逐字节相同。**§25 把 PIT/RTC/IDE 的手工加锁也做完
+了**：IDE 那条路径没有像 23.2 担心的那样需要新架构——`IdeController`
+本来就是 `PioDevice`，复用同一把 `pioLock` 即可，只需注意 `IdeDisk` 的
+6 个 DMA 状态机函数会互相同步调用，锁只能加在真正的异步入口
+（`EventFunctionWrapper` lambda）而不是逐函数加，否则会自锁死；RTC 比
+设计稿多锁了一个点（`RTCTickEvent::process()`，不只是 `RTCEvent::
+process()`）。非 TSan 正确性 A/B + TSan 扩时长 A/B（同样 MAX_TICKS=1.3e9）
+均干净，且这次 TSan 报告里已经不再出现 §24.5 提到的 `AddrRangeMap`
+竞争（S-010 修复生效的交叉验证）。§25.2 额外记了一个环境不一致：这次
+会话的沙盒 cgroup（`cpuset.cpus=0-53,56-91`）拿不到 CLAUDE.md 记录的
+`isolcpus=54-55,92-111` 隔离核，本轮验证改用非隔离核，`hostSeconds`
+数字仅供参考、不能当新基准——需要用户在容器/编排层核实这段隔离核的
+分配。**S-009 到此为止，唯一还没做的主线任务是 §19 的 grid-anchored
+snap 本身（抬高 Q）**——加锁只是这一步的前置工作。
+
+**§24.5（历史）额外发现一个不在 S-009 范围内、量级可能更大的独立
+竞争**——
 `AddrRangeMap<AbstractMemory*,1>` 物理内存地址查找缓存（每核每次内存
 访问都会命中，和 S-004 §9.8 的 X86 TLB 竞争同一个模式）——已拆分单独
 立文并**做完**（S-010）：全仓库 8 处 `AddrRangeMap` 实例化审计额外发现
@@ -66,7 +81,7 @@ S-002/S-003 给 Ruby 加锁的工作量相当。§23 逐设备排查发现竞争
 | S-006 | [S-006-fs-mode-migration.md](./S-006-fs-mode-migration.md) | APIC 唤醒墙已修复 | 迁移到 FS 模式，跨层次检查点重放，APIC 中断跨域唤醒墙的根因（量子网格锚点 bug）与修复；2-level 首次尝试/域布线依据/Ruby 检查点与并行重放不兼容（§11.6-11.8，补记） |
 | S-007 | [S-007-spin-barrier-and-milestone.md](./S-007-spin-barrier-and-milestone.md) | **里程碑达成** | 自旋/混合屏障设计与 SE+FS 双靶实测；FS pythonDump 跨线程墙（已修复）；项目阶段性结论；并行运行下 `SIGUSR1` 崩溃的操作提示（§14） |
 | S-008 | [S-008-fs-serial-vs-parallel-current-position.md](./S-008-fs-serial-vs-parallel-current-position.md) | 测量完成；结论待 S-009 验证 | FS 定窗首次补齐串行臂：当前工作点并行比串行慢 ~3x（0.33x）；抬高 Q 的缺口算术投影只到 ~0.92x；完整 ROI 串行参考数字因宿主重启丢失、按未核实转述记录（§16） |
-| S-009 | [S-009-raise-fs-quantum-past-iobus-edge-design.md](./S-009-raise-fs-quantum-past-iobus-edge-design.md) | **设计稿，未实现** | 精确定位卡住 Q=300 的是 `PacketQueue::schedSendEvent`（`RubyPort.cc` 的 PIO 转发 + 每个经典 PIO 设备共享），不是 IOXBar 参数；设计在这一个公共点套用 S-006 §11.5 的 grid-anchored snap（§19，一次改动覆盖所有调用点）；审计**确认**这条经典 Port 路径存在真实的跨域数据竞争（§18），§23 逐设备排查发现竞争有两种形状（核 vs 核、核 vs 域0自己的线程），找到两个通用加锁落点（`BaseXBar`/`PioDevice`）+ PIT/RTC/IDE 的手工接线；两个通用点已实现+TSan 扩时长 A/B 干净（§24），PIT/RTC/IDE 仍留待下一轮；§24.5 发现的 `AddrRangeMap` 竞争已拆分单独立文，见 S-010 |
+| S-009 | [S-009-raise-fs-quantum-past-iobus-edge-design.md](./S-009-raise-fs-quantum-past-iobus-edge-design.md) | **加锁范围已实现+TSan 验证；抬高 Q 本身（§19）未实现** | 精确定位卡住 Q=300 的是 `PacketQueue::schedSendEvent`（`RubyPort.cc` 的 PIO 转发 + 每个经典 PIO 设备共享），不是 IOXBar 参数；设计在这一个公共点套用 S-006 §11.5 的 grid-anchored snap（§19，**仍未实现**，一次改动覆盖所有调用点）；审计**确认**这条经典 Port 路径存在真实的跨域数据竞争（§18），§23 逐设备排查发现竞争有两种形状（核 vs 核、核 vs 域0自己的线程），找到两个通用加锁落点（`BaseXBar`/`PioDevice`）+ PIT/RTC/IDE 的手工接线；两个通用点已实现+TSan 扩时长 A/B 干净（§24）；**§25 把 PIT/RTC/IDE 也做完**：`PioDevice` 加公开的 `getPioLock()` 访问器给非 `PioDevice` 调用者用，PIT/RTC 走可选的 `crossDomainLock` 参数（RTC 比设计稿多锁了 `RTCTickEvent::process()` 一个点），IDE 发现 `IdeController` 本来就是 `PioDevice`（经 `PciEndpoint→PciDevice→DmaDevice`），复用同一把锁即可、不需要新设计，只是 `IdeDisk` 的 6 个 DMA 状态机函数会互相同步调用，锁必须挂在 `EventFunctionWrapper` lambda 这一层而非逐函数、否则自锁死；非 TSan 正确性 A/B + TSan 扩时长 A/B（MAX_TICKS=1.3e9）均干净，且 §24.5 的 `AddrRangeMap` 竞争这次不再出现（S-010 修复生效的交叉验证）；§25.2 记录了一个环境不一致——本次会话沙盒的 cgroup 拿不到 CLAUDE.md 记录的 `isolcpus=54-55,92-111`，需要用户在容器/编排层核实 |
 | S-010 | [S-010-addr-range-map-cache-race.md](./S-010-addr-range-map-cache-race.md) | **已实现+TSan 验证；性能 A/B 待做** | 起点是 S-009 §24.5 TSan A/B 报告数量最多的一类（1500+ 次）：`AddrRangeMap<AbstractMemory*,1>`（`PhysicalMemory::addrMap`）的 LRU 查找缓存在 `find()`/`addNewEntryToCache()` 间无锁跨域读写，和 S-004 §9.8 X86 TLB 竞争同一个模式；全仓库 8 处 `AddrRangeMap` 实例化排查（§7）额外发现 `BaseXBar::portMap` 也有同一种竞争、且被 S-009 §24.1 的 `layerLock` 漏保护了三个调用入口（§7.2）；修法是在 `AddrRangeMap` 内部加 `cacheLock`（容器级，不是逐调用点，§10），非 TSan 正确性 A/B + TSan 扩时长 A/B（Q=300 小窗口 + MAX_TICKS=1.3e9 serial×2/spin×2，§11）均干净——四份 stats.txt 逐字节相同，76 次 TSan 警告的 `#0` 帧全部落在已知背景噪声（`_curTick`/`Event::Flags`/`Consumer::lock`），无一落在 `AddrRangeMap`/`portMap`；仍未测热路径开销 |
 | S-011 | [S-011-consumer-lock-owner-race-audit.md](./S-011-consumer-lock-owner-race-audit.md) | **草案，未完整审计，未修** | S-010 §11.2 TSan A/B 里第二多的报告类别（66 次）：`Consumer::lock()`/`unlock()`（S-002 引入的 per-consumer 可重入锁）自己的记账字段 `m_wakeup_mutex_owner` 无同步读写；跟同一轮报告里的 `_curTick`/`Event::Flags` 不是一回事——那两个是项目自己"放宽跨域时序"的设计取舍、陈旧读可容忍，这里读的是"我现在持锁吗"，需要精确答案；§3 用一份实测的完整 TSan 调用栈（跨域 `MessageBuffer::enqueue()` 撞见目标 `Switch` 自己域的 `wakeup()`）论证了一个具体的、有物理意义的窗口：曾经合法持有过某个 consumer 锁的线程，在窗口期内可能误读到自己的历史 owner 值，跳过真锁直接走重入快路径，而实际当前持有者是另一个线程；§4 列了三个待确认的开放问题（可达性、触发概率量级、修法方向），都还没做，需要用户定下一步 |
 

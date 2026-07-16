@@ -36,8 +36,10 @@
 namespace gem5
 {
 
-Intel8254Timer::Intel8254Timer(EventManager *em, const std::string &name) :
-    EventManager(em), _name(name), counters{{
+Intel8254Timer::Intel8254Timer(EventManager *em, const std::string &name,
+        UncontendedMutex *cross_domain_lock) :
+    EventManager(em), _name(name), crossDomainLock(cross_domain_lock),
+    counters{{
             {this, name + ".counter0", 0},
             {this, name + ".counter1", 1},
             {this, name + ".counter2", 2}
@@ -288,6 +290,10 @@ Intel8254Timer::Counter::CounterEvent::CounterEvent(Counter* c_ptr)
 void
 Intel8254Timer::Counter::CounterEvent::process()
 {
+    std::unique_lock<UncontendedMutex> guard;
+    if (UncontendedMutex *lock = counter->parent->crossDomainLock)
+        guard = std::unique_lock<UncontendedMutex>(*lock);
+
     switch (counter->mode) {
       case InitTc:
         counter->output_high = true;

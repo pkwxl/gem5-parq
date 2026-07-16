@@ -29,8 +29,11 @@
 #ifndef __DEV_MC146818_HH__
 #define __DEV_MC146818_HH__
 
+#include <mutex>
+
 #include "base/bitunion.hh"
 #include "base/logging.hh"
+#include "base/uncontended_mutex.hh"
 #include "sim/core.hh"
 #include "sim/eventq.hh"
 
@@ -86,6 +89,18 @@ class MC146818 : public EventManager
   private:
     std::string _name;
     const std::string &name() const { return _name; }
+
+    /**
+     * Optional cross-domain lock (S-009 S23.4): non-null only when this RTC
+     * is owned by a PioDevice reachable by another domain's thread (e.g.
+     * x86 Cmos). RTCEvent::process()/RTCTickEvent::process() below both
+     * self-reschedule and touch shared clock state, running on this RTC's
+     * own domain's EventQueue thread with no PIO involved (S-009 S23.1
+     * shape 2), so they must take the same lock that
+     * PioPort<PioDevice>::recvAtomic takes -- that entry point alone does
+     * not cover this path.
+     */
+    UncontendedMutex *crossDomainLock;
 
     /** RTC periodic interrupt event */
     RTCEvent event;
@@ -154,7 +169,8 @@ class MC146818 : public EventManager
 
   public:
     MC146818(EventManager *em, const std::string &name, const struct tm time,
-            bool bcd, Tick frequency);
+            bool bcd, Tick frequency,
+            UncontendedMutex *cross_domain_lock = nullptr);
     virtual ~MC146818();
 
     /** Start ticking */

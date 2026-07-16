@@ -542,23 +542,173 @@ PioPort|layerLock|pioLock`,唯一命中是一次 `NoncoherentXBar::recvTimingReq
   的范围定死在"经典 Port/南桥"路径）,按工作方式如实记录、不顺手处理——
   这大概率值得单独立一个 S-NNN 或者至少单独排一轮,由用户决定优先级。
 
+## 25. PIT/RTC/IDE 三处手工加锁：实现 + TSan 扩时长 A/B（干净）
+
+24 节留到"下一轮"的三处手工加锁，这一节做完了。
+
+### 25.1 实现
+
+先重新过了一遍三个设备的类继承关系（只读审计，读代码确认，没有假设），
+结论比 23.3/23.4 原本设想的接线方式更简单：
+
+- **`PioDevice` 加一个公开访问器** `getPioLock()`（`io_device.hh`），返回
+  24.1 已经加的那个 `pioLock` 的引用——之前只有 `PioPort<PioDevice>` 是
+  友元，这次需要给非 `PioDevice` 的调用者（`Intel8254Timer`/`MC146818`/
+  `IdeDisk`）一个正规入口去拿同一把锁，而不是放宽 `pioLock` 本身的访问
+  级别。
+- **PIT**（`Intel8254Timer`，`intel_8254_timer.hh/.cc`）：不是直接假设它
+  "继承自 `PioDevice`"（23.4 那句话原文有点不准确——`Intel8254Timer` 其实
+  是被 `PioDevice` 派生类组合持有的一个独立 `EventManager` 子对象，见
+  `X86ISA::I8254::pit` 和 `MaltaIO::pitimer` 两处用法，都是"PioDevice 的
+  成员"而不是"PioDevice 的基类")。加法是给构造函数加一个可选的
+  `UncontendedMutex *cross_domain_lock = nullptr`，`CounterEvent::
+  process()`（自重挂的那个回调，19/23.1 定位的竞争点）非空时才
+  `std::unique_lock` 住。x86 的 `I8254`（`x86/i8254.hh`）在构造嵌套的
+  `X86Intel8254Timer` 时传 `&_parent->getPioLock()`；MIPS 的 `MaltaIO::
+  pitimer`（`mips/malta_io.cc`）不传，走默认 `nullptr`——按项目范围（x86
+  FS）保持不变，不是漏做。
+- **RTC**（`MC146818`，`mc146818.hh/.cc`）：同样的可选锁指针写法。**这里
+  比 23 节设计稿多锁了一个点**：`MC146818` 有两个自重挂事件，不是设计稿
+  提到的 `RTCEvent::process()`（周期中断）一个——还有 `RTCTickEvent::
+  process()`（秒级时钟滴答，调用 `tickClock()` 改 `curTime`/`clock_data`，
+  这两个字段和 PIO 侧的 `writeData`/`readData` 共享)。两个 `process()`
+  都在这次改动里加了锁,不锁 `RTCTickEvent` 会漏掉这条竞争路径。x86 的
+  `Cmos::X86RTC`（`x86/cmos.hh`）构造时传 `&getPioLock()`（`this` 就是
+  `Cmos`，`Cmos : public BasicPioDevice`）；MIPS 的 `MaltaIO::rtc` 和
+  RISC-V 的 `RiscvRTC::RTC`（后者是纯 `SimObject`,根本不是 `PioDevice`
+  的子类，也没有 `PioPort`,和这条竞争路径完全无关）都不传,默认
+  `nullptr`,行为不变。
+- **IDE**（`IdeDisk`/`IdeController`）：23.2/23.4 原本预期这里"最麻烦,
+  需要新的 controller↔disk 共享锁路径"。重新读完整条调用链（`ide_ctrl.hh`
+  `class IdeController : public PciEndpoint` → `PciEndpoint : public
+  PciDevice` → `PciDevice : public DmaDevice` → `DmaDevice : public
+  PioDevice`,`ide_ctrl.hh:46`/`dev/pci/device.hh:296/501`/
+  `dma_device.hh:220`）后发现**`IdeController` 本来就是一个
+  `PioDevice`**,24.1 那把 `pioLock` 已经通过 `PciDevice::read()/write()`
+  覆盖了"核 PIO 读写 IDE 寄存器/BMI 寄存器"这条边——不需要凭空发明一条
+  新的共享锁路径,只需要让 `IdeDisk` 自己的 6 个自调度 DMA 事件也去拿
+  `ctrl->getPioLock()`(`IdeDisk::ctrl` 是配置阶段 `setChannel()` 就已经
+  赋值好的 `IdeController*`,DMA 事件触发时必然已经赋值)。
+
+  真正需要小心的是**锁的粒度**,不是"要不要锁":读完
+  `ide_disk.cc` 发现这 6 个 `EventFunctionWrapper` 绑定的具名函数
+  （`doDmaTransfer`/`doDmaRead`/`doDmaWrite`/`dmaPrdReadDone`/
+  `dmaReadDone`/`dmaWriteDone`）**互相同步直接调用**——比如
+  `doDmaRead()` 里直接调 `dmaReadDone()`（非 `schedule()`）,
+  `dmaReadDone()`/`dmaWriteDone()` 又直接调 `doDmaTransfer()`。
+  `UncontendedMutex` 不可重入,如果在每个具名函数入口都加锁,这条同步
+  调用链会自锁死。核实了这 6 个函数**只**通过它们各自的
+  `EventFunctionWrapper` lambda 从 `EventQueue::serviceOne()` 进入（
+  `startDma()`/`abortDma()` 这些从 PIO 路径——已经持有 `ctrl->
+  getPioLock()`——进来的入口只 `schedule()`/`deschedule()`,不直接调用
+  这些函数体),所以锁只加在 `IdeDisk` 构造函数（`ide_disk.cc`）里
+  这 6 个 lambda 的最外层（新加了一个 `IdeDisk::lockCtrl()` 私有
+  helper,`ide_disk.hh`),不动这 6 个具名函数内部——这样同一条调用链
+  里只在最外层拿一次锁,不会自锁死,也覆盖了链条上所有中间调用。
+
+### 25.2 环境更新：本次会话沙盒的 CPU 隔离范围和 CLAUDE.md 记录的不一致
+
+跑验证前想沿用 S-008/S-009 一直用的 `isolcpus=54-55,92-111` 隔离核做干净
+A/B,发现 `taskset -c 54`/`taskset -c 92` 都报 `Invalid argument`。核实：
+`cat /sys/fs/cgroup/cpuset.cpus` 显示这个容器的 cgroup 只放行
+`0-53,56-91`——`54-55`/`92-111` 在内核层面确实是 `isolcpus`（
+`/proc/cmdline` 里还在),但**这个容器的 cgroup 从外部就没有分到那段
+核**,不是容器内部配置能改的（`sudo sh -c 'echo 0-111 >
+/sys/fs/cgroup/cpuset.cpus'` 直接 I/O error,说明是上层 cgroup 卡的硬
+边界,不是权限问题）。用户确认这段核"是留给我用的",但从这个沙盒实例
+内部没有办法拿到——如果之后的会话需要这段隔离核做干净计时对比,需要在
+容器/编排层重新核实这个沙盒实例的 cpuset 分配,不能想当然认为
+CLAUDE.md 记的还成立(和 24.2 "TSan 是否可用需要重新探测,不能假设"是
+同一类"环境事实,不是代码事实,不能跨沙盒实例复用"的教训)。
+
+**这次的验证改用非隔离核**（正确性 A/B：串行 40、并行 spin 60-67；TSan
+扩时长 A/B：serial1 40、serial2 41、spin1 50-59、spin2 70-79,4 路同时跑
+在不同核上),`hostSeconds` 数字因此不是干净的计时对比,不能拿来跟
+S-008/S-009 之前的隔离核数字做定量比较——只用于比对"有没有变慢/变快到
+异常程度"和验证正确性,不当成新的基准数字记录。
+
+### 25.3 正确性 A/B（非 TSan,`build/X86_MESI_Three_Level/gem5.opt`,
+沿用 24.3 方法,Q=300,MAX_TICKS=2e8)
+
+| 模式 | hostSeconds（非隔离核,仅供参考） | simInsts |
+|---|---:|---:|
+| serial | 1.35 | 74062 |
+| spin | 4.09 | 74062 |
+
+`simInsts` 与 24.3/15.2 记录的 74062 一致;`diff` 两份 `stats.txt`（排除
+`host*` 字段）**逐字节相同**。`hostSeconds` 相比 24.3 的 1.34/4.24 没有
+明显劣化（差异在噪声范围内,而且这次是非隔离核,噪声本身就更大)——三处
+新锁在这个工作点上同样是时序中性的。
+
+### 25.4 TSan 扩时长 A/B（`build/X86_MESI_Three_Level_TSAN/gem5.opt`,
+沿用 24.5 方法,MAX_TICKS=1.3e9,serial×2+spin×2,4 路同时跑在不同非隔离核
+上)
+
+重新确认了一次 24.2 记的环境事实：这次会话里 ASLR 已经是关闭状态
+（`/proc/sys/kernel/randomize_va_space` = 0）,`sudo` 免密可用,`setarch
+x86_64 -R` 正常跑通,不需要重新踩一遍 24.2 的坑。`build/
+X86_MESI_Three_Level_TSAN/gem5.opt` 用本轮改动过的源码重新编译过（不是
+沿用 24.2 建的旧二进制)。
+
+**正确性**：四份 `stats.txt`（排除 `host*` 字段)两两 `diff`
+**逐字节相同**——serial1 vs serial2、spin1 vs spin2、以及 serial1 vs
+spin1——`simInsts` 四份都是 926690,和 24.5 记录的数字一致,没有死锁、
+没有崩溃、没有超时,全部正常退出（`hostSeconds`：serial 156.91s/
+156.93s,spin 737.97s/1062.19s——两份 spin 之间的差异比 24.5 大不少,
+最可能的原因是这次用的是非隔离核、4 路任务同时抢宿主机资源,加上没有
+`isolcpus` 保护,不代表本轮加的锁有性能异常;25.2 已经说明这次的
+`hostSeconds` 不用于定量比较)。
+
+**本轮加的三处锁（`Intel8254Timer::crossDomainLock`、`MC146818::
+crossDomainLock`、`IdeDisk::lockCtrl()`）在 TSan 下干净**：对两份 spin
+日志分别 grep `intel_8254_timer\.(cc|hh)|mc146818\.(cc|hh)|i8254\.
+(cc|hh)|cmos\.(cc|hh)|ide_disk\.(cc|hh)|ide_ctrl\.(cc|hh)`,唯一命中是
+一行 `intel_8254_timer.cc:130: warn: Reading current count from inactive
+timer.`——这是 gem5 自己的 `warn()` 诊断输出,不是 TSan 竞争报告的一部分
+（`grep` 是在整份日志文本里搜,把这行也搜出来了)。**没有任何一份 TSan
+`WARNING: ThreadSanitizer: data race` 报告的调用栈里出现这几个文件**,
+新加的三把锁本身没有引入新竞争,也没有被绕过。
+
+**其余出现的报告,和 24.4/24.5 记录的完全同一类,如实记录**：
+
+| 报告位置 | spin1 次数 | spin2 次数 |
+|---|---:|---:|
+| `Consumer.cc:217`（`Consumer::lock()`） | 32 | 32 |
+| `Consumer.cc:231`（`Consumer::unlock()`） | 0 | 1 |
+| `eventq.hh:875`（`EventQueue::getCurTick()`） | 3 | 3 |
+| `flags.hh:116`（`Flags::set()`） | 2 | 2 |
+| **合计** `WARNING: ThreadSanitizer` 块数 | 37 | 38 |
+
+三类和 24.4/24.5 完全一致（Ruby 自己 `Consumer` 锁内部状态的竞争、
+`EventQueue::_curTick` 的既定"放宽跨域时序"设计取舍、`Event::Flags`
+位字段的裸跨域读写),不在本轮范围内处理。**值得记一笔的差异**：24.5
+那一轮里数量最多的一类——`AddrRangeMap<AbstractMemory*,1>` 物理内存
+地址查找缓存竞争（783/787+112/123 次)——**这次完全没有出现**,和
+S-010 已经把这个竞争修掉（`cacheLock`）的时间线吻合,是一个交叉验证:
+两次独立的 TSan 跑,`AddrRangeMap` 竞争在 S-010 之前存在、之后消失,
+再次确认 S-010 那把锁生效了。
+
+### 25.5 结论
+
+S-009 22/23 节定的"两个通用点 + PIT/RTC/IDE 手工接线"这份加锁范围清单
+到这里**全部实现完并通过 TSan 验证**——`BaseXBar::layerLock`/
+`PioDevice::pioLock`（24 节)、`Intel8254Timer::crossDomainLock`/
+`MC146818::crossDomainLock`/`IdeDisk` 的 `ctrl->getPioLock()`（本节)。
+IDE 那条路径没有像 23.2 担心的那样需要"新架构"——`IdeController` 本来
+就是 `PioDevice`,复用同一把锁、只是要小心不能在会互相同步调用的 6 个
+DMA 状态机函数里逐个加锁（会自锁死),只能锁在真正的异步入口
+（`EventFunctionWrapper` lambda）这一层。
+
+**仍然未解决、不在本轮范围内**：`AddrRangeMap` 竞争已经在 S-010 修掉;
+`Consumer` 锁自己的记账竞争在 S-011（草案)记录,还没定修法;
+`EventQueue::_curTick`/`Event::Flags` 是项目"放宽跨域时序"的既定设计
+取舍,不当 bug 处理。25.2 记的沙盒 cpuset 和 CLAUDE.md 记录不一致这件事
+也还没解决,需要用户在容器/编排层核实。
+
 ## 检查点
 
-两个通用点（`BaseXBar`+`PioDevice`）已实现，TSan 扩时长 A/B（24.5，
-MAX_TICKS=1.3e9，serial×2+spin×2）**干净**：四份 stats 逐字节相同，
-`layerLock`/`pioLock`/`reqLayers`/`respLayers`/`routeTo`/`PioDevice::
-read()`/`write()` 没有出现在任何一份 TSan 报告的竞争双方里。
-
-**仍然按 22/23 节的选择，没做**：PIT/RTC/IDE 三处手工加锁——这次 TSan
-没报出这三处的竞争，但 24.5 已经说明这不能当"没有竞争"的证据，只是
-这个窗口没触发，下一轮仍然要做。
-
-**新发现、不在本轮任务范围内、需要用户决定优先级**：24.5 记录的
-`AddrRangeMap<AbstractMemory*,1>` 物理内存地址查找缓存竞争
-（`src/base/addr_range_map.hh:266/291`）——这次 TSan 报告里数量最多
-的一类（两份日志共 1500+ 次），命中路径是"每个核每次内存访问"，和
-S-004 §9.8 的 X86 TLB 竞争同一个模式（mutable 缓存字段被 const 方法
-靠 `const_cast` 修改、跨域无锁读写），量级和触发频率大概率比南桥/
-IOXBar 这条线更大。**请用户确认**：是现在插进来先处理这个（大概率
-和 S-009 当前任务同等或更高优先级），还是先按原计划做完 PIT/RTC/IDE
-再回头看这个，或者单独开一个新 spec 排期。
+S-009 从 17 节开始定位的所有加锁范围（`PacketQueue::schedSendEvent` 的
+grid-anchored snap 除外——19 节的设计**仍未实现**,是 S-009 唯一还没做的
+主线任务)到这里都已经**实现 + TSan 验证干净**。抬高 Q 本身（19 节设计)
+还没有做,S-009 的标题任务("把 FS quantum 上限从 classic iobus 边抬到
+Ruby 合法值")因此仍然只是"锁的前置工作做完了",没有开始。

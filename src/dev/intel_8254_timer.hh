@@ -31,11 +31,13 @@
 
 #include <array>
 #include <iostream>
+#include <mutex>
 #include <string>
 
 #include "base/bitunion.hh"
 #include "base/types.hh"
 #include "base/trace.hh"
+#include "base/uncontended_mutex.hh"
 #include "debug/Intel8254Timer.hh"
 #include "sim/eventq.hh"
 #include "sim/serialize.hh"
@@ -212,6 +214,17 @@ class Intel8254Timer : public EventManager
     std::string _name;
     const std::string &name() const { return _name; }
 
+    /**
+     * Optional cross-domain lock (S-009 S23.4): non-null only when this
+     * timer is owned by a PioDevice reachable by another domain's thread
+     * (e.g. x86 I8254). CounterEvent::process() below self-reschedules and
+     * runs on this timer's own domain's EventQueue thread with no PIO
+     * involved (S-009 S23.1 shape 2), so it must take the same lock that
+     * PioPort<PioDevice>::recvAtomic takes -- that entry point alone does
+     * not cover this path.
+     */
+    UncontendedMutex *crossDomainLock;
+
     /** PIT has three seperate counters */
     std::array<Counter, 3> counters;
 
@@ -227,7 +240,8 @@ class Intel8254Timer : public EventManager
     ~Intel8254Timer()
     {}
 
-    Intel8254Timer(EventManager *em, const std::string &name);
+    Intel8254Timer(EventManager *em, const std::string &name,
+            UncontendedMutex *cross_domain_lock = nullptr);
 
     /** Write control word */
     void writeControl(const CtrlReg data);

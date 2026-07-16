@@ -160,6 +160,16 @@ class PioDevice : public ClockedObject
     Port &getPort(const std::string &if_name,
             PortID idx=InvalidPortID) override;
 
+    /**
+     * Same lock as the PioPort<PioDevice>::recvAtomic specialization above.
+     * Devices whose state can also be touched by domain-local self-
+     * rescheduled events (S-009 S23.1 shape 2: e.g. PIT/RTC periodic
+     * events, IDE DMA state machine, running on domain 0's own EventQueue
+     * thread with no PIO involved) must take this same lock around those
+     * callbacks too -- it is not enough to rely on the PioPort entry point.
+     */
+    UncontendedMutex &getPioLock() const { return pioLock; }
+
     friend class PioPort<PioDevice>;
 
 };

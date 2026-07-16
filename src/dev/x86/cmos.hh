@@ -30,6 +30,7 @@
 #define __DEV_X86_CMOS_HH__
 
 #include "base/bitunion.hh"
+#include "base/uncontended_mutex.hh"
 #include "dev/intpin.hh"
 #include "dev/io_device.hh"
 #include "dev/mc146818.hh"
@@ -66,8 +67,9 @@ class Cmos : public BasicPioDevice
         std::vector<IntSourcePin<X86RTC> *> intPin;
 
         X86RTC(EventManager *em, const std::string &n, const struct tm time,
-                bool bcd, Tick frequency, int int_pin_count) :
-            MC146818(em, n, time, bcd, frequency)
+                bool bcd, Tick frequency, int int_pin_count,
+                UncontendedMutex *cross_domain_lock) :
+            MC146818(em, n, time, bcd, frequency, cross_domain_lock)
         {
             for (int i = 0; i < int_pin_count; i++) {
                 intPin.push_back(new IntSourcePin<X86RTC>(
@@ -83,7 +85,7 @@ class Cmos : public BasicPioDevice
 
     Cmos(const Params &p) : BasicPioDevice(p, 2), latency(p.pio_latency),
         rtc(this, name() + ".rtc", p.time, true, 5000000000ULL,
-                p.port_int_pin_connection_count)
+                p.port_int_pin_connection_count, &getPioLock())
     {
         memset(regs, 0, numRegs * sizeof(uint8_t));
         address = 0;

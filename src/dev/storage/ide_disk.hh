@@ -45,7 +45,10 @@
 #ifndef __DEV_STORAGE_IDE_DISK_HH__
 #define __DEV_STORAGE_IDE_DISK_HH__
 
+#include <mutex>
+
 #include "base/statistics.hh"
+#include "base/uncontended_mutex.hh"
 #include "dev/io_device.hh"
 #include "dev/storage/disk_image.hh"
 #include "dev/storage/ide_atareg.h"
@@ -228,6 +231,24 @@ class IdeDisk : public SimObject
     int diskDelay;
 
   private:
+    /**
+     * Cross-domain lock (S-009 S23.4), shared with the owning controller's
+     * PioDevice::pioLock -- IdeDisk itself is a plain SimObject, not a
+     * PioDevice, but its own six self-scheduled DMA events below run on
+     * domain 0's own EventQueue thread with no PIO involved (S-009 S23.1
+     * shape 2) and touch state (this disk's own registers, and the
+     * controller/Channel's bmiRegs/interrupt state) that a core's PIO
+     * thread can also reach synchronously through the controller, already
+     * under this same lock. Only valid to call once ctrl is set (after
+     * setChannel(), i.e. once the event queue is actually running).
+     */
+    std::unique_lock<UncontendedMutex>
+    lockCtrl() const
+    {
+        return std::unique_lock<UncontendedMutex>(ctrl->getPioLock());
+    }
+
+
     /** Drive identification structure for this disk */
     struct ataparams driveID;
     /** Data buffer for transfers */

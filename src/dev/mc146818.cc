@@ -89,8 +89,10 @@ MC146818::setTime(const struct tm time)
 }
 
 MC146818::MC146818(EventManager *em, const std::string &n,
-        const struct tm time, bool bcd, Tick frequency)
-    : EventManager(em), _name(n), event(this, frequency), tickEvent(this)
+        const struct tm time, bool bcd, Tick frequency,
+        UncontendedMutex *cross_domain_lock)
+    : EventManager(em), _name(n), crossDomainLock(cross_domain_lock),
+      event(this, frequency), tickEvent(this)
 {
     memset(clock_data, 0, sizeof(clock_data));
 
@@ -322,6 +324,10 @@ MC146818::RTCEvent::scheduleIntr()
 void
 MC146818::RTCEvent::process()
 {
+    std::unique_lock<UncontendedMutex> guard;
+    if (UncontendedMutex *lock = parent->crossDomainLock)
+        guard = std::unique_lock<UncontendedMutex>(*lock);
+
     DPRINTF(MC146818, "RTC Timer Interrupt\n");
     parent->schedule(this, curTick() + interval);
     parent->handleEvent();
@@ -336,6 +342,10 @@ MC146818::RTCEvent::description() const
 void
 MC146818::RTCTickEvent::process()
 {
+    std::unique_lock<UncontendedMutex> guard;
+    if (UncontendedMutex *lock = parent->crossDomainLock)
+        guard = std::unique_lock<UncontendedMutex>(*lock);
+
     DPRINTF(MC146818, "RTC clock tick\n");
     parent->schedule(this, curTick() + sim_clock::as_int::s);
     parent->tickClock();
