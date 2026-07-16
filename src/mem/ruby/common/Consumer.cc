@@ -213,22 +213,33 @@ Consumer::processKick()
 void
 Consumer::lock()
 {
-    std::thread::id self = std::this_thread::get_id();
-    if (m_wakeup_mutex_owner == self) {
+    // S-011 Sec.8.2/8.4: relaxed is sufficient here -- the property this
+    // read relies on (never re-observing a stale, already-overwritten
+    // owner value) is the coherence guarantee any std::atomic gives for a
+    // single location, independent of memory_order.
+    EventQueue *self = curEventQueue();
+    if (m_wakeup_mutex_owner.load(std::memory_order_relaxed) == self) {
         ++m_wakeup_mutex_depth;
         return;
     }
     m_wakeup_mutex.lock();
-    m_wakeup_mutex_owner = self;
+    // Must be written only after the real lock is held (S-011 Sec.8.2):
+    // this is the store that makes the fast path above safe.
+    m_wakeup_mutex_owner.store(self, std::memory_order_release);
     m_wakeup_mutex_depth = 1;
 }
 
 void
 Consumer::unlock()
 {
-    assert(m_wakeup_mutex_owner == std::this_thread::get_id());
+    assert(m_wakeup_mutex_owner.load(std::memory_order_relaxed)
+           == curEventQueue());
     if (--m_wakeup_mutex_depth == 0) {
-        m_wakeup_mutex_owner = std::thread::id();
+        // Must be cleared before the real unlock (S-011 Sec.8.2): clearing
+        // afterward would reopen the same owner-misjudgment window one
+        // level down, between the real mutex becoming free and the owner
+        // field still showing the previous holder.
+        m_wakeup_mutex_owner.store(nullptr, std::memory_order_release);
         m_wakeup_mutex.unlock();
     }
 }

@@ -47,9 +47,9 @@
 #ifndef __MEM_RUBY_COMMON_CONSUMER_HH__
 #define __MEM_RUBY_COMMON_CONSUMER_HH__
 
+#include <atomic>
 #include <iostream>
 #include <set>
-#include <thread>
 
 #include "base/uncontended_mutex.hh"
 #include "sim/clocked_object.hh"
@@ -104,6 +104,18 @@ class Consumer
      * always blocks normally. Recursion never changes how many *distinct*
      * locks a thread holds, so it doesn't weaken the section 6.2 invariant
      * (a thread holds at most one such lock at a time).
+     *
+     * The re-entrancy fast path (docs/specs/S-011 Sec.8) identifies "am I
+     * the thread currently holding this lock" by comparing against
+     * m_wakeup_mutex_owner, which must be an atomic EventQueue* (not a
+     * plain std::thread::id): the single-location coherence guarantee that
+     * comes with any std::atomic -- not any particular memory_order -- is
+     * what rules out a thread ever re-observing its own stale,
+     * already-overwritten owner value while a different thread genuinely
+     * holds m_wakeup_mutex (S-011 Sec.8.2). EventQueue* (via
+     * curEventQueue(), the same per-host-thread domain identity already
+     * used at Consumer.cc:65/118) is used instead of std::thread::id so the
+     * atomic is unambiguously lock-free on every mainstream platform.
      */
     void lock();
     void unlock();
@@ -141,7 +153,7 @@ class Consumer
     Event::Priority m_ev_prio;
 
     UncontendedMutex m_wakeup_mutex;
-    std::thread::id m_wakeup_mutex_owner;
+    std::atomic<EventQueue *> m_wakeup_mutex_owner{nullptr};
     unsigned m_wakeup_mutex_depth = 0;
 
     void commitTick(Tick when);
