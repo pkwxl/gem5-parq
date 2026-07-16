@@ -49,6 +49,7 @@
 
 #include "base/addr_range.hh"
 #include "base/types.hh"
+#include "base/uncontended_mutex.hh"
 
 namespace gem5
 {
@@ -154,7 +155,12 @@ class AddrRangeMap
     iterator
     insert(const AddrRange &r, const V& d)
     {
-        if (intersects(r) != end())
+        std::lock_guard<UncontendedMutex> lock(cacheLock);
+
+        // Can't call the public intersects()/find() here: they take
+        // cacheLock themselves and UncontendedMutex is not reentrant.
+        if (findImpl(r, [r](const AddrRange r1) {
+                return r.intersects(r1); }) != end())
             return tree.end();
 
         return tree.insert(std::make_pair(r, d)).first;
@@ -166,6 +172,7 @@ class AddrRangeMap
     void
     erase(iterator p)
     {
+        std::lock_guard<UncontendedMutex> lock(cacheLock);
         cache.remove(p);
         tree.erase(p);
     }
@@ -176,6 +183,7 @@ class AddrRangeMap
     void
     erase(iterator p, iterator q)
     {
+        std::lock_guard<UncontendedMutex> lock(cacheLock);
         for (auto it = p; it != q; it++) {
             cache.remove(p);
         }
@@ -188,6 +196,7 @@ class AddrRangeMap
     void
     clear()
     {
+        std::lock_guard<UncontendedMutex> lock(cacheLock);
         cache.erase(cache.begin(), cache.end());
         tree.erase(tree.begin(), tree.end());
     }
@@ -279,12 +288,16 @@ class AddrRangeMap
      * iterator to the entry that satisfies the input conidition on
      * the input address range. Returns end() if none found.
      *
+     * Does not take cacheLock itself -- callers that already hold it
+     * (insert()) call this directly; everyone else goes through the
+     * locked find() below.
+     *
      * @param r An input address range
      * @param f A condition on an address range
      * @return An iterator that contains the input address range
      */
     iterator
-    find(const AddrRange &r, std::function<bool(const AddrRange)> cond)
+    findImpl(const AddrRange &r, std::function<bool(const AddrRange)> cond)
     {
         // Check the cache first
         for (auto c = cache.begin(); c != cache.end(); c++) {
@@ -320,6 +333,13 @@ class AddrRangeMap
         return end();
     }
 
+    iterator
+    find(const AddrRange &r, std::function<bool(const AddrRange)> cond)
+    {
+        std::lock_guard<UncontendedMutex> lock(cacheLock);
+        return findImpl(r, cond);
+    }
+
     const_iterator
     find(const AddrRange &r, std::function<bool(const AddrRange)> cond) const
     {
@@ -335,6 +355,15 @@ class AddrRangeMap
      * always be valid iterators of the tree.
      */
     mutable std::list<iterator> cache;
+
+    /**
+     * Guards tree/cache against concurrent access from multiple
+     * parallel-EventQueue domains. contains()/intersects() look
+     * read-only from the outside but internally reorder/rewrite
+     * cache via find(); insert()/erase()/clear() mutate tree and
+     * cache directly. All of them take this lock.
+     */
+    mutable UncontendedMutex cacheLock;
 };
 
 } // namespace gem5
