@@ -37,6 +37,10 @@ this file, for anything related to this work. New investigations get their own `
 - Host CPUs `54-55,92-111` are kernel-isolated (`isolcpus=`, see `/proc/cmdline`) for clean A/B timing.
   `54-55` is on NUMA node 0 (node 0 spans 0-55) — pin the serial arm there. `92-111` is on NUMA node 1
   (node 1 spans 56-111) — pin the parallel-spin arm there.
+- `54-55` is reserved exclusively for the serial-arm test and `92-111` exclusively for the parallel-arm
+  test — no other job may be scheduled or pinned to them. This includes build tools (e.g. `scons -j`) that
+  would otherwise happily use every core on the box: constrain those to the unreserved cores (e.g. via
+  `taskset`/`--cpu-list`), whose max available count is 90.
 
 ## Branches
 
