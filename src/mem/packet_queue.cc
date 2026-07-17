@@ -40,13 +40,35 @@
 
 #include "mem/packet_queue.hh"
 
+#include <atomic>
+#include <cstdint>
+
 #include "base/intmath.hh"
+#include "base/logging.hh"
 #include "base/trace.hh"
 #include "debug/Drain.hh"
 #include "debug/PacketQueue.hh"
 
 namespace gem5
 {
+
+// S-015 §10.6: counters for the "tolerate spurious retry/send" relaxation.
+// Under the parallel-EventQueue relaxed-timing model a retry or a fired
+// sendEvent can reach a PacketQueue that is not (or no longer) in the state
+// the upstream single-thread invariants assume -- another domain's thread
+// already sent/consumed the head, or the head's ready tick is still in this
+// domain's future. Rather than assert (the S-015 crash: assert(
+// deferredPacketReady()) at the historical tick 5305999323366), we tolerate it
+// -- recovering by rescheduling for the ready time and dropping nothing -- and
+// count + log each occurrence so the frequency of the deliberate relaxation is
+// quantified. Global (across all queues); the log message names the queue.
+static std::atomic<uint64_t> numSpuriousRetries{0};
+static std::atomic<uint64_t> numSpuriousDeferredSends{0};
+
+// Cap the per-event warn() volume so a pathological workload cannot flood the
+// log; the atomic counters keep counting past the cap and every event is still
+// DPRINTF'd under the PacketQueue debug flag.
+static constexpr uint64_t maxRelaxationWarnings = 100;
 
 PacketQueue::PacketQueue(EventManager& _em, const std::string& _label,
                          const std::string& _sendEventName,
@@ -73,10 +95,28 @@ PacketQueue::retry()
     // pqLock, then send with the lock released (leaf rule, S-015 section 8.3).
     // This entry point is reachable cross-domain (qport.hh recvRespRetry/
     // recvReqRetry called directly by a peer domain's thread).
+    bool spurious;
     {
         std::lock_guard<UncontendedMutex> lock(pqLock);
-        assert(waitingOnRetry);
+        // Tolerate a spurious retry (S-015 section 10.6): under relaxed
+        // cross-domain timing a retry can arrive when we were not actually
+        // awaiting one (the queue was already serviced by another path).
+        // Upstream asserts waitingOnRetry here; we recover instead.
+        spurious = !waitingOnRetry;
         waitingOnRetry = false;
+    }
+    if (spurious) {
+        uint64_t n = ++numSpuriousRetries;
+        DPRINTF(PacketQueue, "Queue %s: spurious retry tolerated (#%llu)\n",
+                name(), n);
+        if (n <= maxRelaxationWarnings) {
+            warn("PacketQueue relaxation: tolerated spurious retry on %s "
+                 "(#%llu) -- not awaiting a retry\n", name(), n);
+        }
+        // Nothing to resend on this path: any pending packet already has a
+        // sendEvent scheduled (a ready packet with waitingOnRetry==false
+        // always does). Do not call sendDeferredPacket.
+        return;
     }
     sendDeferredPacket();
 }
@@ -290,13 +330,43 @@ PacketQueue::sendDeferredPacket()
     // take pqLock without self-deadlocking; the `sending` flag closes the
     // window where the head is popped but waitingOnRetry is not yet updated.
     DeferredPacket dp(0, nullptr);
+    bool spurious = false;
+    Tick ready_at = MaxTick;
     {
         std::lock_guard<UncontendedMutex> lock(pqLock);
         assert(!waitingOnRetry);
-        assert(deferredPacketReady());
-        dp = transmitList.front();
-        transmitList.pop_front();
-        sending = true;
+        // Tolerate a spurious deferred send (S-015 section 10.6): under
+        // relaxed cross-domain timing this can run with no packet ready --
+        // another domain's thread already sent/consumed the head, or the
+        // head's ready tick is still in this domain's future. Upstream
+        // asserts deferredPacketReady() here (the S-015 crash); we recover by
+        // rescheduling for the ready time instead, dropping nothing.
+        if (!deferredPacketReady()) {
+            spurious = true;
+            ready_at = deferredPacketReadyTime();   // MaxTick if empty
+        } else {
+            dp = transmitList.front();
+            transmitList.pop_front();
+            sending = true;
+        }
+    }
+
+    if (spurious) {
+        uint64_t n = ++numSpuriousDeferredSends;
+        DPRINTF(PacketQueue, "Queue %s: spurious deferred send tolerated "
+                "(#%llu, readyAt=%llu, now=%llu)\n",
+                name(), n, ready_at, curTick());
+        if (n <= maxRelaxationWarnings) {
+            warn("PacketQueue relaxation: tolerated spurious deferred send on "
+                 "%s (#%llu) -- %s at tick %llu\n", name(), n,
+                 ready_at == MaxTick ? "queue empty" : "head not yet ready",
+                 curTick());
+        }
+        // Re-derive the correct schedule from current state: if a (future)
+        // packet remains, reschedule its send; if empty, this routes to the
+        // drain check. pqLock is released here (leaf rule).
+        schedSendEvent(ready_at);
+        return;
     }
 
     // use the appropriate implementation of sendTiming based on the
