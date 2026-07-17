@@ -1748,6 +1748,12 @@ cross-domain race of any kind is possible — this hang cannot be a variant
 of S-015's bug. It is a separate, TSan-build-specific problem, now with
 one more data point (launch-method-independent) but still unresolved.
 
+**UPDATE (2026-07-17, §13): the "TSan-build-specific" half of this
+paragraph's conclusion is now FALSIFIED — see §13. The hang reproduces
+on a plain, non-instrumented `.opt` build with no TSan at all, and even
+on a commit that predates every line of S-015's code. Read §13 before
+treating this section's hypothesis (a) as current.**
+
 ### 12.3 Correctness cross-check
 
 The serial arms' hang means they don't provide a same-session serial
@@ -1763,18 +1769,360 @@ serial arms hung.
 TSan-confirmed to have actually closed the four races §7 found — this
 was race-hygiene confirmation, not a crash gate (the crash itself was
 already fixed and re-confirmed clean here as a side effect). **The
-TSan-build serial-mode hang is a distinct, still-unresolved, tooling-only
-issue** — unrelated to S-015's correctness, but real, and now confirmed
-independent of the wrapper-vs-flat launch-method question §7.4 left open.
-Anyone running this project's TSan protocol under the serial arm should
-expect to need to detect and kill a hang (utime-frozen +
-`futex_wait_queue`, no crash marker) rather than assume a long runtime is
-just slow.
+serial-mode hang is a distinct, still-unresolved issue** — unrelated to
+S-015's correctness, but real. **UPDATE (§13): it is not TSan-specific
+either** — see §13 for the corrected picture. Anyone running a long
+unattended serial-mode run in this project (TSan or not) should expect
+to need to detect and kill a hang (utime-frozen + `futex_wait_queue`, no
+crash marker) rather than assume a long runtime is just slow.
 
 **Branch state**: `s015-packetqueue-retry-race` unchanged by this
 section (measurement only, no code changes) — still holds the working
 fix (§8 hybrid + §11 tolerate-spurious), now with the TSan hygiene pass
 also complete. Ready to propose for merge to `main` (`--no-ff`).
+
+## 13. The serial-mode hang is NOT TSan-specific and NOT caused by S-015
+— found by chance while checking on another session's live run, this
+session (2026-07-17)
+
+> **This section's topic has since been split out to its own spec,
+> [S-016](./S-016-unbounded-serial-run-hang.md)**, once TSan, wrapper-
+> launch, and all of S-009 through S-015's code were ruled out as
+> causes (§13.2-§13.4) and the investigation kept going (§13.5-§13.6)
+> into territory unrelated to this document's own subject (the
+> `PacketQueue` retry race). §13.1-§13.6 below are kept as the original,
+> in-the-moment discovery narrative; **S-016 is the consolidated,
+> forward-looking account** — read it for the current state of this
+> open investigation (four reproductions, the `sendMessage` trace, and
+> a significant finding that this project has never confirmed an
+> unbounded serial run of this checkpoint actually finishes, going back
+> to S-006).
+
+### 13.1 What happened
+
+This session was asked to check on a job "another session" had started:
+a full, unbounded (no `MAX_TICKS`) serial-vs-spin A/B on plain post-merge
+`main` (`build/X86_MESI_Three_Level/gem5.opt`, **no TSan**), launched via
+flat `exec taskset -c 54 ...` (`/tmp/s014-full/run-serial.sh` — not a
+wrapper script) against the same checkpoint this whole spec has used
+(`x86-threads3-roi-classic`). Diagnosis (read-only: `ps`, `/proc/<pid>/
+stat`, `/proc/<pid>/wchan`, `taskset -p`, `lsof`; `gdb`/`strace` were
+unavailable/blocked by the sandbox's `ptrace_scope=1`, so no backtrace
+was possible):
+
+- The spin arm (PID 457815) was healthy — 7 threads at ~100% CPU, 3.5h+
+  in, no stats yet (expected for a long unbounded run).
+- The serial arm (PID 457814) was **hung**: single thread, `utime` frozen
+  at 3767 clock ticks (~37.7 CPU-seconds) after ~3.5 hours wall-clock,
+  `wchan=futex_wait_queue`, `stats.txt` still 0 bytes. The log's last
+  line was `src/arch/x86/interrupts.cc:530: hack: Assuming logical
+  destinations are 1 << id.` — i.e. it froze very early, before any
+  simulated tick was ever counted.
+
+This is the identical signature §7.4 and §12.2 documented for TSan
+builds, but this build has **no TSan instrumentation** (checked: no
+`tsan` symbols via `nm -D`, no TSan runtime in `ldd`) and used a **flat**
+launch (not the wrapper-script structure §7.4 originally suspected).
+
+### 13.2 Bisection: does the hang predate S-015 entirely?
+
+Per the user's hypothesis ("might this be a bug S-015's fix
+introduced?"), built commit `a3e325afb5` — S-014's `occupyLayer`
+`crossDomainSnap()` fix **plus** S-015's first, since-superseded
+`layerLock`-in-`releaseLayer()` attempt, but **zero** `pqLock`/
+`UncontendedMutex`/tolerate-spurious-retry code in `packet_queue.cc`
+(that code was introduced starting at `c815c78fec`, well after this
+commit) — in a fresh worktree
+(`/workspace/gem5-wt/bisect-a3e325a-serial-hang`, build mirrored to
+`/workspace/shm/gem5/bisect-a3e325a-serial-hang/build/`, built with
+`taskset -c 0-53,56-91` per the CLAUDE.md isolcpus reservation). Ran the
+identical unbounded serial workload pinned to CPU 55 (idle, same
+reserved-for-serial range, independent of the still-running/still-hung
+PID 457814 on CPU 54).
+
+**It hung the same way**: `utime` froze at 3734 ticks (~37.34
+CPU-seconds — within 1% of the original's 37.7s), `wchan` went to
+`futex_wait_queue` and stayed there (checked at t=40s/60s/80s/100s
+post-launch, zero movement), `stats.txt` stayed 0 bytes, and the log's
+last line was **byte-for-byte identical**:
+`src/arch/x86/interrupts.cc:530: hack: Assuming logical destinations are
+1 << id.`
+
+**This falsifies the hypothesis that S-015 introduced this hang.** It
+reproduces on a commit with none of S-015's code at all.
+
+### 13.3 What this means for §7.4/§12.2's hypotheses
+
+Cross-checking against §7's own numbers: those TSan serial hangs
+(`serial1`/`serial2`, §7.4) burned **~294 CPU-seconds** (`utime=29375`
+ticks) before freezing — using the **same** `MAX_TICKS=2e9`-bounded
+command as every other §7 run (confirmed by re-reading §7's setup
+paragraph: "Same checkpoint/quantum/bound as every S-015 repro batch so
+far ... `MAX_TICKS=2e9`"). Today's two non-TSan reproductions (S-015's
+final fix on `main`, and pre-S-015 `a3e325afb5`) both ran **unbounded**
+(no `MAX_TICKS` at all) and froze after ~37-40 CPU-seconds. The ratio
+(~294/37 ≈ 7.9x) is squarely inside TSan's typical instrumentation
+slowdown range — consistent with **the same underlying freeze point**,
+reached after processing a roughly fixed amount of actual simulated
+work, independent of wall-clock bound, TSan instrumentation, launch
+method (flat vs. wrapper), and S-014/S-015 code version.
+
+So, updating §7.4/§12.2's open hypotheses:
+- **(a) "TSan-build-specific" — FALSIFIED.** Reproduces with zero TSan
+  instrumentation.
+- **(b) "wrapper-script launch structure" — already falsified by §12.2
+  itself, reconfirmed here** (today's launches were flat throughout).
+- **(c) "unbounded vs. `MAX_TICKS`-bounded run" — also not the
+  distinguishing factor**: §7.4/§12.2's TSan hangs were on
+  `MAX_TICKS=2e9`-bounded commands, and today's are unbounded, yet all
+  four hang with the same signature.
+
+**What remains as the best-supported explanation**: this is a
+**serial-mode-only** (single `EventQueue`, single host thread — so no
+cross-domain race of any kind is structurally possible), **deterministic**
+(same freeze point regardless of build/launch/bound, scaling only with
+per-instruction overhead, not wall-clock time), likely **pre-existing**
+(present before any of S-014/S-015's code) bug — most likely a genuine
+self-deadlock somewhere in an `UncontendedMutex`-guarded critical section
+(`src/base/uncontended_mutex.hh`): its slow path (`cv.wait()` on an
+internal `std::mutex`/condition_variable) is implemented via a futex
+under glibc/NPTL, matching the `futex_wait_queue` wchan exactly, and in a
+genuinely single-threaded process the *only* way to reach that slow path
+at all is if the same thread calls `lock()` on an already-locked instance
+(the mutex is explicitly documented as non-reentrant, e.g.
+`addr_range_map.hh:175`'s comment) — i.e. a nested/reentrant lock bug,
+not a race. This has **not** been confirmed by a backtrace (`gdb`/
+`strace` are both blocked by this sandbox's `ptrace_scope=1`; no root
+cause has been read from source and verified) — it is the
+best-supported hypothesis given the evidence, not a confirmed mechanism.
+`interrupts.cc:530` being the last log line before every observed freeze
+is suggestive (early boot / interrupt-controller setup, well before any
+simulated instruction is counted per the empty `stats.txt`s) but not
+itself proven to be the freeze site.
+
+### 13.4 Second bisection, same session: predates S-009 too — none of
+this fork's cross-domain locks are involved
+
+Per the user's request to keep bisecting backward, built commit
+`3a030687a6` ("docs: add pre-S-008 session handoff note" — after
+S-006's FS-mode migration and S-007's spin-barrier work, but **before**
+S-009 started adding any of this fork's cross-domain locks at all: no
+`layerLock`, `pioLock`, `cacheLock`, `pqLock`, or the S-011
+`Consumer::lock()` atomic-owner fix). Same worktree/tmpfs-build pattern
+as §13.2 (`/workspace/gem5-wt/bisect-3a03068-pre-s009-serial-hang`,
+built on unreserved cores), same unbounded serial workload, same
+checkpoint, pinned to CPU 55 again after the first bisection PID was
+cleaned up.
+
+**It hung the same way a third time**: `utime` froze at 4027 ticks
+(~40.3 CPU-seconds — again within the same ~37-40s band as both prior
+reproductions), `wchan=futex_wait_queue` from t=40s through t=100s+ with
+zero movement, `stats.txt` 0 bytes, log tail byte-for-byte identical
+down to the same `interrupts.cc:530` hack line. Killed via `SIGTERM`
+after confirming (clean exit).
+
+**Three independent reproductions now span this fork's entire
+lock-adding history** — post-S-015 `main`, pre-S-015/post-S-014
+(`a3e325afb5`), and pre-S-009 (`3a030687a6`, before any cross-domain
+lock this fork ever added existed) — all with the same signature and
+near-identical (~37-40 CPU-second) freeze timing. This makes it highly
+unlikely that **any** of S-009 through S-015's work is responsible.
+What's left unruled-out is either (a) something in this fork's earlier
+work (S-001's throttle/deadlock-avoidance design, S-002's per-consumer
+`Consumer::lock()`/`UncontendedMutex`-style wakeup mutex, S-005's
+host-thread affinity pinning, or S-006's FS-mode/checkpoint-restore
+changes — none audited yet), or (b) something inherited unchanged from
+stock upstream gem5 (`UncontendedMutex` itself carries a 2020 Google
+copyright header, i.e. predates this fork entirely) that simply never
+gets exercised long enough to trigger in typical upstream usage. Not
+yet distinguished.
+
+### 13.5 Third bisection axis, same session: not the checkpoint either
+— and a concrete lead on *where* the freeze happens
+
+Per the user's suggestion ("might this be a property of the checkpoint
+itself — try a different one"), re-ran the identical unbounded serial
+workload against `x86-threads-balanced3-roi-classic` (the S-013
+balanced-workload checkpoint — a structurally different guest program
+state, different `.pmem`/`.cow`, built by a different script) instead
+of `x86-threads3-roi-classic`, using the current `main` build, pinned to
+CPU 55.
+
+**Hung the same way a fourth time**: `utime` froze at 3679 ticks (~36.8
+CPU-seconds, same band as all three prior reproductions), `wchan=
+futex_wait_queue`, `stats.txt` 0 bytes. The log tail matches down to the
+same last line (one fewer repeated `fwait unimplemented` warning before
+it, reflecting the different guest instruction stream, but otherwise
+identical): `src/arch/x86/interrupts.cc:530: hack: Assuming logical
+destinations are 1 << id.`
+
+**Four independent reproductions now span 3 different code commits (all
+of S-009-S-015 ruled out) and 2 different checkpoints (checkpoint
+content ruled out)** — always freezing at the same log line, always
+after ~37-40 CPU-seconds.
+
+**Read `interrupts.cc` around that line and found something concrete**:
+the `hack_once(...)` at `interrupts.cc:530` fires **exactly once ever**
+(it's a "hack once" warning, not a per-call one — consistent with it
+always being the last line) inside
+`X86ISA::Interrupts::writeReg()`'s handling of
+`APIC_INTERRUPT_COMMAND_LOW` with a **logical-destination, no-shorthand
+broadcast** (`destShorthand==0`, `destMode==1`) — i.e. the first time
+this simulation ever sends an IPI addressed to multiple APICs by a
+bitmask rather than to one target or "all". Right after computing the
+target list (`apics`), the code loops over every target and calls
+`intRequestPort.sendMessage(pkt, ...)` once per target
+(`interrupts.cc:582-585`). `IntRequestPort::sendMessage()`
+(`src/dev/x86/intdev.hh:137-150`) calls `schedTimingReq()` in timing
+mode, i.e. `QueuedRequestPort`'s `PacketQueue::schedSendTiming()` — the
+exact same `PacketQueue` machinery this whole S-009-S-015 line has been
+about, except this call path (interrupt controller → `IntRequestPort` →
+`PacketQueue`) is **stock gem5**, unmodified by any commit tested so
+far (`pqLock` didn't even exist yet at the `3a030687a6` reproduction).
+
+This is a plausible explanation for why the freeze is so deterministic
+and checkpoint-content-independent: both tested checkpoints are named
+`x86-threads3-*`/`x86-threads-balanced3-*` — both taken at the same
+phase of a similar benchmark (the benchmark spawning its 3-4 worker
+threads at ROI start, per S-013 §1's own account of `threads.cpp`). A
+guest OS SMP scheduler commonly sends exactly this kind of
+logical-destination broadcast IPI (`smp_call_function`-style) to wake
+idle CPUs when scheduling new threads — which would explain why it
+fires deterministically, once, at almost the same point in both
+checkpoints, and never before. **Not confirmed** — this is a plausible
+account of *why* the trigger is deterministic and checkpoint-
+independent, not a demonstrated mechanism for the hang itself (still no
+backtrace of the actually-hung state).
+
+### 13.6 Traced the `sendMessage` call path per user request; found no
+reentrant-lock bug there, but found something more load-bearing instead
+— this project has never confirmed an unbounded serial run of this
+checkpoint actually finishes
+
+Per the user's direction, traced the specific call path §13.5 flagged
+(`Interrupts::writeReg`'s broadcast-IPI loop → `IntRequestPort::
+sendMessage` → `schedTimingReq` → `PacketQueue::schedSendTiming`/
+`schedSendEvent` → `EventQueue::schedule`). For a burst of N packets
+with the *same* `when` (all built in one loop iteration, same `curTick()
++ latency`), only the *first* insertion (into an empty `transmitList`)
+sets `schedule_send = true` and calls `schedSendEvent`/`EventQueue::
+schedule` — every subsequent same-tick packet's search loop finds an
+existing entry with `it->tick <= when` and returns via the middle-
+insertion branch (`transmitList.emplace(++it, when, pkt); return;`)
+*without* reaching the `schedule_send = true` line. So an N-target
+broadcast cannot re-enter `schedSendEvent`/`EventQueue::schedule` N
+times from the same call frame — **no reentrant-lock bug found in this
+specific path.**
+
+Followed the chain one level further: the delivered IPI eventually
+reaches `X86ISA::Interrupts::requestInterrupt()`
+(`interrupts.cc:227-274`), which for `FullSystem` calls
+`tc->getCpuPtr()->wakeup(0)` unconditionally (`interrupts.cc:273`) —
+**this is the exact same `recvMessage → wakeup → activateContext →
+EventQueue::schedule` call chain that S-006 §11.2-§11.5 already found
+and fixed a real bug in** (the `simQuantumStart`-anchored
+`crossDomainSnap()` grid fix, `2273b39c1f`/`284b291f46`/`9d25761024`) —
+though that fix targeted a *parallel*-mode assert (`when < curTick()`
+across domains), and S-006 §11.3 itself states plainly that serial mode
+*cannot* hit that specific assert (single queue, no cross-domain
+scheduling).
+
+**Reading S-006/S-007's own account of their serial reference runs
+turned up something more significant than a reentrant-lock bug**: this
+project has **never actually confirmed** that an unbounded (no
+`MAX_TICKS`) serial run of this checkpoint+workload completes.
+Specifically:
+
+- S-006 §11.3 (the FS-mode migration that first restored this
+  checkpoint): "同配置 `PARALLEL_EVENTQ=0` 单 EventQueue 重放不可能触发
+  该 assert... 本次运行**尚在 ROI 中**...结果 simTicks 待补" — the
+  serial reference run was still in-flight, result marked "TBD," at the
+  end of that session.
+- S-007 §12.6 (the spin-barrier milestone, a later session): "串行参考跑
+  （pid 1540862，`/tmp/fs3-restore-serial`，串行中性、**仍在 ROI 中**）
+  给出的完整-ROI 对照 simTicks **仍 TBD**" — *still* TBD, in a
+  *different* session, i.e. no one had gone back to confirm the S-006
+  run had finished, and this session's own attempt (a different PID)
+  was *also* still running/unconfirmed when that section was written.
+- S-008 §16: a **later still** session's handoff note
+  (`docs/refs/what-to-do-next-floofy-wombat.md`, committed as part of
+  `3a030687a6` — the exact commit this session's §13.4 bisection
+  build used) claims the run *did* eventually finish —
+  `simTicks=210050075139858`, `hostSeconds=16851.86` (~4.68 hours),
+  `simInsts=3278585986` — but S-008's own session **could not verify
+  this**: the host had rebooted in the interim, `/tmp/fs3-restore-serial`
+  was gone, and the only source for these numbers was the prior
+  session's prose, not a `stats.txt` this session actually read. S-008
+  explicitly flags this as "记录在案的未核实二手数据" (an on-the-record
+  but unverified secondhand claim) and recommends re-running rather than
+  trusting it for any quantitative conclusion.
+- Since S-008, **every** subsequent "historical serial reference" used
+  in this project (S-009 §27, S-014 §9, S-015 throughout — the
+  `finalTick=5306177114066`/`simInsts=1475264` numbers cited
+  everywhere) has come from a **`MAX_TICKS=2e9`-bounded** run (confirmed
+  by re-reading S-014 §9: "bumped to `MAX_TICKS=2e9`... completed
+  cleanly"), i.e. a run that stops at a fixed tick offset from restore,
+  not one that reaches the workload's actual end. No session after
+  S-008 re-ran a genuinely unbounded serial reference to independently
+  confirm the S-008 §16 claim.
+
+**Net effect**: this session's four hung reproductions are consistent
+with "an unbounded serial run of this checkpoint has never actually
+been confirmed to finish, going back to the original FS-mode migration"
+— they may not be a new regression at all, just the first time anyone
+has gone back to directly check process-level CPU activity (`utime`,
+`wchan`) on such a run rather than leaving it as an unconfirmed
+background job. The one report of it *ever* finishing (S-008 §16) is
+explicitly second-hand, unverified, and its numbers cannot be
+reproduced from any artifact this session could read. **Not conclusive
+either way**: it's equally possible the S-008 §16 claim is accurate and
+something environment-specific changed since (different host/sandbox
+instance, reboot-related state) that now causes the hang where it
+previously didn't happen — this session has no way to distinguish those
+two possibilities from the documentary record alone.
+
+### 13.7 Not yet done
+
+- §13.5's lead not chased further: no read of what happens *inside*
+  `PacketQueue::schedSendTiming`/`schedSendEvent`/`EventQueue::schedule`
+  for this specific multi-target IPI-broadcast burst (N calls to
+  `sendMessage` in a tight loop, same call frame) to find an actual
+  reentrant/nested-lock path; no attempt at a checkpoint that avoids a
+  multi-thread wake-up broadcast entirely (both available `-classic`
+  checkpoints are taken at a multi-thread-spawn ROI start, so this
+  hasn't been isolated from "any checkpoint taken at this benchmark
+  phase" vs. "any checkpoint that reaches this IPI pattern at all" —
+  the third `x86-threads3-roi` (non-`-classic`, Ruby-cache-gz) checkpoint
+  was not tried and is presumably the same phase too).
+- No backtrace of a hung process (blocked by sandbox `ptrace_scope`).
+- No audit of every `UncontendedMutex` call site for a reentrant-lock
+  path (started, not completed — `eventq.hh`'s `service_mutex`/
+  `ScopedMigration`/`ScopedRelease` were read and did not show an obvious
+  issue for a single-`EventQueue` serial run, but the full call graph
+  from `interrupts.cc:530` onward was not traced to a conclusion).
+  `noncoherent_xbar.cc`/`xbar.cc`/`cache/base.cc`/`ruby/Sequencer.*`/
+  `io_device.*`/`tlb.*`/`mc146818.*`/`intel_8254_timer.*`/
+  `ide_disk.*`/`addr_range_map.hh` all also use `UncontendedMutex` and
+  were not individually audited.
+- No test against a commit that predates this fork's own work entirely
+  (S-001/S-002, or truly vanilla upstream) — §13.4 only ruled out S-009
+  through S-015; S-001-S-008 (per-consumer lock, host-thread affinity,
+  FS-mode migration) are not yet individually bisected. A fair A/B that
+  far back needs checking how early `docs/refs/scripts/
+  x86_fs_mesi3_parallel_eventq.py` and this checkpoint format exist in
+  usable form.
+- Original hung PID 457814 (the other session's job, on CPU 54) was left
+  running, untouched, per user instruction, throughout both bisections.
+  Both bisection worktrees/builds
+  (`/workspace/gem5-wt/bisect-a3e325a-serial-hang`,
+  `/workspace/gem5-wt/bisect-3a03068-pre-s009-serial-hang`, and their
+  `/workspace/shm/gem5/...` build dirs) were left in place, not cleaned
+  up, in case further bisection is wanted.
+- Not yet decided: whether this deserves its own `S-016` (it is now
+  clearly independent of S-015 specifically, and now shown independent
+  of S-009 through S-015 entirely — so per this project's convention it
+  likely should get its own spec rather than keep accumulating under
+  S-015, but that split has not been done yet).
 
 ---
 
