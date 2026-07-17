@@ -117,9 +117,10 @@ hypothesis** for the hang (it recurs regardless of launch method) and
 points instead at a genuine TSan-build-specific issue, still not
 root-caused. Not the S-015 race (serial mode = one thread, no
 cross-domain concurrency possible) — a separate, tooling-only problem.
-Branch is unchanged by this section (measurement only) and is now
-**ready to propose for `--no-ff` merge to `main`**, TSan hygiene pass
-included. Full detail: §12.
+Branch is unchanged by this section (measurement only) and was fix+
+hygiene-complete. **Merged into `main` via `--no-ff` (commit
+`1bacbb0a7c`)** -- the branch itself (`s015-packetqueue-retry-race`) was
+left in place, not deleted, after the merge. Full detail: §12.
 
 ## 1. What happened
 
