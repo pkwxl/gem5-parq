@@ -198,10 +198,20 @@ getCurTick())`，而是 `packet_queue.cc:219`
 
 1. 取下一个未使用的编号（当前最大是 `S-015`，下一份是 `S-016`），**不要**
    回填或重排已有编号，哪怕新主题在逻辑上是某个旧编号的延续。
+   **并行开发下先在 `main` 上占号**：编号是全局分配的，两个并行调查不能
+   同时抢同一个 `S-NNN`。开分支前，先在 `main` 上给下面的表格加一行
+   （状态填 `进行中`，附上分支名 `sNNN-slug`），提交——这一步在主干上把
+   编号原子地占住，也让在途的调查可见。然后再
+   `git worktree add /workspace/gem5-wt/sNNN-slug -b sNNN-slug main`。
+   完整的分支/worktree/tmpfs 约定见
+   [../decisions/0001-fork-branching-strategy.md](../decisions/0001-fork-branching-strategy.md)。
 2. 命名 `S-NNN-slug.md`，独立成文——不要把新主题塞进某个已有 `S-NNN`
    文件的正文里，哪怕它是那份文档里某个未解决问题的直接后续（用交叉引用
    `S-NNN §X.Y` 链接过去即可，同 S-001..S-007 互相引用的方式）。
-3. 写完后只在这个表格里加一行——不要因为新增一份 spec 就去改写旧
-   `S-NNN` 文件的正文内容。
+3. 写完后把占号时那一行的状态从 `进行中` 更新为最终状态——不要因为新增
+   一份 spec 就去改写旧 `S-NNN` 文件的正文内容。这个表格**只增不改别人的
+   行**：并行分支合回 `main` 时，这里几乎必然冲突，按"两行都保留"机械解决，
+   第二个合并的人负责解冲突、不改写别人那一行（见
+   [../decisions/0001-fork-branching-strategy.md](../decisions/0001-fork-branching-strategy.md)）。
 4. 如果这份新 spec 明显解决/推进了上面"现状"段落提到的某个悬而未决项，
    顺手更新那一段（这是本索引里唯一预期会被频繁编辑的部分）。

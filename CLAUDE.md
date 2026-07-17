@@ -44,11 +44,31 @@ this file, for anything related to this work. New investigations get their own `
 
 ## Branches
 
-- `stable`: latest official release only. **Do not develop on `stable`.**
-- `develop`: active development branch; all contributions are made against this branch and merged into
-  `stable` at release time.
-Check which branch you're on before starting work; if asked to make a change intended for upstream
-contribution and you're on `stable`, switch to/branch from `develop` first.
+**Remotes.** `origin` = `git@github.com:pkwxl/gem5-parq.git` (this fork's personal
+repo — research backup + integration home). `upstream` = `https://github.com/gem5/gem5.git`
+(read-only; source of `stable`/`develop`).
+
+**Fork research workflow** (the full rationale is
+[docs/decisions/0001-fork-branching-strategy.md](docs/decisions/0001-fork-branching-strategy.md) —
+read it before starting a new investigation):
+- `main` (tracks `origin/main`) is this fork's **research trunk** — the analogue of upstream `develop`.
+  Keep it buildable and spec-consistent; **do not commit exploratory work directly on `main`.**
+- **One branch per S-NNN investigation**, named `sNNN-slug` to match its `docs/specs/S-NNN-slug.md` spec,
+  branched from `main`. **Claim the number on `main` first** (add the `INDEX.md` row, status `进行中`,
+  commit) before branching, so parallel investigations don't collide on the next number.
+- Give each investigation its own `git worktree` under `/workspace/gem5-wt/<branch>/`, with its `build/`
+  symlinked into namespaced tmpfs `/workspace/shm/gem5/<branch>/build/` (volatile — builds regenerate;
+  checkpoints still go to `-d /tmp/...`). One-time: `mkdir -p /workspace/shm/gem5`.
+- Orthogonal investigations → independent branches; conflicting/same-subsystem ones (the S-009→S-014→S-015
+  pattern over `xbar.cc`/`packet_queue.cc`) → chain off the parent branch or rebase after it merges.
+- Conclude by merging to `main` with `--no-ff` (**never squash** — the step-by-step commit log is itself a
+  research record); dead-end investigations still land their spec + INDEX row as the negative result.
+- **Pushing is manual** — push `main` (and active `sNNN-*` branches) to `origin` by hand; nothing here
+  auto-pushes.
+
+**Upstream contribution** (unchanged): if asked to make a change intended for upstream, branch from
+`upstream/develop` (not `main` or `stable`), keep fork-research commits out, and open the PR against
+`gem5/gem5`'s `develop`. Check which branch you're on before starting work.
 
 ## Build
 
