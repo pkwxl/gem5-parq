@@ -52,19 +52,24 @@ the bare ~15% rate, as §1b's own prediction anticipated. Full detail:
 anomaly was wrong and is corrected in §7.3 -- read §7.3-§7.4, not §7.1,
 for the real account; §7.4 also flags a new, separate, TSan-build
 launch-method hang unrelated to this bug). A **deferral-based
-architectural alternative** (§6 step 5b) is still recorded to weigh
-against a 4th bolt-on lock before committing to fix #2 -- that design
-decision remains open for the user. **§8 now sketches the step-4
-restructure in full, with a lock-ordering proof -- and corrects the
-"step 4 = complete fix surface" framing above: a `pqLock` *alone* is
-INSUFFICIENT.** Part of the confirmed race is on `sendEvent`'s
-scheduling, and gem5's `EventQueue` forbids cross-domain `reschedule()`
-by assertion (`eventq.hh:844`), which no `PacketQueue`-level lock can
-serialize against `serviceOne()`. The robust fix is a **hybrid**:
-`pqLock` (a strict leaf lock) for `transmitList`/`waitingOnRetry`, plus
-an owner-thread-only `asyncInsert`-based handoff for `sendEvent`
-scheduling (a narrow, structural piece of step 5b). Still design-only,
-not implemented.
+architectural alternative** (§6 step 5b) was recorded to weigh
+against a 4th bolt-on lock before committing to fix #2. **§8 sketches
+the step-4 restructure in full, with a lock-ordering proof -- and
+corrects the "step 4 = complete fix surface" framing above: a `pqLock`
+*alone* is INSUFFICIENT.** Part of the confirmed race is on
+`sendEvent`'s scheduling, and gem5's `EventQueue` forbids cross-domain
+`reschedule()` by assertion (`eventq.hh:844`), which no
+`PacketQueue`-level lock can serialize against `serviceOne()`. The
+robust fix is a **hybrid**: `pqLock` (a strict leaf lock) for
+`transmitList`/`waitingOnRetry`, plus an owner-thread-only
+`asyncInsert`-based handoff for `sendEvent` scheduling (a narrow,
+structural piece of step 5b). **The hybrid-vs-full-5b design decision
+is now SETTLED (§9, 2026-07-17, at the user's delegation): the §8
+hybrid is the chosen fix; full 5b deferral is rejected as this bug's
+fix (it cannot cover the confirmed `recvTimingResp`-path race without
+a flow-control protocol redesign, since `recvTiming*` returns a
+synchronous bool) and is retained only as a possible future
+architecture investigation. Implementation not yet started.**
 
 ## 1. What happened
 
@@ -656,7 +661,15 @@ started)
    #5. Bigger change, and it must respect the relaxed-timing quantum
    model (the deferred retry lands at a barrier boundary, same as other
    cross-domain timing) -- but it addresses the cause, not the symptom.
-   Not chosen; recorded so it's compared against the lock before fix #2.
+   **Decision made (§9): NOT chosen as the S-015 fix.** Full deferral
+   can't cover the confirmed race surface (the §7.2 race enters via
+   bool-returning `recvTimingResp`, which can't be deferred without a
+   flow-control redesign), so a `pqLock` is needed regardless — see §9
+   for the full grounds. The §8 hybrid already incorporates this
+   step's principle exactly where the `EventQueue` contract forces it
+   (the B2 scheduling handoff). Kept on record as the shape of a
+   possible future domain-boundary-channel architecture investigation
+   (its own S-NNN), with §9.4's falsifiers as the trigger.
 6. Once fixed (or if ruled out as a real bug), return to S-014 §6 step 3
    / §9 proper: confirm the *original* `occupyLayer` crash point is
    durably fixed over a genuinely long/unbounded run, now that this
@@ -1202,6 +1215,121 @@ leaves that race live. The hybrid (8.3-8.5) is what closes all four.
   race signatures in the table to disappear, `diag2`/`diag4` repro to go
   clean) + the §1a bare-repro batch (expect 0/20) + the S-009 §27
   short-window byte-identical `stats.txt` regression.
+
+## 9. DECISION (2026-07-17): the §8 hybrid is chosen as the S-015 fix;
+full §6-step-5b deferral is REJECTED as this bug's fix (recorded as a
+future architecture direction, not discarded)
+
+The user delegated the open hybrid-vs-defer design decision ("settle
+it"); this section records the decision and its grounds so the next
+session can implement without re-litigating. Every code fact cited was
+re-verified against the tree this session, not carried over from
+memory.
+
+### 9.1 The decision
+
+Implement the fix as sketched in §8: a strict-leaf `pqLock` over
+`PacketQueue`'s data members (`transmitList`, `waitingOnRetry`, a new
+`sending` guard), restructured as unlocked cores + thin locked
+wrappers, **plus** the owner-thread-only `sendEvent` scheduling handoff
+(`crossWakeEvent` via `asyncInsert`, §8.5). Do **not** pursue §6 step
+5b's full defer-to-owning-domain redesign as the S-015 fix.
+
+### 9.2 Grounds
+
+1. **Full deferral cannot cover the confirmed race surface without a
+   flow-control protocol redesign — so the lock is needed either way.**
+   The entries that *can* be deferred as-is are the void-returning ones
+   (`recvRespRetry`/`recvReqRetry`, `qport.hh:69`/`:121`). But the
+   TSan-confirmed §7.2 T1 race enters through
+   `NoncoherentXBar::recvTimingResp` → `cpuSidePorts[id]->
+   schedTimingResp(...)` (`noncoherent_xbar.cc:225`) running on a
+   core-domain thread — and `recvTimingReq`/`recvTimingResp` return a
+   **synchronous flow-control `bool`** (`port.hh:255`, `:454`) that the
+   caller consumes inline. Deferring those means either always-accept
+   (unbounded buffering — a real protocol change, not a fix) or a
+   proper inter-domain channel with its own backpressure (see ground
+   2). Deferring *only* the retries leaves the confirmed
+   `schedTimingResp` race live, so `pqLock` is required regardless.
+   The actual menu was never "lock vs. defer" — it was "hybrid" vs.
+   "hybrid *plus also* defer the retries", and the extra deferral adds
+   timing perturbation without closing any additional confirmed race.
+
+2. **The version of 5b that would genuinely retire the bug family is a
+   domain-boundary message-passing architecture** — defer at the
+   *source* of every cross-domain call, with an explicit inter-domain
+   channel handling flow control (parti-gem5's actual design). That is
+   a new investigation (its own S-NNN), not a bug fix: it invalidates
+   the byte-identical-`stats.txt` regression baseline every validation
+   in this project rests on, requires re-quantifying timing accuracy
+   from scratch, and is disproportionate for what is (in this topology)
+   rare PIO/interrupt traffic — all while the project's real open
+   question (path 3, getting past 0.91x) is untouched. If the family
+   persists after this fix (see 9.4), that investigation is the right
+   response — as architecture, with its own spec, not as gap-#6
+   patching.
+
+3. **The hybrid does not repeat the gap-#N failure mode that motivated
+   5b.** Every prior partial fix locked *callers* — three
+   `NoncoherentXBar` entry points (S-009 §24), `PioDevice` entries
+   (S-009 §25), `releaseLayer()` (§1c) — and each time the next gap was
+   a caller chain that couldn't see (or never asked for) the lock.
+   `pqLock` lives **inside the raced object**: every chain that mutates
+   `transmitList`/`waitingOnRetry` does so through `PacketQueue`'s own
+   methods, so the "unaware caller" failure mode is structurally gone
+   *for this object's state*. And the one operation an object-level
+   lock cannot fix — a foreign thread calling `em.reschedule()`
+   (owner-thread-only by assertion, `eventq.hh:844`) — is exactly where
+   §8 already applies 5b's principle (the B2 handoff). The hybrid is
+   not "lock #4 waiting for gap #5"; it is "lock the state itself, and
+   defer the one operation that is un-lockable."
+
+4. **Timing/validation asymmetry.** The B2 handoff posts
+   `crossWakeEvent` at the same grid-snapped tick today's cross-domain
+   `schedSendEvent` snap already computes (`packet_queue.cc:186-199`),
+   so the hybrid is *expected* stats-neutral in the validated S-009 §27
+   window (must still be verified, §8.8). Full retry-deferral moves
+   retry delivery to quantum boundaries → changes stats everywhere and
+   forfeits the byte-identical regression protocol.
+
+5. **Deadlock safety is already proven for the hybrid** (§8.6 leaf-lock
+   proof), and its known implementation caveats are catalogued (§8.8);
+   none is a blocker.
+
+### 9.3 Costs accepted, with eyes open
+
+- One uncontended `compare_exchange_strong` per queue operation on
+  **every** classic `PacketQueue` in **every** config — including
+  pure-classic-memory configs where these queues sit on the cache hot
+  path even in serial mode (`UncontendedMutex`'s fast path,
+  `base/uncontended_mutex.hh`). If a serial-mode perf regression is
+  measurable, gate the lock on `inParallelMode` at implementation time
+  — decide by measuring, not by guessing.
+- Added state-machine complexity: the `sending` flag, its drain-path
+  interaction, and the cache's `sendDeferredPacket` override audit
+  (§8.8 items c/d) are now mandatory implementation work, not
+  optional hardening.
+
+### 9.4 Falsifiers — conditions under which this decision gets revisited
+
+- The prototype cannot hold `stats.txt` byte-identical in the S-009
+  §27 short window (i.e. the B2 handoff turns out not to be
+  timing-neutral where it must be), **or**
+- post-fix TSan finds the family continuing in a *fifth* object
+  outside `PacketQueue` (another cross-domain-mutated structure with
+  its own unaware callers).
+
+Either of those means stop patching and open the domain-boundary
+channel investigation (ground 2's architecture) as its own spec,
+rather than writing a gap-#6 fix.
+
+### 9.5 Scope note
+
+This settles the *design*. Implementation (per §8, with §8.8's open
+items) and its verification (§8.8's plan: TSan A/B re-run expecting the
+four §8.7 signatures to disappear, §1a-style bare batch expecting 0/20,
+S-009 §27 byte-identical short-window regression) are the next
+sub-phase and were not started in the deciding session.
 
 ---
 
