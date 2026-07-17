@@ -1,11 +1,20 @@
 # S-014 — `BaseXBar::Layer::occupyLayer` cross-domain crash beyond any
 previously-tested window
 
-**Status: crash reproduced and root-caused at the source level; not fixed,
-not yet scoped. Discovered as a side effect of S-013, but it is NOT about
-S-013's four-core-balance question — it's a correctness gap in the
-grid-anchored snap fix S-009 shipped, and it directly qualifies S-009's
-"Q=6660, 0.91x speedup, validated" conclusion.** This surfaced because the
+**Status: crash reproduced and root-caused at the source level; call-site
+audit (§7) done; fix implemented and compiled (§8) -- `crossDomainSnap()`
+wrapped inside `Layer::occupyLayer()` itself, covering all four call
+chains per the user's explicit choice of the broad option; short-window
+regression check (same protocol as S-009 §27) is clean (byte-identical
+`stats.txt`, no crash). **Not yet done: re-running the actual unbounded-
+window reproduction to confirm the fix survives past the original crash
+point** (§8, awaiting a scope/duration check-in before launching a
+possibly-long run) -- so this bug is not yet confirmed *fixed* in the
+scenario that found it, only shown not to regress the short window.
+Discovered as a side effect of S-013, but it is NOT about S-013's
+four-core-balance question — it's a correctness gap in the grid-anchored
+snap fix S-009 shipped, and it directly qualifies S-009's "Q=6660, 0.91x
+speedup, validated" conclusion.** This surfaced because the
 user asked, correctly, whether S-012/S-013's critical-path runs used too
 few instructions and should be extended to cover more of the ROI
 (`MAX_TICKS=2e8` only reaches ~74,588 instructions, essentially still
@@ -179,11 +188,169 @@ plausibly take the same `crossDomainSnap()` treatment as
    -- that's a documentation/conclusion-scoping question the user may want
    handled separately from the code fix.
 
-No code changes made in this investigation.
+## 7. Call-site audit (step 1 of §6, read-only, this session)
+
+Per S-009 §18/§23's precedent, audited every path that reaches
+`Layer::occupyLayer` for cross-domain reachability, using this project's
+*actual* instantiated topology (`x86_fs_mesi3_parallel_eventq.py` +
+`MESIThreeLevelCacheHierarchy`), not just the generic `BaseXBar` class
+hierarchy. No code was changed; this is groundwork for whichever of steps
+2-4 the user greenlights next.
+
+**Finding: `CoherentXBar` is not instantiated at all in this project's
+topology.** Ruby (`MESIThreeLevelCacheHierarchy`) never builds a
+`CoherentXBar`/`L2XBar`/`SystemXBar` -- confirmed by grepping
+`src/python/gem5/components/cachehierarchies/ruby/*.py` for `XBar` (no
+hits). The only `BaseXBar` subclass this project's binary ever builds is
+`IOXBar` (`= NoncoherentXBar`, `src/mem/XBar.py:209`), used as
+`X86Board.iobus` (`x86_board.py:119`). So for the purposes of this fork's
+actual operating point, only `NoncoherentXBar`'s three call chains matter;
+`CoherentXBar`'s four `occupyLayer` call sites
+(`coherent_xbar.cc:213/322/352/652/684`) are dead code here (still
+theoretically reachable if a future config adds a classic coherent xbar
+anywhere, but not exercised by anything this project runs today).
+
+**`occupyLayer` has three call chains, all ultimately in `xbar.cc`:**
+
+| Call chain | Layer | Reachable how (in this topology) | Cross-domain? |
+|---|---|---|---|
+| `recvTimingReq` → `succeededTiming` (`noncoherent_xbar.cc:171`) | `reqLayers` | `iobus.cpu_side_ports` ← `pci_host.up_request_port()` ← per-core Ruby `Sequencer`/RubyPort PIO forwarding (`Pc.py:109`, `x86_board.py:143-145`) | **Yes -- confirmed.** This is the exact call chain the crash backtrace shows (§1-2): the calling thread is whichever core domain (i+1) issued the PIO request; `iobus` itself sits on domain 0 (`eventq_index` never set for it in `_pre_instantiate`, so it keeps the default 0). Matches S-009's already-fixed `RubyPort.cc` PIO-forwarding edge -- same source domain, different downstream scheduling point that was missed. |
+| `recvTimingReq` → `failedTiming` (`noncoherent_xbar.cc:159-160`) | `reqLayers` | Same call chain as above, taken when `memSidePorts[...]->sendTimingReq(pkt)` returns false (peer busy) instead of true | **Yes, same hazard, not yet observed in a crash.** It's the failure branch of the identical cross-domain call stack -- `clockEdge(Cycles(1))` is computed by the same wrong-domain calling thread before `occupyLayer` schedules onto `iobus`'s domain-0 queue. No structural reason this branch is safer than the success branch; it just wasn't the branch taken in the run that crashed. |
+| `recvTimingResp` → `succeededTiming` (`noncoherent_xbar.cc:231`) | `respLayers` | `iobus.mem_side_ports` ← `pci_host`/south-bridge devices (IDE, PIT, RTC, serial, floppy, PCI config) -- all domain 0 per this project's domain map (`x86_fs_mesi3_parallel_eventq.py` docstring: "domain 0: DMA controllers + every device + uncore leftovers") | **No, domain-local in this topology.** Both the calling device and `iobus` are domain 0 -- same thread, so `curTick()`/`clockEdge()` agree. Not at risk *as currently wired*; would become at risk only if some mem-side device were ever moved off domain 0. |
+| `recvReqRetry` → `recvRetry` → `retryWaiting` → `occupyLayer(xbar.clockEdge())` (`xbar.cc:304`) | `reqLayers` | Same mem-side devices as above (domain 0) calling back to report a retry | **No, domain-local in this topology, same reasoning as `recvTimingResp`.** Note this call site is structurally different from the other two: it computes `until` from `xbar.clockEdge()` *inside* `Layer::retryWaiting()` rather than from a value the caller passed in -- but that doesn't change the hazard shape, since `clockEdge()`/`curTick()` still resolve via whatever `EventQueue` the *executing* thread is currently bound to (thread-local `curEventQueue()`), not necessarily the domain that owns `xbar`. If this call chain is ever reached from a cross-domain caller in some future topology, it has the identical bug. |
+
+**Conclusion for this project's current operating point (Q=6660,
+3-core... 4-core MESI_Three_Level FS):** exactly one of the four
+`occupyLayer` call chains needs the fix to stop the observed crash
+(`recvTimingReq` → `succeededTiming`, `reqLayers`), and one more shares
+its exact hazard on an untaken branch (`recvTimingReq` → `failedTiming`,
+same `reqLayers`). The other two (`respLayers` success path, `recvRetry`
+path) are safe *only because* every device this board attaches to
+`iobus.mem_side_ports` happens to live in domain 0 -- that's an artifact
+of this project's specific domain assignment (`_pre_instantiate` in
+`x86_fs_mesi3_parallel_eventq.py`), not a structural guarantee in
+`xbar.cc`/`noncoherent_xbar.cc` itself.
+
+**Implication for where a fix should live (not yet decided, flagging for
+whichever step comes next):** patching only the two `reqLayers` call
+sites in `NoncoherentXBar::recvTimingReq` would stop today's crash and
+match this project's actual reachability, but would repeat the exact
+mistake S-009 made twice already (§2-3 above) -- fixing at individual
+call sites that happen to be reachable *today* rather than at the shared
+low-level scheduling point (`Layer::occupyLayer` itself, `xbar.cc:165`,
+which every call chain funnels through). Wrapping the fix inside
+`occupyLayer` once would cover all four chains (including the two that
+are currently domain-local but not structurally guaranteed to stay that
+way) and the still-unaudited `CoherentXBar` chains for free, at the cost
+of a redundant snap on the two paths that don't need it today. This
+tradeoff -- narrow/precise vs. broad/future-proof -- is a design decision
+for step 2, not resolved by this audit.
+
+No code changes made in this investigation (audit only, per user's
+explicit scope decision this session -- steps 2-4 of §6 not started).
+
+## 8. Fix implemented (§6 steps 2, this session, user explicitly requested
+"wrap the fix inside occupyLayer itself, cover all four chains")
+
+Per the §7 tradeoff, the user chose the broad option: wrap the
+grid-anchored snap inside `Layer::occupyLayer()` itself rather than
+patching only the two call sites confirmed reachable today. This covers
+all four call chains (§7's table) plus the unaudited `CoherentXBar` chains,
+at the cost of a redundant (harmless) snap check on the two paths that
+don't need it in this project's current topology.
+
+**Change** (`src/mem/xbar.hh`, `src/mem/xbar.cc`): added
+`Layer<SrcType, DstType>::crossDomainSnap(Tick until) const`, same
+grid-anchored pattern as `BridgeBase::crossDomainSnap()`
+(`bridge.cc:57-68`) and `PacketQueue::schedSendEvent`
+(`packet_queue.cc:186-192`) -- `if (inParallelMode && curEventQueue() !=
+xbar.eventQueue())`, snap `until` up to the next `simQuantumStart +
+k*simQuantum` boundary. `occupyLayer()` now calls
+`until = crossDomainSnap(until);` immediately before
+`xbar.schedule(releaseEvent, until)`; the `occupancy` stat accumulation
+still uses the (now-snapped) `until` value, no change to that line's
+shape. Added `#include "base/intmath.hh"` to `xbar.cc` for `divCeil`
+(bridge.cc already includes it for the same reason).
+
+**Compiled**: `build/X86_MESI_Three_Level/gem5.opt`, `taskset -c
+0-53,56-91` (kept off the reserved `54-55`/`92-111` isolcpus ranges per
+`CLAUDE.md`) -- clean build, no warnings from the new code.
+
+**Quick regression check (this session)**: re-ran the exact S-009 §27
+short-window protocol (same checkpoint
+`x86-threads3-roi-classic`, `SIM_QUANTUM_TICKS=6660`, `MAX_TICKS=2e8`,
+serial on `taskset -c 54`, parallel/spin on `taskset -c 92` with
+`HOST_PIN_CPUS=92,93,94,95,96,97,98,99`) against the new build, one round
+each. Result: no assert/abort/panic in either arm, `simInsts=74062` in
+both (matches the S-009 §27 reference number exactly), and the two
+`stats.txt` (host* fields excluded) are **byte-identical** to each other.
+This confirms the fix is a no-op within the previously-validated short
+window -- exactly the expected outcome, since `crossDomainSnap` should
+only ever change behavior when a cross-domain call's `until` has actually
+drifted behind the target domain's clock, which this window never
+triggers (that's the whole reason S-014 needed a *longer* window to find
+the bug in the first place).
+
+**Not yet done**: the actual confirmation this bug fix targets --
+re-running the unbounded-window reproduction from §1 (no `MAX_TICKS`
+cap, same checkpoints) to see whether it now runs past the previous
+crash point (~646M ticks past restore) instead of asserting -- has
+**not** been run this session. That run's duration is unknown (the
+crash previously hit well before any guest-side `m5 exit`, but there is
+no data yet on how much further execution now proceeds, or whether it
+reaches the benchmark's actual end); per `CLAUDE.md`'s checkpoint
+convention this is exactly the kind of open-ended, possibly-long,
+first-of-its-kind verification step to confirm scope/duration
+expectations on before launching, rather than starting it unprompted.
+Also still not done: auditing/testing the `CoherentXBar` call sites
+(dead code in this project's topology, per §7, so lower priority), and
+reassessing the "0.91x, validated" conclusion's wording (§6 step 4).
+
+## 9. Confirmation run (§6 step 3, this session) -- original crash does
+not recur, but a second, unrelated bug (S-015) now blocks a full
+unbounded confirmation
+
+Per the user's explicit choice ("launch bounded past the old crash
+point," not a fully unbounded run), re-ran the same operating point as
+§1 (`CHECKPOINT_DIR=x86-threads3-roi-classic`, `SIM_QUANTUM_TICKS=6660`,
+`EVENTQ_BARRIER_MODE=spin`, `HOST_PIN_CPUS=92,93,94,95,96,97,98,99`)
+against the fixed build, bumped to `MAX_TICKS=2e9` (~3x past the
+original ~646M-ticks-past-restore crash point).
+
+- **Serial arm**: completed cleanly, `finalTick=5306177114066`,
+  `simInsts=1475264`.
+- **Parallel/spin arm, 4 runs**: **0 of 4 recurrences of this bug's
+  crash** (`assert(when >= getCurTick())` in `EventQueue::schedule`).
+  All 4 either completed cleanly to the same `finalTick` as serial, or
+  crashed with a **different** assert entirely, in a different function
+  (`PacketQueue::sendDeferredPacket`'s `assert(deferredPacketReady())`)
+  -- a new, non-deterministic bug, unrelated to this fix, written up
+  separately as [S-015](./S-015-packetqueue-retry-race-beyond-occupylayer-fix.md).
+
+This is a good sign for the `crossDomainSnap()` fix itself (§8) -- the
+exact crash it targeted did not come back even ~3x past where it
+previously fired 100% of the time -- but it is **not** the full
+confirmation §6 step 3 called for. A "clean run to completion" can no
+longer be treated as sufficient proof at this operating point, since a
+second, independent race (S-015) can now crash the same run for an
+unrelated reason. Full confirmation of this fix (a genuinely long or
+unbounded run with **zero** crashes of *any* kind) is blocked until
+S-015 is understood/resolved -- see S-015 §6 step 4, which loops back to
+this exact task.
+
+**Batch update (later session, S-015 repro-rate investigation)**: a
+follow-up batch of 16 more identical parallel/spin runs (S-015 §1a) added
+2 more S-015-class crashes (bringing the combined sample to 3 crashes in
+20 runs) and **zero** additional recurrences of this bug's original
+assert -- still 0 crashes of *this* specific bug across all 20 runs
+tested so far, reinforcing that the `crossDomainSnap()` fix itself is
+holding up; S-015 remains the sole blocker to calling this fix fully
+confirmed.
 
 ---
 
 **Related**: [S-009 §19-27](./S-009-raise-fs-quantum-past-iobus-edge-design.md),
 [S-013](./S-013-balanced-four-core-workload-checkpoint.md) (where this was
-found)
+found), [S-015](./S-015-packetqueue-retry-race-beyond-occupylayer-fix.md)
+(the new bug blocking full confirmation of §8's fix)
 **Return**: [INDEX.md](./INDEX.md)
