@@ -347,6 +347,36 @@ tested so far, reinforcing that the `crossDomainSnap()` fix itself is
 holding up; S-015 remains the sole blocker to calling this fix fully
 confirmed.
 
+## 10. §6 step 3 confirmed -- via S-015 §11.3's batch, not a fresh rerun
+
+S-015 was fixed (§11, tolerate-spurious-retry change, commit
+`c693e9777d`) and merged to `main` (`--no-ff`, `1bacbb0a7c`). Checking
+which commit this fix built on: S-015's fix commits (`c815c78fec`,
+`c693e9777d`) are both descendants of this spec's own fix commit
+(`a3e325afb5`, §8's `crossDomainSnap()` in `occupyLayer`) -- i.e. every
+build S-015 tested after its own fix already contained §8's fix too.
+
+That means S-015 §11.3's crash-confirmation batch -- same operating
+point as this spec's §9 (`x86-threads3-roi-classic`,
+`SIM_QUANTUM_TICKS=6660`, `MAX_TICKS=2e9`, spin arm, `HOST_PIN_CPUS=
+92-99`), run 20 times -- **is** the §6 step 3 confirmation this spec was
+waiting on, not a separate result that merely clears the way for one.
+Outcome: **20/20 clean, 0 crashes of any kind** (neither this bug's
+original `assert(when >= getCurTick())` nor S-015's), identical
+`simInsts=1475264`/`finalTick=5306177114066` across all 20 runs. S-015
+§11.3 says so explicitly: "This unblocks the S-014 confirmation."
+
+Decision this session (user-confirmed): treat that batch as the
+confirmation rather than re-running an identical experiment on the same
+code for a second data point. **§6 step 3 is done.**
+
+**Still open from §6**: step 4 (reassess whether S-009's "0.91x,
+validated" conclusion needs a formal caveat given the long-window crash
+history this spec and S-015 uncovered -- unrelated to whether the fix
+works, a documentation-scoping call for the user) and the `CoherentXBar`
+call-site audit (§7 -- dead code in this project's current topology, so
+low priority, still unaudited/untested).
+
 ---
 
 **Related**: [S-009 §19-27](./S-009-raise-fs-quantum-past-iobus-edge-design.md),
