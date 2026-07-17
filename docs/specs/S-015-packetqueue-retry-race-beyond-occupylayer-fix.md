@@ -69,14 +69,24 @@ hybrid is the chosen fix; full 5b deferral is rejected as this bug's
 fix (it cannot cover the confirmed `recvTimingResp`-path race without
 a flow-control protocol redesign, since `recvTiming*` returns a
 synchronous bool) and is retained only as a possible future
-architecture investigation. **§10 (2026-07-17): the §8 hybrid is now
+architecture investigation. **§10 (2026-07-17): the §8 hybrid was
 IMPLEMENTED on branch `s015-packetqueue-retry-race` (`src/mem/
-packet_queue.{hh,cc}` + the cache override in `src/mem/cache/base.cc`),
-builds clean, and passes the S-009 §27 short-window regression
-byte-identical (serial vs spin) with no deadlock. The crash-confirmation
-runs (§1a-style bare batch at MAX_TICKS=2e9 reaching the ~5.306e9
-historical crash tick, and the §7 TSan A/B re-run) are the remaining
-verification sub-phase — see §10.4.**
+packet_queue.{hh,cc}` + the cache override in `src/mem/cache/base.cc`) —
+it builds clean and is regression-neutral in the S-009 §27 short window
+(byte-identical serial vs spin, no deadlock), but the crash-confirmation
+batch FALSIFIED it: 2 crashes / 11 runs at MAX_TICKS=2e9, the SAME assert
+(`deferredPacketReady()`) at the SAME tick `5305999323366` as pre-fix,
+via `BaseXBar::Layer::releaseLayer`→`retryWaiting`→`sendDeferredPacket`
+on the crossbar's OWN-domain thread. The §8 hybrid does NOT fix the bug.
+Root reason (§10.5): the raced invariant is a CROSS-OBJECT one spanning
+`Layer` (under `layerLock`) and `PacketQueue` (under `pqLock`) — "port is
+waiting for retry" ⇎ "queue has a ready packet" is not atomic across the
+domain boundary, and no per-object leaf lock makes it so. This is the
+§9.4 falsifier-2 condition; the indicated next direction is the
+domain-boundary-channel architecture (5b) as its own S-NNN, or a
+narrower "tolerate spurious retry" semantic change (§10.6) — both are
+user decisions, NOT started. Branch kept as a negative result, not
+merged to `main`.**
 
 ## 1. What happened
 
@@ -1397,7 +1407,7 @@ set across `checkConflictingSnoop()`, which itself calls
   `pqLock` released, so `pqLock` has no outgoing edges and cannot be in a
   deadlock cycle.
 
-### 10.3 Verification done so far — PASS (short window)
+### 10.3 Short-window regression — PASS
 
 S-009 §27 short-window regression, this build
 (`build/X86_MESI_Three_Level/gem5.opt`, checkpoint
@@ -1410,29 +1420,97 @@ S-009 §27 short-window regression, this build
   change), and `stats.txt` **byte-identical** to serial (excluding
   `host*` lines).
 
-This confirms the fix is a no-op in the already-validated window and
-that the B2 handoff is timing-neutral there — i.e. §9.4 falsifier-1 is
-NOT triggered. It does **not** yet confirm the fix stops the crash: the
-2e8 window ends at tick ≈5.3046e9, short of the ≈5.306e9 historical
-crash cluster.
+So the fix is a no-op in the already-validated window and the B2 handoff
+is timing-neutral there (§9.4 falsifier-1 not triggered). But the 2e8
+window ends at tick ≈5.3046e9, short of the ≈5.306e9 crash cluster —
+this proves nothing about the crash itself.
 
 (Operational note for the next runner: the config script's
 `HOST_PIN_CPUS` is comma-separated and `int()`-parsed per element —
 pass `92,93,…,99`, not the range `92-99`, or it aborts with a
 `ValueError` before simulating.)
 
-### 10.4 Verification still to do (the crash-confirmation sub-phase)
+### 10.4 Crash-confirmation batch — **FAIL. The §8 hybrid does NOT fix the bug.**
 
-Per the §8.8 / §9.5 plan, still outstanding (qualitatively riskier —
-long runs, possible live debugging — so gated on a checkpoint per the
-project working style):
-- **§1a-style bare-repro batch at `MAX_TICKS=2e9`** (reaches the
-  ≈5.306e9 crash tick): expect **0 crashes / 20 runs** (pre-fix rate was
-  3/20 ≈ 15%).
-- **§7 TSan A/B re-run** on `build/X86_MESI_Three_Level_TSAN/gem5.opt`:
-  expect the four §8.7 race signatures to disappear and the `diag2`/
-  `diag4` standalone repro to go clean (use the flat launch form, not the
-  wrapper script — §7.4; set `TSAN_OPTIONS=halt_on_error=0`).
+Bare-repro batch at `MAX_TICKS=2e9` (reaches the crash cluster), same
+build/checkpoint/pinning as §1a:
+
+- **2 crashes in 11 completed runs (~18%)** — the same order of
+  magnitude as the pre-fix 3/20 ≈ 15% rate. (Batch was cut to 11 by a
+  wall-clock cap; the rate is already conclusive.)
+- Both crashes are **byte-identical to the pre-fix crash**: `Assertion
+  'deferredPacketReady()' failed` in `PacketQueue::sendDeferredPacket()`
+  (now `packet_queue.cc:296`, the first locked block), at the **exact
+  historical tick `5305999323366`**, via `BaseXBar::Layer<RequestPort,
+  ResponsePort>::releaseLayer()` → `retryWaiting()` → … →
+  `sendDeferredPacket()`, dispatched from the crossbar's **own domain**
+  thread (`EventQueue::serviceOne` → `doSimLoop`).
+- A single 2e9 run before the batch, and 9 of the 11 batch runs,
+  completed clean to `finalTick=5306177114066` (past the crash tick).
+
+### 10.5 Why the hybrid was insufficient — a leaf lock cannot fix a cross-object, cross-domain ordering violation
+
+The §7 TSan races on `PacketQueue` state are **real**, and `pqLock` does
+serialize them — but serializing the memory accesses does not stop the
+crash, because the crash is not (only) a torn-memory data race. The
+crashing path runs **entirely same-domain** on the crossbar's own thread
+(`releaseLayer` → `retryWaiting` → `retry` → `sendDeferredPacket`), so
+neither `pqLock`'s cross-domain serialization nor the B2 scheduling
+handoff even engages on it.
+
+The mechanism is a **cross-object invariant** that spans two separately
+locked objects: the xbar `Layer`'s retry bookkeeping (under `layerLock`,
+incl. the §1c `releaseLayer` addition) believes a port is waiting for a
+retry, so `retryWaiting` delivers one; the port's `PacketQueue` (under
+`pqLock`) has, by then, no ready deferred packet — because a
+cross-domain thread sent/consumed it, at relaxed timing, in an
+interleaving the two independent leaf locks permit. "`Layer` thinks the
+port is waiting" and "`PacketQueue` has a ready packet" must be **atomic
+together across the domain boundary**, and no per-object leaf lock makes
+them so. The crash tick is deterministic (a specific simulated event);
+the crash-vs-clean *outcome* depends on host-thread interleaving at that
+tick — exactly S-015 §1a's characterization, unchanged by this fix.
+
+Note this is *not* merely the lock-gap the restructure introduced
+between `retry()`'s unlock and `sendDeferredPacket()`'s re-lock: the
+pre-fix crash had **no locks at all** on this path yet crashed at the
+identical tick, so merging those two lock regions into one atomic
+retry-core would not close it.
+
+### 10.6 Disposition and next direction
+
+This is the **§9.4 falsifier-2 condition**, reached without even needing
+post-fix TSan: the bug family continues, and the raced invariant lives
+*between* objects (`Layer`↔`PacketQueue`), not inside one. Per §9.4 the
+indicated response is to stop bolting per-object locks on and open the
+**domain-boundary channel investigation** (§9.2 ground 2 / §6 step 5b's
+architecture) as its own S-NNN spec — defer cross-domain retry/response
+delivery to the owning domain so these objects are single-threaded
+again, rather than adding lock #5.
+
+A narrower, cheaper alternative to weigh first (not yet analyzed):
+make `retry()` / `sendDeferredPacket()` **tolerate a spurious
+not-ready retry** (early-return instead of `assert(deferredPacketReady())`)
+— i.e. treat "the packet was already sent by another path" as benign
+under the relaxed model. That is a semantic change to the flow-control
+contract and needs its own correctness argument (could it drop a real
+send?), so it is a decision for the user, not an unattended next step.
+
+**Branch state:** `s015-packetqueue-retry-race` holds the implemented
+hybrid as a **negative result** — builds clean, regression-neutral in
+the short window, but does not fix the crash. It is isolated on its own
+branch (not merged to `main`). Keep it as the research record of "the
+leaf-lock hybrid was implemented and empirically shown insufficient";
+whether any of it is retained depends on the chosen next direction.
+
+### 10.7 Verification still not run
+
+- **§7 TSan A/B re-run** was not reached — the plain (non-TSan) batch
+  already falsified the fix, so a TSan run would only characterize
+  *which* residual races remain, not whether the crash is fixed (it
+  isn't). Worth doing only if the next direction is to understand the
+  `Layer`↔`PacketQueue` interleaving in more detail before designing the
+  channel fix.
 
 ---
 
