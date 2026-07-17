@@ -69,7 +69,57 @@ hybrid is the chosen fix; full 5b deferral is rejected as this bug's
 fix (it cannot cover the confirmed `recvTimingResp`-path race without
 a flow-control protocol redesign, since `recvTiming*` returns a
 synchronous bool) and is retained only as a possible future
-architecture investigation. Implementation not yet started.**
+architecture investigation. **§10 (2026-07-17): the §8 hybrid was
+IMPLEMENTED on branch `s015-packetqueue-retry-race` (`src/mem/
+packet_queue.{hh,cc}` + the cache override in `src/mem/cache/base.cc`) —
+it builds clean and is regression-neutral in the S-009 §27 short window
+(byte-identical serial vs spin, no deadlock), but the crash-confirmation
+batch FALSIFIED it: 2 crashes / 11 runs at MAX_TICKS=2e9, the SAME assert
+(`deferredPacketReady()`) at the SAME tick `5305999323366` as pre-fix,
+via `BaseXBar::Layer::releaseLayer`→`retryWaiting`→`sendDeferredPacket`
+on the crossbar's OWN-domain thread. The §8 hybrid does NOT fix the bug.
+Root reason (§10.5): the raced invariant is a CROSS-OBJECT one spanning
+`Layer` (under `layerLock`) and `PacketQueue` (under `pqLock`) — "port is
+waiting for retry" ⇎ "queue has a ready packet" is not atomic across the
+domain boundary, and no per-object leaf lock makes it so.**
+
+**§11 (2026-07-17): the crash is now FIXED by adding the
+tolerate-spurious-retry semantic change ON TOP of the hybrid.**
+`retry()`/`sendDeferredPacket()` no longer assert on a not-ready retry —
+they count + log the relaxation and recover (reschedule the future-tick
+head for its ready time; drop nothing). The hybrid `pqLock` is kept (it
+makes the §7 TSan data races well-defined; the tolerate change handles
+the §10.5 cross-object ordering the lock can't). **Result: 20/20 clean
+at MAX_TICKS=2e9 (0 crashes vs pre-fix ~15-18%); 4 relaxation events
+total, all at the exact historical crash tick 5305999323366, all "head
+not yet ready" on a RubyPort PIO RespPacketQueue; all 20 runs
+outcome-identical (simInsts=1475264) → the relaxation is
+OUTCOME-NEUTRAL. Short-window regression byte-identical, 0 relaxation
+events.** The relaxation is deliberate + quantified (atomic counters +
+capped warn + DPRINTF). §9.4 falsifier-2 resolved by this narrow change,
+not by the 5b architecture. Branch `s015-packetqueue-retry-race` holds
+the working fix. Full detail: §11.**
+
+**§12 (2026-07-17): the optional TSan hygiene re-run is now DONE — race
+signatures confirmed gone, plus a NEW finding that revises §7.4.** Fresh
+TSAN build off this branch's tip, re-ran the §7 A/B (flat launch, not
+§7.4's wrapper script). **Both spin arms ran the full 2e9-tick window
+clean (`finalTick` matching the historical reference) with ZERO TSan
+race reports** — the four §7/§8.7-confirmed races are gone, confirming
+`pqLock` actually serializes them (not just coincidentally avoiding
+them). One spin arm hit a tolerate-spurious relaxation event at the
+exact historical crash tick with no accompanying race report, as
+expected. **Both serial arms hung** (frozen `utime`,
+`wchan=futex_wait_queue`, no crash marker) — same signature as §7.4, but
+this time under the *flat* launch method §7.4's `diag2/3/4` used
+without issue, which **disproves §7.4's "wrapper-script launch"
+hypothesis** for the hang (it recurs regardless of launch method) and
+points instead at a genuine TSan-build-specific issue, still not
+root-caused. Not the S-015 race (serial mode = one thread, no
+cross-domain concurrency possible) — a separate, tooling-only problem.
+Branch is unchanged by this section (measurement only) and is now
+**ready to propose for `--no-ff` merge to `main`**, TSan hygiene pass
+included. Full detail: §12.
 
 ## 1. What happened
 
@@ -1330,6 +1380,400 @@ items) and its verification (§8.8's plan: TSan A/B re-run expecting the
 four §8.7 signatures to disappear, §1a-style bare batch expecting 0/20,
 S-009 §27 byte-identical short-window regression) are the next
 sub-phase and were not started in the deciding session.
+
+## 10. Implementation of the §8 hybrid (2026-07-17, branch `s015-packetqueue-retry-race`)
+
+Implemented per the §9 decision and the §8 sketch. Branch created off
+`main` with its own worktree/tmpfs per ADR 0001 (the S-015 number was
+already claimed, so no new INDEX row).
+
+### 10.1 What changed
+
+`src/mem/packet_queue.{hh,cc}`:
+- New state (§8.2): `mutable UncontendedMutex pqLock` (strict leaf) and
+  `bool sending` (protected, so the cache override can use them);
+  `EventFunctionWrapper crossWakeEvent` + `std::atomic<bool> wakePending`
+  and a private `processCrossWake()` for the B2 handoff.
+- `retry()` — thin locked wrapper: clears `waitingOnRetry` under `pqLock`,
+  then calls `sendDeferredPacket()` with the lock released (§8.3).
+- `schedSendTiming()` — the `transmitList` insert (and the 1024-packet
+  sanity check) now run under `pqLock`; `schedSendEvent()` is called after
+  the lock is released, and only on the emplace-front branch as before.
+- `schedSendEvent()` — restructured into §8.5: a `pqLock`-guarded snapshot
+  gate (`waitingOnRetry || sending` → hold off), then the MaxTick/drain
+  branch (reads `transmitList.empty() && !sending` under lock), then the
+  B1 same-domain path (touches `sendEvent` directly, owner-thread-only) vs
+  the B2 cross-domain path (snap to quantum + `crossWakeEvent` via
+  `asyncInsert`, guarded by `wakePending.exchange`).
+- `processCrossWake()` — owner-thread callback: clears `wakePending`,
+  reads `deferredPacketReadyTime()` under lock, calls `schedSendEvent()`
+  (now on the B1 path).
+- `sendDeferredPacket()` — the §8.4 pop-under-lock / send-unlocked /
+  settle-under-lock structure with the `sending` guard; `schedSendEvent()`
+  called only on success, lock released.
+- `processSendEvent()` — dropped the redundant unlocked `assert(!
+  waitingOnRetry)` (would be a TSan-flagged read vs `retry()`);
+  `sendDeferredPacket()` asserts it under lock.
+- `drain()` — now returns Drained only if `transmitList.empty() &&
+  !sending` under lock (§8.8 item c).
+
+`src/mem/cache/base.cc` — `BaseCache::CacheReqPacketQueue::
+sendDeferredPacket()` (§8.8 item d): adopts the same discipline —
+`waitingOnRetry` read/written under `pqLock`, `sending` held only around
+the outbound `entry->sendPacket(cache)`. `sending` is deliberately NOT
+set across `checkConflictingSnoop()`, which itself calls
+`schedSendEvent()` (that would no-op under the `sending` gate).
+
+### 10.2 Design points worth noting for a future reader
+
+- The query methods that only *read* `transmitList` (`checkConflict`,
+  `trySatisfyFunctional`, `size`, the public `deferredPacketReadyTime`,
+  `deferredPacketReady`) are intentionally left unlocked: they are called
+  from within `pqLock`-held regions (`sendDeferredPacket`,
+  `processCrossWake`) and `UncontendedMutex` is non-recursive, so locking
+  them would self-deadlock. This matches §8.2's "lock only the mutations"
+  invariant. They were not in the §8.7 confirmed-race set; if post-fix
+  TSan flags one, that is the §9.4 falsifier-2 condition, to be recorded,
+  not silently patched.
+- Lock is a strict leaf (§8.6): every outbound call (`sendTiming`,
+  `em.schedule/reschedule`, `signalDrainDone`, DPRINTF) is made with
+  `pqLock` released, so `pqLock` has no outgoing edges and cannot be in a
+  deadlock cycle.
+
+### 10.3 Short-window regression — PASS
+
+S-009 §27 short-window regression, this build
+(`build/X86_MESI_Three_Level/gem5.opt`, checkpoint
+`x86-threads3-roi-classic`, `SIM_QUANTUM_TICKS=6660`,
+`MAX_TICKS=2e8`):
+- serial (`taskset -c 54`): clean, `simInsts=74062` (matches the S-009
+  §27 reference).
+- parallel/spin (`taskset -c 92-99`, `HOST_PIN_CPUS=92,93,…,99`): clean,
+  `simInsts=74062`, **no deadlock** (the primary risk of a locking
+  change), and `stats.txt` **byte-identical** to serial (excluding
+  `host*` lines).
+
+So the fix is a no-op in the already-validated window and the B2 handoff
+is timing-neutral there (§9.4 falsifier-1 not triggered). But the 2e8
+window ends at tick ≈5.3046e9, short of the ≈5.306e9 crash cluster —
+this proves nothing about the crash itself.
+
+(Operational note for the next runner: the config script's
+`HOST_PIN_CPUS` is comma-separated and `int()`-parsed per element —
+pass `92,93,…,99`, not the range `92-99`, or it aborts with a
+`ValueError` before simulating.)
+
+### 10.4 Crash-confirmation batch — **FAIL. The §8 hybrid does NOT fix the bug.**
+
+Bare-repro batch at `MAX_TICKS=2e9` (reaches the crash cluster), same
+build/checkpoint/pinning as §1a:
+
+- **2 crashes in 11 completed runs (~18%)** — the same order of
+  magnitude as the pre-fix 3/20 ≈ 15% rate. (Batch was cut to 11 by a
+  wall-clock cap; the rate is already conclusive.)
+- Both crashes are **byte-identical to the pre-fix crash**: `Assertion
+  'deferredPacketReady()' failed` in `PacketQueue::sendDeferredPacket()`
+  (now `packet_queue.cc:296`, the first locked block), at the **exact
+  historical tick `5305999323366`**, via `BaseXBar::Layer<RequestPort,
+  ResponsePort>::releaseLayer()` → `retryWaiting()` → … →
+  `sendDeferredPacket()`, dispatched from the crossbar's **own domain**
+  thread (`EventQueue::serviceOne` → `doSimLoop`).
+- A single 2e9 run before the batch, and 9 of the 11 batch runs,
+  completed clean to `finalTick=5306177114066` (past the crash tick).
+
+### 10.5 Why the hybrid was insufficient — a leaf lock cannot fix a cross-object, cross-domain ordering violation
+
+The §7 TSan races on `PacketQueue` state are **real**, and `pqLock` does
+serialize them — but serializing the memory accesses does not stop the
+crash, because the crash is not (only) a torn-memory data race. The
+crashing path runs **entirely same-domain** on the crossbar's own thread
+(`releaseLayer` → `retryWaiting` → `retry` → `sendDeferredPacket`), so
+neither `pqLock`'s cross-domain serialization nor the B2 scheduling
+handoff even engages on it.
+
+The mechanism is a **cross-object invariant** that spans two separately
+locked objects: the xbar `Layer`'s retry bookkeeping (under `layerLock`,
+incl. the §1c `releaseLayer` addition) believes a port is waiting for a
+retry, so `retryWaiting` delivers one; the port's `PacketQueue` (under
+`pqLock`) has, by then, no ready deferred packet — because a
+cross-domain thread sent/consumed it, at relaxed timing, in an
+interleaving the two independent leaf locks permit. "`Layer` thinks the
+port is waiting" and "`PacketQueue` has a ready packet" must be **atomic
+together across the domain boundary**, and no per-object leaf lock makes
+them so. The crash tick is deterministic (a specific simulated event);
+the crash-vs-clean *outcome* depends on host-thread interleaving at that
+tick — exactly S-015 §1a's characterization, unchanged by this fix.
+
+Note this is *not* merely the lock-gap the restructure introduced
+between `retry()`'s unlock and `sendDeferredPacket()`'s re-lock: the
+pre-fix crash had **no locks at all** on this path yet crashed at the
+identical tick, so merging those two lock regions into one atomic
+retry-core would not close it.
+
+### 10.6 Disposition and next direction
+
+This is the **§9.4 falsifier-2 condition**, reached without even needing
+post-fix TSan: the bug family continues, and the raced invariant lives
+*between* objects (`Layer`↔`PacketQueue`), not inside one. Per §9.4 the
+indicated response is to stop bolting per-object locks on and open the
+**domain-boundary channel investigation** (§9.2 ground 2 / §6 step 5b's
+architecture) as its own S-NNN spec — defer cross-domain retry/response
+delivery to the owning domain so these objects are single-threaded
+again, rather than adding lock #5.
+
+A narrower, cheaper alternative to weigh first (not yet analyzed):
+make `retry()` / `sendDeferredPacket()` **tolerate a spurious
+not-ready retry** (early-return instead of `assert(deferredPacketReady())`)
+— i.e. treat "the packet was already sent by another path" as benign
+under the relaxed model. That is a semantic change to the flow-control
+contract and needs its own correctness argument (could it drop a real
+send?). **→ This alternative was chosen and IS the working fix — see
+§11. It stops the crash (0/20) and is outcome-neutral.**
+
+**Branch state (as of §10):** `s015-packetqueue-retry-race` holds the
+implemented hybrid as a **negative result** on its own — builds clean,
+regression-neutral in the short window, but does not fix the crash.
+**§11 then adds the tolerate-spurious change on top of the hybrid, and
+that combination fixes it.**
+
+### 10.7 Verification still not run
+
+- **§7 TSan A/B re-run** was not reached — the plain (non-TSan) batch
+  already falsified the fix, so a TSan run would only characterize
+  *which* residual races remain, not whether the crash is fixed (it
+  isn't). Worth doing only if the next direction is to understand the
+  `Layer`↔`PacketQueue` interleaving in more detail before designing the
+  channel fix.
+
+## 11. The working fix: hybrid pqLock + tolerate-spurious-retry (2026-07-17)
+
+Chose the §10.6 alternative and added it **on top of** the §8 hybrid.
+The two pieces are complementary, and both are kept:
+- **`pqLock` (the §8 hybrid)** makes the concurrent accesses to
+  `transmitList`/`waitingOnRetry` well-defined — the §7 TSan races are
+  real data races (UB) and the leaf lock removes them. It does not, by
+  itself, stop the crash (§10.4/§10.5).
+- **Tolerate-spurious-retry** handles the cross-object ordering that no
+  per-object lock can (§10.5): when a retry / fired `sendEvent` reaches a
+  `PacketQueue` with no ready head, recover instead of asserting.
+
+### 11.1 What changed (`src/mem/packet_queue.cc`)
+
+- `retry()` — replaced `assert(waitingOnRetry)` with tolerance: if not
+  actually awaiting a retry, count + log and return (a ready packet with
+  `waitingOnRetry==false` always already has a `sendEvent` scheduled, so
+  nothing is stranded).
+- `sendDeferredPacket()` — replaced `assert(deferredPacketReady())` with
+  tolerance: if the head is not ready, count + log, then re-derive the
+  schedule from current state via `schedSendEvent(deferredPacketReadyTime())`
+  — reschedules the (future-tick) head for its ready time, or routes an
+  empty queue to the drain check. **Drops nothing.**
+- Two file-scope `std::atomic<uint64_t>` counters
+  (`numSpuriousRetries`, `numSpuriousDeferredSends`), a `DPRINTF`
+  (`PacketQueue` flag) per event, and a `warn()` per event capped at 100
+  (`maxRelaxationWarnings`) so a pathological workload cannot flood the
+  log while the counters keep counting.
+
+### 11.2 Correctness argument (why tolerating drops no traffic)
+
+The relaxation only triggers when `!deferredPacketReady()`, i.e. there is
+no packet that is *ready to send now*. Two sub-cases, both non-lossy:
+- **Head not yet ready (future tick):** the packet is still on
+  `transmitList`; `schedSendEvent(deferredPacketReadyTime())` schedules a
+  `sendEvent` for its ready tick, so it is delivered then. This is the
+  *only* case observed empirically (§11.3).
+- **Queue empty:** the packet was already sent by another path; there is
+  nothing to send. Routes to the drain check.
+
+The upstream `assert(deferredPacketReady())` encodes a *single-thread*
+invariant (a retry is delivered exactly when the head is ready). Under
+the project's deliberately-relaxed cross-domain timing, a retry can be
+delivered up to a quantum early relative to this domain's clock; tolerate
++ reschedule restores the ready-time delivery the single-thread model
+would have had. It is the same philosophy as the existing grid-anchored
+`schedSendEvent` snap (S-009 §19): a cross-domain-early time is corrected
+to a locally-valid one, not dropped.
+
+### 11.3 Verification — PASS
+
+Build `build/X86_MESI_Three_Level/gem5.opt`, checkpoint
+`x86-threads3-roi-classic`, `SIM_QUANTUM_TICKS=6660`.
+
+- **Short-window regression (`MAX_TICKS=2e8`)**: serial (`-c 54`) vs
+  spin (`-c 92-99`) `stats.txt` **byte-identical** (excl `host*`),
+  `simInsts=74062`, **0 relaxation events**, no deadlock. The change is a
+  no-op in the already-validated window.
+- **Crash-confirmation batch (`MAX_TICKS=2e9`, 20 runs)**: **20/20
+  clean, 0 crashes** (pre-fix and the hybrid-alone both crashed
+  ~15-18%). **4 relaxation events total** (in 4 distinct runs; the other
+  16 hit none — the spurious condition is itself interleaving-dependent,
+  matching the crash's non-determinism). **Every** event was identical:
+  `tolerated spurious deferred send on
+  board.cache_hierarchy.ruby_system.l1_controllers0.sequencer.
+  pio-response-port-RespPacketQueue -- head not yet ready at tick
+  5305999323366` — the **exact historical crash tick**, on a RubyPort PIO
+  response queue (consistent with §1b's cross-domain PIO-response
+  finding). So the relaxation fires at precisely the point the old assert
+  fired.
+- **Outcome-neutral**: all 20 runs — the 4 relaxed and the 16 not —
+  produced **identical `simInsts=1475264`** and identical
+  `finalTick=5306177114066`. The tolerated reschedule does not perturb
+  the simulation result.
+
+This refines §10.5's mechanism guess: the observed spurious condition is
+**"head not yet ready" (future tick)**, not "queue empty" — a pure
+cross-domain timing skew (the retry arrives before this domain's clock
+reaches the head's tick), which is exactly what the relaxed model
+produces and what the reschedule corrects.
+
+### 11.4 Status, caveats, open items
+
+- **Crash fixed** at this operating point: 0/20 at 2e9, outcome-neutral,
+  regression-clean. This unblocks the S-014 confirmation and any real
+  steady-state run at Q=6660 that was previously blocked by S-015.
+- The relaxation is **deliberate and quantified** (counters + capped
+  `warn` + `DPRINTF`); its rate here is ~0.2 events/run, all at one tick.
+  Watch the counter on other workloads/quanta — a high rate would signal
+  the cross-domain skew is large enough to matter and deserves scrutiny
+  (not silent tolerance).
+- **Not yet done**: (a) the §7 TSan A/B re-run — now worth doing to
+  confirm the `pqLock` half removed the four §8.7 race signatures cleanly
+  (the crash is already gone, so this is race-hygiene confirmation, not
+  the crash gate); (b) longer-than-2e9 / full-ROI runs; (c) the
+  serial-mode perf check for the `pqLock` fast-path cost (§9.3) if this is
+  ever headed upstream. None blocks the "S-015 crash is fixed"
+  conclusion.
+- **Decision-vs-§9**: §9 chose the hybrid and rejected full 5b deferral.
+  Tolerate-spurious is *not* full 5b — it is a local, outcome-neutral
+  invariant relaxation (already flagged as the cheap alternative in
+  §10.6), and it composes with the hybrid rather than replacing it. The
+  §9.4 falsifier-2 that §10 hit is resolved by this narrow change, not by
+  the domain-boundary-channel architecture (which remains the right move
+  only if a *future* workload shows this relaxation is lossy or its rate
+  unacceptable).
+
+**Branch state:** `s015-packetqueue-retry-race` now holds the **working
+fix** (hybrid + tolerate-spurious), two-plus commits, verified as above.
+Ready to propose for merge to `main` (`--no-ff`) pending the user's call
+on whether to run the TSan hygiene pass first.
+
+---
+
+**Related**: [S-014](./S-014-occupylayer-crossdomain-crash-beyond-tested-window.md)
+(where this was found, while confirming §8's fix), [S-009 §18-25](./S-009-raise-fs-quantum-past-iobus-edge-design.md)
+(the `layerLock`/`pioLock` precedent), [S-011](./S-011-consumer-lock-owner-race-audit.md)
+(prior non-deterministic-race investigation in this project, including
+the "designed a stress test, user chose not to run it" precedent)
+
+## 12. §11.4 item (a) done: TSan A/B re-run — race-hygiene CONFIRMED clean,
+and a separate finding that revises §7.4's launch-method hypothesis
+
+Per §11.4's remaining open item, re-ran the §7 TSan A/B protocol against
+the current branch tip (`c693e9777d`, §11's hybrid `pqLock` +
+tolerate-spurious-retry fix in place) — not to re-check the crash (already
+fixed, §11.3) but to confirm the four §8.7 TSan-confirmed race signatures
+are actually gone now that `pqLock` serializes `PacketQueue`'s state.
+
+**Build**: fresh `build/X86_MESI_Three_Level_TSAN/gem5.opt` (this branch's
+tmpfs build dir had no prior TSAN variant), `taskset -c 0-53,56-91` (off
+the reserved isolcpus ranges), clean build. Smoke-tested
+(`MAX_TICKS=1e6`) before committing to the full run — exit 0, no issues.
+
+**Launch method**: used the flat form (`env VAR=... taskset -c N binary
+-d dir script > log 2>&1 &`) throughout, per §7.4's recorded lesson, not
+the nested wrapper script blamed there for the serial hang.
+
+**A/B layout**: same operating point as every S-015 batch
+(`x86-threads3-roi-classic`, `SIM_QUANTUM_TICKS=6660`, `MAX_TICKS=2e9`,
+`TSAN_OPTIONS=halt_on_error=0`) — `spin1`→core 92 + `HOST_PIN_CPUS=
+92,93,...,99`, `spin2`→core 100 + `HOST_PIN_CPUS=100,101,...,107`,
+`serial1`→core 54, `serial2`→core 55.
+
+### 12.1 Spin arms: BOTH clean, ZERO TSan race reports — the four §8.7
+signatures are gone
+
+Both `spin1` and `spin2` ran the full `MAX_TICKS=2e9` window (spanning the
+historical crash-tick cluster at `5305999323366`) to completion:
+`finalTick=5306177114066` in both, byte-identical to the long-established
+serial reference. **Zero `WARNING: ThreadSanitizer: data race` lines and
+zero `SUMMARY: ThreadSanitizer` lines in either log** — none of the four
+§8.7-confirmed races (`waitingOnRetry` read/write, `transmitList` size,
+`retry()`/`deferredPacketReady()`, the `eventq.cc` reschedule path)
+reappeared. This is the race-hygiene confirmation §11.4 flagged as
+outstanding: `pqLock` (plus the B2 handoff) genuinely serializes the
+races TSan caught in §7, not merely coincidentally avoiding them.
+
+`spin1` additionally logged **one** tolerate-spurious relaxation event,
+at the **exact historical crash tick** `5305999323366`, on the same hot
+object as §11.3 (`board.cache_hierarchy.ruby_system.l1_controllers0.
+sequencer.pio-response-port-RespPacketQueue`, "head not yet ready") — and
+critically, **no TSan race report accompanies it**: the relaxation path
+itself is racing against nothing, consistent with §11's design (the
+cross-object `Layer`↔`PacketQueue` ordering issue §10.5 identified was
+never a data race to begin with, just an ordering assumption violated
+under relaxed cross-domain timing). `spin2` logged zero relaxation
+events, matching §11.3's "interleaving-dependent, not every run hits it"
+characterization.
+
+### 12.2 Serial arms: BOTH hung — same signature as §7.4, but this
+DISPROVES §7.4's leading "wrapper-script launch" hypothesis
+
+`serial1`/`serial2` (flat-launched, not wrapper-launched) both hung:
+confirmed via a direct 30-second `/proc/<pid>/stat` `utime` recheck on
+each (zero movement, `3758`→`3758` and `3762`→`3762`), single thread,
+`wchan=futex_wait_queue` — the identical signature §7.4 found for the
+wrapper-launched `serial1`/`serial2` that session. No crash/assert/panic
+marker in either log; both `stats.txt` are 0 bytes (killed mid-run, not a
+clean exit). Killed both via `SIGTERM` after confirming zero progress,
+same handling as §7.4.
+
+**This is new information, not a repeat of §7.4**: that session's two
+live hypotheses for the hang were (a) a TSan-build-specific issue
+independent of this investigation, or (b) something about the specific
+`nohup driver.sh -> function(){...} & -> wait` wrapper-script launch
+structure. This session used the flat launch form throughout (the same
+form §7.4's `diag2/3/4` used successfully, no hangs) — **and the serial
+hang still occurred**. That rules out (b) as the (or at least *a*)
+explanation: the hang is not specific to the wrapper-script launch
+structure. Hypothesis (a) — a genuine TSan-build-specific issue (TSan-
+internal deadlock, or an interaction between TSan's instrumentation and
+some gem5 primitive that assumes real wall-clock progress, e.g. a
+spin-wait or timeout path that never fires under TSan's slowdown) — is
+now the better-supported explanation, though still not root-caused.
+
+**Not the S-015 race, same reasoning as §7.4**: serial mode has exactly
+one `EventQueue`/one host thread (`inParallelMode` false), so no
+cross-domain race of any kind is possible — this hang cannot be a variant
+of S-015's bug. It is a separate, TSan-build-specific problem, now with
+one more data point (launch-method-independent) but still unresolved.
+
+### 12.3 Correctness cross-check
+
+The serial arms' hang means they don't provide a same-session serial
+`finalTick` to diff against — but `spin1`/`spin2`'s
+`finalTick=5306177114066` already matches the long-established historical
+serial reference (S-015 §1, §7.3's `diag3`, §11.3) exactly, serving the
+same cross-check purpose §7.4's `diag3` served when its wrapper-launched
+serial arms hung.
+
+### 12.4 Bottom line
+
+**§11.4 item (a) is done**: the `pqLock` half of the §8/§11 fix is
+TSan-confirmed to have actually closed the four races §7 found — this
+was race-hygiene confirmation, not a crash gate (the crash itself was
+already fixed and re-confirmed clean here as a side effect). **The
+TSan-build serial-mode hang is a distinct, still-unresolved, tooling-only
+issue** — unrelated to S-015's correctness, but real, and now confirmed
+independent of the wrapper-vs-flat launch-method question §7.4 left open.
+Anyone running this project's TSan protocol under the serial arm should
+expect to need to detect and kill a hang (utime-frozen +
+`futex_wait_queue`, no crash marker) rather than assume a long runtime is
+just slow.
+
+**Branch state**: `s015-packetqueue-retry-race` unchanged by this
+section (measurement only, no code changes) — still holds the working
+fix (§8 hybrid + §11 tolerate-spurious), now with the TSan hygiene pass
+also complete. Ready to propose for merge to `main` (`--no-ff`).
 
 ---
 

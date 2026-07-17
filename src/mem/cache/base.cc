@@ -2722,35 +2722,55 @@ BaseCache::MemSidePort::recvFunctionalSnoop(PacketPtr pkt)
 void
 BaseCache::CacheReqPacketQueue::sendDeferredPacket()
 {
-    // sanity check
-    assert(!waitingOnRetry);
-
-    // there should never be any deferred request packets in the
-    // queue, instead we resly on the cache to provide the packets
-    // from the MSHR queue or write queue
-    assert(deferredPacketReadyTime() == MaxTick);
+    // This override of PacketQueue::sendDeferredPacket adopts the same
+    // pqLock/sending guard discipline as the base (S-015 section 8.8 item d):
+    // waitingOnRetry is read/written under pqLock, and `sending` is held only
+    // around the outbound entry->sendPacket() so a concurrent scheduleSend
+    // does not double-schedule. sending is deliberately NOT set across
+    // checkConflictingSnoop, which itself schedules a send (schedSendEvent
+    // would no-op if sending were true).
+    {
+        std::lock_guard<UncontendedMutex> lock(pqLock);
+        // sanity check
+        assert(!waitingOnRetry);
+        // there should never be any deferred request packets in the
+        // queue, instead we resly on the cache to provide the packets
+        // from the MSHR queue or write queue
+        assert(deferredPacketReadyTime() == MaxTick);
+    }
 
     // check for request packets (requests & writebacks)
     QueueEntry* entry = cache.getNextQueueEntry();
 
-    if (!entry) {
-        // can happen if e.g. we attempt a writeback and fail, but
-        // before the retry, the writeback is eliminated because
-        // we snoop another cache's ReadEx.
-    } else {
+    if (entry) {
         // let our snoop responses go first if there are responses to
         // the same addresses
         if (checkConflictingSnoop(entry->getTarget()->pkt)) {
             return;
         }
-        waitingOnRetry = entry->sendPacket(cache);
+        {
+            std::lock_guard<UncontendedMutex> lock(pqLock);
+            sending = true;
+        }
+        bool wait_retry = entry->sendPacket(cache);
+        std::lock_guard<UncontendedMutex> lock(pqLock);
+        sending = false;
+        waitingOnRetry = wait_retry;
     }
+    // (!entry can happen if e.g. we attempt a writeback and fail, but
+    // before the retry, the writeback is eliminated because we snoop
+    // another cache's ReadEx -- waitingOnRetry is left unchanged/false.)
 
     // if we succeeded and are not waiting for a retry, schedule the
     // next send considering when the next queue is ready, note that
     // snoop responses have their own packet queue and thus schedule
     // their own events
-    if (!waitingOnRetry) {
+    bool wait_retry;
+    {
+        std::lock_guard<UncontendedMutex> lock(pqLock);
+        wait_retry = waitingOnRetry;
+    }
+    if (!wait_retry) {
         schedSendEvent(cache.nextQueueReadyTime());
     }
 }
