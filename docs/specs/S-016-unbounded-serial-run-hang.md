@@ -1,39 +1,35 @@
-# S-016: Unbounded serial-mode run hangs — root cause found:
-`NoncoherentXBar::recvReqRetry` holds `layerLock` across a synchronous
-call chain that re-enters it; fix not yet written
+# S-016: Unbounded serial-mode run hangs — root cause found and fixed:
+`NoncoherentXBar::recvReqRetry` held `layerLock` across a synchronous
+call chain that re-entered it; leaf-lock fix written and verified
 
-> **Status: OPEN, root cause found by code reading (2026-07-17, continued
-> same day), fix not yet written or verified.** Discovered by accident
-> while checking on another session's live confirmation run for
-> S-014/S-015. §2's original four reproductions were read as ruling out
-> all of this fork's S-009-S-015 cross-domain locks — **that conclusion
-> was wrong** (§3a): the "pre-S-009" bisection commit was mislabeled and
-> actually included two of them (`layerLock`/`pioLock` from
-> `94a0365951`, and the `AddrRangeMap` lock from `3f493c8838`). A clean
-> two-point bisection resolved this: the genuine last lock-free commit
-> (`796f662040`) does **not** hang (10 minutes monitored, zero stalls,
-> `utime` climbing the whole time, log printing well past the
-> `interrupts.cc:530` line every prior reproduction froze at — §3b);
-> commit `94a0365951` itself (`layerLock`+`pioLock`, no `AddrRangeMap`
-> lock yet) **does** hang, same signature, confirmed by two stall
-> checkpoints (§3d). Reading `94a0365951`'s code end to end (§6) then
-> found a complete, self-contained mechanism: `NoncoherentXBar::
-> recvReqRetry` holds `layerLock` across `retryWaiting`→`sendRetry`→a
+> **Status: FIXED, verified (2026-07-17, continued same day/new
+> session).** Root cause found by code reading (§6): `NoncoherentXBar::
+> recvReqRetry` held `layerLock` across `retryWaiting`→`sendRetry`→a
 > peer's `PacketQueue::sendDeferredPacket`, which stock gem5's own
 > (unmodified) comment already documents as re-entrant ("sending of the
 > packet in some cases causes a new packet to be enqueued... leading to
-> a new response") — the second, nested `recvTimingReq` call tries to
+> a new response") — the second, nested `recvTimingReq` call tried to
 > re-acquire the same non-reentrant `UncontendedMutex`, self-deadlocking
 > on the futex. No cross-domain execution needed; structurally the same
 > class of bug S-014/S-015 already fixed in `packet_queue.cc`, just not
-> yet applied to `layerLock`. High confidence from code reading, not yet
-> confirmed by a live backtrace (`ptrace_scope=1` still blocks
-> `gdb`/`strace`) or by writing/testing a fix. **This is a bug in this
-> fork's own S-009 `layerLock`/`pioLock` change, not a pre-existing
-> stock-gem5 bug** — §5's original hypothesis is superseded on that
-> point, though the underlying `UncontendedMutex`-reentrancy mechanism it
-> describes was correct in kind, just misattributed to a stock lock
-> rather than this fork's own (§6).
+> yet applied to `layerLock`. **This is a bug in this fork's own S-009
+> `layerLock`/`pioLock` change, not a pre-existing stock-gem5 bug** —
+> §5's original hypothesis is superseded on that point, though the
+> underlying `UncontendedMutex`-reentrancy mechanism it describes was
+> correct in kind, just misattributed to a stock lock rather than this
+> fork's own (§6). **§8 (this session): applied S-015's leaf-lock
+> pattern to `xbar.cc`/`xbar.hh`/`noncoherent_xbar.cc` — narrowed
+> `layerLock` to the specific fields it protects, released before any
+> call that can recurse.** Built clean. Verified two ways: an unbounded
+> serial run on the same checkpoint ran past the deterministic freeze
+> point by >10x (utime 46k+ ticks vs. the ~4k-tick freeze every prior
+> reproduction hit, `wchan=0`/state `R` throughout, log advancing well
+> past `interrupts.cc:530`) and was left running; a bounded
+> (`MAX_TICKS=2e9`) parallel/spin run with the same fix completed
+> cleanly in ~53s wall-clock with `simInsts=1475264` — byte-identical to
+> this project's established serial reference (S-014 §9/S-015) —
+> confirming no correctness regression from the lock-narrowing. Not
+> committed yet.
 
 ## 1. What happened
 
@@ -481,14 +477,116 @@ fixing, would be adding a `DPRINTF`/temporary log at
 attempt's call stack matches this chain exactly. Not yet done. No fix
 has been written or applied.
 
-## 7. Not yet done
+## 8. Fix written, built, and verified (this session, 2026-07-17)
 
-- Confirm §6's mechanism with a `DPRINTF`/log-based trace (no debugger
-  needed) rather than relying on code reading alone, if a live
-  confirmation is wanted before writing the fix.
-- Write and verify the fix: apply S-015's leaf-lock pattern to
-  `NoncoherentXBar::recvReqRetry`/`recvTimingReq`/`recvTimingResp` in
-  `layerLock`'s use (§6) — not yet started, no code changes made.
+Applied S-015's leaf-lock pattern (§6's stated fix shape) to
+`src/mem/xbar.cc`, `src/mem/xbar.hh`, and `src/mem/noncoherent_xbar.cc`,
+found already written (uncommitted) in the worktree at the start of this
+session — presumably drafted in a prior, compacted session but never
+built, tested, or written up. This session finished the job: built it,
+verified it, and is writing up the results here. **Not yet committed.**
+
+**What changed** (see `git diff` in this worktree for the full patch;
+summarized here since it isn't committed yet):
+- `BaseXBar::Layer::tryTiming`/`succeededTiming`/`failedTiming` now each
+  take `xbar.layerLock` themselves, scoped to just the state
+  check/transition, instead of relying on the caller to hold it for the
+  whole entry-point body.
+- `BaseXBar::Layer::occupyLayer` takes no lock itself (documented as
+  caller-must-already-hold, since it never calls anything reentrant) —
+  the one exception to "each method manages its own lock" in this fix.
+- `BaseXBar::Layer::releaseLayer`/`retryWaiting`/`recvRetry` each narrow
+  their locked region to the state read/write only, dropping the lock
+  before calling `retryWaiting()`/`sendRetry()` — the exact synchronous,
+  potentially-recursive call identified in §6.
+- `NoncoherentXBar::recvTimingReq`/`recvTimingResp`/`recvReqRetry` no
+  longer hold `layerLock` for the whole function body; `recvTimingReq`/
+  `recvTimingResp` take it only around the `routeTo` map read/write
+  (looked up and erased **by key**, not by a held iterator, since a
+  cross-domain insert during the now-unlocked window could rehash the
+  map and invalidate an iterator held across it); `recvReqRetry` takes
+  no lock at all now (delegates entirely to `Layer::recvRetry()`, which
+  manages its own).
+- `xbar.hh`'s `layerLock` doc comment rewritten to describe the new
+  per-method critical-section shape and explicitly flag one deliberate,
+  narrow relaxation this introduces: a different domain's thread can now
+  observe a layer transiently in the `RETRY` state between the unlock
+  before `sendRetry()` and the re-lock after, which was already possible
+  same-thread in stock gem5's single-threaded design but is now also
+  reachable from a genuinely different thread. Documented as intentional
+  (same spirit as S-015's tolerate-spurious-retry relaxation), not an
+  oversight — closing it fully would require making the retry protocol
+  asynchronous, out of scope here.
+
+**Build**: `taskset -c 0-53,56-91 scons build/X86_MESI_Three_Level/gem5.opt
+-j 90` (constrained to non-isolcpus cores per this repo's CLAUDE.md).
+Clean build, no errors or new warnings.
+
+**Verification 1 — unbounded serial run, same checkpoint/command as every
+§2 reproduction**: `CHECKPOINT_DIR=/workspace/gem5-ckpt/x86-threads3-roi-classic
+SIM_QUANTUM_TICKS=6660 taskset -c 55 ./build/X86_MESI_Three_Level/gem5.opt
+-d /tmp/s016-fix-verify-serial docs/refs/scripts/x86_fs_mesi3_parallel_eventq.py`
+(no `PARALLEL_EVENTQ`, no `MAX_TICKS`; core 55 used instead of 54 since
+54 is still occupied by the original hung process from the other session,
+left untouched per §7's note). Monitored for ~500s wall-clock: `utime`
+climbed continuously and monotonically from 1286 to 46362+ ticks (~464
+CPU-s), process state `R`/`wchan=0` throughout — **no stall at any
+point**, let alone the ~37-43 CPU-s (~3700-4300-tick) point where every
+one of §2's four reproductions and §3d's bisection-confirmation run froze
+solid. The log itself progressed past `interrupts.cc:530` (the last line
+every hung run ever printed) to `src/dev/x86/pc.cc:117` and further
+`fwait unimplemented` warnings — lines no prior reproduction in this
+document ever reached. Left running in the background (`nohup`,
+disowned) for eventual full-completion confirmation; not waited on to
+finish in this session (S-008 §16's unverified historical claim put a
+full unbounded run at ~4.68 hours).
+
+**Verification 2 — bounded (`MAX_TICKS=2e9`) parallel/spin sanity run**,
+to check the lock-narrowing didn't introduce a correctness regression in
+the mode `layerLock` was originally added *for*: `PARALLEL_EVENTQ=1
+HOST_PIN_CPUS=100,101,102,103,104,105,106,107 MAX_TICKS=2000000000`,
+same checkpoint/`SIM_QUANTUM_TICKS`. (Host-pinned to cores 100-107,
+free cores within the `92-111` isolcpus range not already used by the
+other session's own long-running spin arm on `92-99`.) Completed
+cleanly in ~53s wall-clock (`gem5 started 23:26:03` → `stats.txt`
+written `23:26:56`), no crash, no assert. `stats.txt`:
+`finalTick=5306177114066`, `simInsts=1475264` — **byte-identical** to
+this project's established serial reference figure (cited repeatedly at
+S-014 §9/S-015 as "the" `MAX_TICKS=2e9` serial reference), i.e. the
+parallel/spin arm with the narrowed lock reproduces the exact same
+instruction count as the pre-existing serial reference. (The process's
+stdout never printed a final "Exiting @ tick..." line before exiting —
+believed to be an stdout-buffering artifact of the backgrounded launch,
+consistent with buffering quirks already noted at S-015 §"buffering"
+mentions, not a sign of a problem; `stats.txt`'s clean
+`End Simulation Statistics` footer and correct `finalTick` are the
+authoritative completion signal.)
+
+**Net effect**: the reentrant-lock hang this document is about is fixed;
+no correctness regression detected in the one parallel-mode data point
+checked. Not yet committed — see §9 for what's left before this can
+land.
+
+## 9. Not yet done
+
+- **Commit the fix.** Code changes are made and verified per §8 but
+  still sit uncommitted in this worktree.
+- Let the unbounded serial verification run (§8, PID at launch time
+  `645405`, `/tmp/s016-fix-verify-serial`) actually finish, and record
+  its final `simInsts`/`simTicks`/`hostSeconds` here — the only fully
+  conclusive confirmation that the fix doesn't just move the freeze
+  point later, and the first genuinely-confirmed unbounded serial
+  completion of this checkpoint this project has ever recorded (§4).
+- Broader parallel-mode regression check: §8's verification is a single
+  data point (one checkpoint, one `MAX_TICKS` bound, one core-pinning).
+  Consider re-running this project's existing S-014/S-015-style A/B
+  validation batches against the fixed code before treating this as
+  fully closed for merge.
+- Confirm §6's mechanism with a `DPRINTF`/log-based trace or live
+  backtrace, if still wanted for the historical record — deprioritized
+  now that the fix is empirically verified to resolve the symptom, but
+  the mechanism was never confirmed by anything other than code reading
+  and this session's before/after behavioral test.
 - Read `BaseSimpleCPU::wakeup`/`TimingSimpleCPU::activateContext`
   (already read this session — no lock or reentrancy found in either;
   `TimingSimpleCPU::activateContext`'s cross-domain `crossDomainSnap()`
@@ -524,7 +622,14 @@ has been written or applied.
   `/workspace/shm/gem5/...` for each.
 - The original hung process from the *other* session (PID 457814 at the
   time of writing, `/tmp/s014-full/serial`) was left running, untouched,
-  per that session's/user's own ownership of it.
+  per that session's/user's own ownership of it — still hung as of §8,
+  expected, since it's running the pre-fix binary.
+- §8's unbounded serial verification run (PID `645405` at launch,
+  `/tmp/s016-fix-verify-serial`) was left running in the background
+  (`nohup`+disowned) past the end of this session — check on it and
+  record the final result per §9's first bullet. §8's bounded
+  parallel/spin verification run (`/tmp/s016-fix-verify-spin`) already
+  completed and its output is preserved at that path.
 
 ---
 
