@@ -227,6 +227,25 @@ class BaseXBar : public ClockedObject
         EventFunctionWrapper releaseEvent;
 
         /**
+         * Snap a release time computed by (possibly) a different domain's
+         * host thread onto this crossbar's own quantum grid before
+         * occupyLayer() schedules on it. `until` (from
+         * succeededTiming/failedTiming's caller, or from retryWaiting's own
+         * `xbar.clockEdge()`) is always derived from curTick(), which
+         * resolves through the *calling* thread's curEventQueue() TLS --
+         * not necessarily the EventQueue this Layer's `xbar` is bound to.
+         * Without this, a caller whose domain has already advanced past
+         * `xbar`'s current tick can compute an `until` that lands in
+         * `xbar`'s past, tripping EventQueue::schedule()'s
+         * `assert(when >= getCurTick())` (S-014). Same grid-anchored
+         * pattern as BridgeBase::crossDomainSnap() (bridge.hh/cc) and
+         * PacketQueue::schedSendEvent (packet_queue.cc), applied once
+         * inside occupyLayer() so every call chain reaching it is covered
+         * regardless of which caller computed `until`.
+         */
+        Tick crossDomainSnap(Tick until) const;
+
+        /**
          * Stats for occupancy and utilization. These stats capture
          * the time the layer spends in the busy state and are thus only
          * relevant when the memory system is in timing mode.

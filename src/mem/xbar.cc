@@ -48,6 +48,7 @@
 #include <memory>
 #include <string>
 
+#include "base/intmath.hh"
 #include "base/logging.hh"
 #include "base/trace.hh"
 #include "debug/AddrRanges.hh"
@@ -162,6 +163,20 @@ BaseXBar::Layer<SrcType, DstType>::Layer(DstType& _port, BaseXBar& _xbar,
 }
 
 template <typename SrcType, typename DstType>
+Tick
+BaseXBar::Layer<SrcType, DstType>::crossDomainSnap(Tick until) const
+{
+    if (inParallelMode && curEventQueue() != xbar.eventQueue()) {
+        assert(simQuantum > 0);
+        until = std::max(until,
+            simQuantumStart +
+                divCeil(until - simQuantumStart, simQuantum) *
+                    simQuantum);
+    }
+    return until;
+}
+
+template <typename SrcType, typename DstType>
 void BaseXBar::Layer<SrcType, DstType>::occupyLayer(Tick until)
 {
     // ensure the state is busy at this point, as the layer should
@@ -172,6 +187,12 @@ void BaseXBar::Layer<SrcType, DstType>::occupyLayer(Tick until)
 
     // until should never be 0 as express snoops never occupy the layer
     assert(until != 0);
+
+    // until was computed by the calling thread's curTick(), which can be
+    // a different domain than this layer's xbar under the parallel-
+    // EventQueue split (S-014) -- snap to this xbar's quantum grid before
+    // scheduling on it.
+    until = crossDomainSnap(until);
     xbar.schedule(releaseEvent, until);
 
     // account for the occupied ticks
@@ -250,6 +271,21 @@ template <typename SrcType, typename DstType>
 void
 BaseXBar::Layer<SrcType, DstType>::releaseLayer()
 {
+    // This is releaseEvent's callback, invoked directly by this layer's
+    // own domain's EventQueue::serviceOne() -- unlike recvTimingReq/
+    // recvTimingResp/recvReqRetry (noncoherent_xbar.cc), which each take
+    // xbar.layerLock around their whole body before touching this same
+    // Layer/PacketQueue state, nothing protected this call chain
+    // (retryWaiting -> occupyLayer/sendRetry -> the peer's
+    // PacketQueue::retry()) before now. recvTimingReq can run on a
+    // different domain's host thread than this one, so without this
+    // lock the two call chains could mutate the same state
+    // unsynchronized (S-015). Only acquired here, not in
+    // retryWaiting()/occupyLayer() themselves, since retryWaiting() is
+    // also reached via recvRetry() <- NoncoherentXBar::recvReqRetry(),
+    // which already holds this same (non-recursive) lock.
+    std::lock_guard<UncontendedMutex> lock(xbar.layerLock);
+
     // releasing the bus means we should now be idle
     assert(state == BUSY);
     assert(!releaseEvent.scheduled());
