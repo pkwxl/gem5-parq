@@ -53,9 +53,11 @@ PacketQueue::PacketQueue(EventManager& _em, const std::string& _label,
                          bool force_order,
                          bool disable_sanity_check)
     : em(_em), sendEvent([this]{ processSendEvent(); }, _sendEventName),
+      crossWakeEvent([this]{ processCrossWake(); }, _sendEventName + ".cross"),
+      wakePending(false),
       _disableSanityCheck(disable_sanity_check),
       forceOrder(force_order),
-      label(_label), waitingOnRetry(false)
+      label(_label), waitingOnRetry(false), sending(false)
 {
 }
 
@@ -67,8 +69,15 @@ void
 PacketQueue::retry()
 {
     DPRINTF(PacketQueue, "Queue %s received retry\n", name());
-    assert(waitingOnRetry);
-    waitingOnRetry = false;
+    // Thin locked wrapper over an unlocked core: clear the retry flag under
+    // pqLock, then send with the lock released (leaf rule, S-015 section 8.3).
+    // This entry point is reachable cross-domain (qport.hh recvRespRetry/
+    // recvReqRetry called directly by a peer domain's thread).
+    {
+        std::lock_guard<UncontendedMutex> lock(pqLock);
+        assert(waitingOnRetry);
+        waitingOnRetry = false;
+    }
     sendDeferredPacket();
 }
 
@@ -117,80 +126,109 @@ PacketQueue::schedSendTiming(PacketPtr pkt, Tick when)
     // express snoops should never be queued
     assert(!pkt->isExpressSnoop());
 
-    // add a very basic sanity check on the port to ensure the
-    // invisible buffer is not growing beyond reasonable limits
-    if (!_disableSanityCheck && transmitList.size() > 1024) {
-        panic("Packet queue %s has grown beyond 1024 packets\n",
-              name());
-    }
+    // Insert into transmitList under pqLock (this entry point is reachable
+    // cross-domain, e.g. qport.hh schedTimingResp on a peer domain's thread --
+    // the S-015 section 7.2 TSan-confirmed race). schedSendEvent() is called
+    // with the lock released (leaf rule, section 8.3).
+    bool schedule_send = false;
+    {
+        std::lock_guard<UncontendedMutex> lock(pqLock);
 
-    // we should either have an outstanding retry, or a send event
-    // scheduled, but there is an unfortunate corner case where the
-    // x86 page-table walker and timing CPU send out a new request as
-    // part of the receiving of a response (called by
-    // PacketQueue::sendDeferredPacket), in which we end up calling
-    // ourselves again before we had a chance to update waitingOnRetry
-    // assert(waitingOnRetry || sendEvent.scheduled());
-
-    // this belongs in the middle somewhere, so search from the end to
-    // order by tick; however, if forceOrder is set, also make sure
-    // not to re-order in front of some existing packet with the same
-    // address
-    auto it = transmitList.end();
-    while (it != transmitList.begin()) {
-        --it;
-        if ((forceOrder && it->pkt->matchAddr(pkt)) || it->tick <= when) {
-            // emplace inserts the element before the position pointed to by
-            // the iterator, so advance it one step
-            transmitList.emplace(++it, when, pkt);
-            return;
+        // add a very basic sanity check on the port to ensure the
+        // invisible buffer is not growing beyond reasonable limits
+        if (!_disableSanityCheck && transmitList.size() > 1024) {
+            panic("Packet queue %s has grown beyond 1024 packets\n",
+                  name());
         }
+
+        // we should either have an outstanding retry, or a send event
+        // scheduled, but there is an unfortunate corner case where the
+        // x86 page-table walker and timing CPU send out a new request as
+        // part of the receiving of a response (called by
+        // PacketQueue::sendDeferredPacket), in which we end up calling
+        // ourselves again before we had a chance to update waitingOnRetry.
+        // With the S-015 restructure this reentrant call is safe: the send
+        // in sendDeferredPacket runs with pqLock released, so this lock_guard
+        // does not self-deadlock, and the reentrantly-added packet is picked
+        // up by sendDeferredPacket's own tail schedSendEvent once sending
+        // clears.
+        // assert(waitingOnRetry || sendEvent.scheduled());
+
+        // this belongs in the middle somewhere, so search from the end to
+        // order by tick; however, if forceOrder is set, also make sure
+        // not to re-order in front of some existing packet with the same
+        // address
+        auto it = transmitList.end();
+        while (it != transmitList.begin()) {
+            --it;
+            if ((forceOrder && it->pkt->matchAddr(pkt)) || it->tick <= when) {
+                // emplace inserts the element before the position pointed to
+                // by the iterator, so advance it one step
+                transmitList.emplace(++it, when, pkt);
+                return;
+            }
+        }
+        // either the packet list is empty or this has to be inserted
+        // before every other packet
+        transmitList.emplace_front(when, pkt);
+        schedule_send = true;
     }
-    // either the packet list is empty or this has to be inserted
-    // before every other packet
-    transmitList.emplace_front(when, pkt);
-    schedSendEvent(when);
+
+    if (schedule_send)
+        schedSendEvent(when);
 }
 
 void
 PacketQueue::schedSendEvent(Tick when)
 {
-    // if we are waiting on a retry just hold off
-    if (waitingOnRetry) {
-        DPRINTF(PacketQueue, "Not scheduling send as waiting for retry\n");
-        assert(!sendEvent.scheduled());
+    // Snapshot the flow-control state under pqLock, then release it before
+    // touching sendEvent or the EventQueue (leaf rule, S-015 section 8.5).
+    // If we are waiting on a retry, or a send is in flight, just hold off --
+    // the pending retry / in-flight send will schedule the next send once it
+    // settles.
+    {
+        std::lock_guard<UncontendedMutex> lock(pqLock);
+        if (waitingOnRetry || sending) {
+            DPRINTF(PacketQueue, "Not scheduling send (waitingOnRetry=%d "
+                    "sending=%d)\n", waitingOnRetry, sending);
+            return;
+        }
+    }
+
+    if (when == MaxTick) {
+        // we get a MaxTick when there is no more to send, so if we're
+        // draining, we may be done at this point
+        bool idle;
+        {
+            std::lock_guard<UncontendedMutex> lock(pqLock);
+            idle = transmitList.empty() && !sending;
+        }
+        if (drainState() == DrainState::Draining && idle &&
+            !sendEvent.scheduled()) {
+
+            DPRINTF(Drain, "PacketQueue done draining,"
+                    "processing drain event\n");
+            signalDrainDone();
+        }
         return;
     }
 
-    if (when != MaxTick) {
-        // we cannot go back in time, and to be consistent we stick to
-        // one tick in the future
-        when = std::max(when, curTick() + 1);
-        // @todo Revisit the +1
+    // we cannot go back in time, and to be consistent we stick to
+    // one tick in the future
+    when = std::max(when, curTick() + 1);
+    // @todo Revisit the +1
 
-        // Cross-domain send (e.g. RubyPort PIO forwarding a response from
-        // a device domain's thread into this port's own domain, or any
-        // other classic PioDevice reached via a QueuedRequestPort/
-        // QueuedResponsePort): em.eventQueue() is bound at construction to
-        // this port's own domain and never changes, so comparing it
-        // against curEventQueue() (the calling thread's TLS) reliably
-        // detects a cross-domain call here, unlike EventQueue::schedule()
-        // which cannot tell whether this particular schedule needs
-        // snapping (design doc S-009 sections 17-19). Snap to the next
-        // barrier boundary for the same reason as timing.cc's
-        // activateContext snap: `when` was computed from the calling
-        // thread's curTick(), which can be up to one quantum ahead of the
-        // target domain's clock, so it can land in the target's past. The
-        // grid is anchored at simQuantumStart, not 0, to stay valid after
-        // an FS restore where parallel mode begins mid-simulation.
-        if (inParallelMode && curEventQueue() != em.eventQueue()) {
-            assert(simQuantum > 0);
-            when = std::max(when,
-                simQuantumStart +
-                    divCeil(when - simQuantumStart, simQuantum) *
-                        simQuantum);
-        }
-
+    // Cross-domain send (e.g. RubyPort PIO forwarding a response from a
+    // device domain's thread into this port's own domain, or any other
+    // classic PioDevice reached via a QueuedRequestPort/QueuedResponsePort):
+    // em.eventQueue() is bound at construction to this port's own domain and
+    // never changes, so comparing it against curEventQueue() (the calling
+    // thread's TLS) reliably detects a cross-domain call here (design doc
+    // S-009 sections 17-19).
+    if (!inParallelMode || curEventQueue() == em.eventQueue()) {
+        // B1 same-domain: the calling thread owns this queue's EventQueue, so
+        // only the owner ever reaches this branch -- touching sendEvent
+        // directly (as the pre-S-015 code always did) is legal and race free.
         if (!sendEvent.scheduled()) {
             em.schedule(&sendEvent, when);
         } else if (when < sendEvent.when()) {
@@ -199,59 +237,111 @@ PacketQueue::schedSendEvent(Tick when)
             em.reschedule(&sendEvent, when);
         }
     } else {
-        // we get a MaxTick when there is no more to send, so if we're
-        // draining, we may be done at this point
-        if (drainState() == DrainState::Draining &&
-            transmitList.empty() && !sendEvent.scheduled()) {
-
-            DPRINTF(Drain, "PacketQueue done draining,"
-                    "processing drain event\n");
-            signalDrainDone();
+        // B2 cross-domain: MUST NOT touch sendEvent.scheduled()/reschedule()
+        // -- both are owner-thread-only by assertion (eventq.hh); a foreign
+        // reschedule() does remove()/insert() on a queue it does not own,
+        // racing the owner's serviceOne() (the S-015 section 1b "event not
+        // found!" / "event scheduled in the past" crash variants, which no
+        // PacketQueue-level lock can serialize). Instead snap to the next
+        // quantum boundary (same reason as the pre-S-015 snap: `when` was
+        // computed from the calling thread's curTick(), up to one quantum
+        // ahead of the target domain's clock, so it can land in the target's
+        // past; grid anchored at simQuantumStart to survive an FS restore)
+        // and hand the real scheduling to the owner thread via crossWakeEvent,
+        // posted through the one cross-domain-safe primitive (asyncInsert,
+        // reached because crossWakeEvent belongs to em's own queue).
+        // wakePending keeps at most one outstanding wake.
+        assert(simQuantum > 0);
+        when = std::max(when,
+            simQuantumStart +
+                divCeil(when - simQuantumStart, simQuantum) *
+                    simQuantum);
+        if (!wakePending.exchange(true)) {
+            em.schedule(&crossWakeEvent, when);
         }
     }
 }
 
 void
+PacketQueue::processCrossWake()
+{
+    // Runs on the owner thread only (crossWakeEvent fires from em's own
+    // queue), so schedSendEvent() below now takes the B1 same-domain path and
+    // does the real (re)schedule of sendEvent where it is legal.
+    wakePending.store(false);
+    Tick when;
+    {
+        std::lock_guard<UncontendedMutex> lock(pqLock);
+        when = deferredPacketReadyTime();
+    }
+    schedSendEvent(when);
+}
+
+void
 PacketQueue::sendDeferredPacket()
 {
-    // sanity checks
-    assert(!waitingOnRetry);
-    assert(deferredPacketReady());
-
-    DeferredPacket dp = transmitList.front();
-
-    // take the packet of the list before sending it, as sending of
-    // the packet in some cases causes a new packet to be enqueued
-    // (most notaly when responding to the timing CPU, leading to a
-    // new request hitting in the L1 icache, leading to a new
-    // response)
-    transmitList.pop_front();
+    // Pop the head under pqLock and mark sending, then release the lock for
+    // the actual send (leaf rule, S-015 section 8.4). Taking the packet off
+    // the list before sending matters because sending it can, in some cases,
+    // cause a new packet to be enqueued (most notably when responding to the
+    // timing CPU, leading to a new request hitting in the L1 icache, leading
+    // to a new response -- the x86-PTW reentrant path). Dropping pqLock across
+    // the send is what lets that reentrant schedSendTiming on this same queue
+    // take pqLock without self-deadlocking; the `sending` flag closes the
+    // window where the head is popped but waitingOnRetry is not yet updated.
+    DeferredPacket dp(0, nullptr);
+    {
+        std::lock_guard<UncontendedMutex> lock(pqLock);
+        assert(!waitingOnRetry);
+        assert(deferredPacketReady());
+        dp = transmitList.front();
+        transmitList.pop_front();
+        sending = true;
+    }
 
     // use the appropriate implementation of sendTiming based on the
-    // type of queue
-    waitingOnRetry = !sendTiming(dp.pkt);
+    // type of queue -- cross-domain outbound, pqLock NOT held
+    bool ok = sendTiming(dp.pkt);
+
+    Tick next;
+    {
+        std::lock_guard<UncontendedMutex> lock(pqLock);
+        sending = false;
+        waitingOnRetry = !ok;
+        if (!ok) {
+            // put the packet back at the front of the list
+            transmitList.emplace_front(dp);
+            next = MaxTick;
+        } else {
+            next = deferredPacketReadyTime();
+        }
+    }
 
     // if we succeeded and are not waiting for a retry, schedule the
-    // next send
-    if (!waitingOnRetry) {
-        schedSendEvent(deferredPacketReadyTime());
-    } else {
-        // put the packet back at the front of the list
-        transmitList.emplace_front(dp);
-    }
+    // next send (with pqLock released)
+    if (ok)
+        schedSendEvent(next);
 }
 
 void
 PacketQueue::processSendEvent()
 {
-    assert(!waitingOnRetry);
+    // sendDeferredPacket asserts !waitingOnRetry under pqLock; no separate
+    // unlocked read here (would be a TSan-flagged data race against retry()).
     sendDeferredPacket();
 }
 
 DrainState
 PacketQueue::drain()
 {
-    if (transmitList.empty()) {
+    // A drain must not complete mid-send: the head is popped (transmitList may
+    // read empty) while sending is true (S-015 section 8.8 item c).
+    bool drained;
+    {
+        std::lock_guard<UncontendedMutex> lock(pqLock);
+        drained = transmitList.empty() && !sending;
+    }
+    if (drained) {
         return DrainState::Drained;
     } else {
         DPRINTF(Drain, "PacketQueue not drained\n");

@@ -49,8 +49,10 @@
  * for the flow control of the port.
  */
 
+#include <atomic>
 #include <list>
 
+#include "base/uncontended_mutex.hh"
 #include "mem/port.hh"
 #include "sim/drain.hh"
 #include "sim/eventq.hh"
@@ -90,6 +92,21 @@ class PacketQueue : public Drainable
     /** Event used to call processSendEvent. */
     EventFunctionWrapper sendEvent;
 
+    /**
+     * Owner-thread-only handoff for cross-domain send scheduling
+     * (S-015 section 8.5). A foreign (non-owner-domain) thread may not touch
+     * sendEvent.scheduled()/reschedule() -- EventQueue::reschedule() asserts
+     * owner-thread-only (eventq.hh) -- so instead it posts crossWakeEvent via
+     * the one cross-domain-safe primitive (EventQueue::asyncInsert, reached by
+     * scheduling an event that belongs to em's own queue from a foreign
+     * thread) and the owner thread does the real (re)schedule in
+     * processCrossWake(). wakePending collapses a burst of foreign wakes to a
+     * single outstanding crossWakeEvent.
+     */
+    void processCrossWake();
+    EventFunctionWrapper crossWakeEvent;
+    std::atomic<bool> wakePending;
+
      /*
       * Optionally disable the sanity check
       * on the size of the transmitList. The
@@ -111,6 +128,27 @@ class PacketQueue : public Drainable
 
     /** Remember whether we're awaiting a retry. */
     bool waitingOnRetry;
+
+    /**
+     * Strict-leaf lock (S-015 section 8) protecting this queue's mutable
+     * state (transmitList, waitingOnRetry, sending) against concurrent access
+     * from a different domain's host thread in parallel-EventQueue mode. It is
+     * a leaf: held only around list/flag manipulation and released before
+     * every call that leaves the object (sendTiming, em.schedule/reschedule,
+     * signalDrainDone, DPRINTF), so it can never be part of a deadlock cycle
+     * (lock-ordering proof, section 8.6).
+     */
+    mutable UncontendedMutex pqLock;
+
+    /**
+     * Send-in-progress guard (under pqLock, S-015 section 8.4). Set while a
+     * packet has been popped from transmitList but sendTiming() has not yet
+     * settled waitingOnRetry -- because the leaf rule forbids holding pqLock
+     * across the send. A concurrent scheduleSend treats sending exactly like
+     * waitingOnRetry (do not schedule; the in-flight send will settle it), and
+     * a drain must not complete while sending is true.
+     */
+    bool sending;
 
     /** Check whether we have a packet ready to go on the transmit list. */
     bool deferredPacketReady() const

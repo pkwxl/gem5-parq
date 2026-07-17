@@ -69,7 +69,14 @@ hybrid is the chosen fix; full 5b deferral is rejected as this bug's
 fix (it cannot cover the confirmed `recvTimingResp`-path race without
 a flow-control protocol redesign, since `recvTiming*` returns a
 synchronous bool) and is retained only as a possible future
-architecture investigation. Implementation not yet started.**
+architecture investigation. **§10 (2026-07-17): the §8 hybrid is now
+IMPLEMENTED on branch `s015-packetqueue-retry-race` (`src/mem/
+packet_queue.{hh,cc}` + the cache override in `src/mem/cache/base.cc`),
+builds clean, and passes the S-009 §27 short-window regression
+byte-identical (serial vs spin) with no deadlock. The crash-confirmation
+runs (§1a-style bare batch at MAX_TICKS=2e9 reaching the ~5.306e9
+historical crash tick, and the §7 TSan A/B re-run) are the remaining
+verification sub-phase — see §10.4.**
 
 ## 1. What happened
 
@@ -1330,6 +1337,102 @@ items) and its verification (§8.8's plan: TSan A/B re-run expecting the
 four §8.7 signatures to disappear, §1a-style bare batch expecting 0/20,
 S-009 §27 byte-identical short-window regression) are the next
 sub-phase and were not started in the deciding session.
+
+## 10. Implementation of the §8 hybrid (2026-07-17, branch `s015-packetqueue-retry-race`)
+
+Implemented per the §9 decision and the §8 sketch. Branch created off
+`main` with its own worktree/tmpfs per ADR 0001 (the S-015 number was
+already claimed, so no new INDEX row).
+
+### 10.1 What changed
+
+`src/mem/packet_queue.{hh,cc}`:
+- New state (§8.2): `mutable UncontendedMutex pqLock` (strict leaf) and
+  `bool sending` (protected, so the cache override can use them);
+  `EventFunctionWrapper crossWakeEvent` + `std::atomic<bool> wakePending`
+  and a private `processCrossWake()` for the B2 handoff.
+- `retry()` — thin locked wrapper: clears `waitingOnRetry` under `pqLock`,
+  then calls `sendDeferredPacket()` with the lock released (§8.3).
+- `schedSendTiming()` — the `transmitList` insert (and the 1024-packet
+  sanity check) now run under `pqLock`; `schedSendEvent()` is called after
+  the lock is released, and only on the emplace-front branch as before.
+- `schedSendEvent()` — restructured into §8.5: a `pqLock`-guarded snapshot
+  gate (`waitingOnRetry || sending` → hold off), then the MaxTick/drain
+  branch (reads `transmitList.empty() && !sending` under lock), then the
+  B1 same-domain path (touches `sendEvent` directly, owner-thread-only) vs
+  the B2 cross-domain path (snap to quantum + `crossWakeEvent` via
+  `asyncInsert`, guarded by `wakePending.exchange`).
+- `processCrossWake()` — owner-thread callback: clears `wakePending`,
+  reads `deferredPacketReadyTime()` under lock, calls `schedSendEvent()`
+  (now on the B1 path).
+- `sendDeferredPacket()` — the §8.4 pop-under-lock / send-unlocked /
+  settle-under-lock structure with the `sending` guard; `schedSendEvent()`
+  called only on success, lock released.
+- `processSendEvent()` — dropped the redundant unlocked `assert(!
+  waitingOnRetry)` (would be a TSan-flagged read vs `retry()`);
+  `sendDeferredPacket()` asserts it under lock.
+- `drain()` — now returns Drained only if `transmitList.empty() &&
+  !sending` under lock (§8.8 item c).
+
+`src/mem/cache/base.cc` — `BaseCache::CacheReqPacketQueue::
+sendDeferredPacket()` (§8.8 item d): adopts the same discipline —
+`waitingOnRetry` read/written under `pqLock`, `sending` held only around
+the outbound `entry->sendPacket(cache)`. `sending` is deliberately NOT
+set across `checkConflictingSnoop()`, which itself calls
+`schedSendEvent()` (that would no-op under the `sending` gate).
+
+### 10.2 Design points worth noting for a future reader
+
+- The query methods that only *read* `transmitList` (`checkConflict`,
+  `trySatisfyFunctional`, `size`, the public `deferredPacketReadyTime`,
+  `deferredPacketReady`) are intentionally left unlocked: they are called
+  from within `pqLock`-held regions (`sendDeferredPacket`,
+  `processCrossWake`) and `UncontendedMutex` is non-recursive, so locking
+  them would self-deadlock. This matches §8.2's "lock only the mutations"
+  invariant. They were not in the §8.7 confirmed-race set; if post-fix
+  TSan flags one, that is the §9.4 falsifier-2 condition, to be recorded,
+  not silently patched.
+- Lock is a strict leaf (§8.6): every outbound call (`sendTiming`,
+  `em.schedule/reschedule`, `signalDrainDone`, DPRINTF) is made with
+  `pqLock` released, so `pqLock` has no outgoing edges and cannot be in a
+  deadlock cycle.
+
+### 10.3 Verification done so far — PASS (short window)
+
+S-009 §27 short-window regression, this build
+(`build/X86_MESI_Three_Level/gem5.opt`, checkpoint
+`x86-threads3-roi-classic`, `SIM_QUANTUM_TICKS=6660`,
+`MAX_TICKS=2e8`):
+- serial (`taskset -c 54`): clean, `simInsts=74062` (matches the S-009
+  §27 reference).
+- parallel/spin (`taskset -c 92-99`, `HOST_PIN_CPUS=92,93,…,99`): clean,
+  `simInsts=74062`, **no deadlock** (the primary risk of a locking
+  change), and `stats.txt` **byte-identical** to serial (excluding
+  `host*` lines).
+
+This confirms the fix is a no-op in the already-validated window and
+that the B2 handoff is timing-neutral there — i.e. §9.4 falsifier-1 is
+NOT triggered. It does **not** yet confirm the fix stops the crash: the
+2e8 window ends at tick ≈5.3046e9, short of the ≈5.306e9 historical
+crash cluster.
+
+(Operational note for the next runner: the config script's
+`HOST_PIN_CPUS` is comma-separated and `int()`-parsed per element —
+pass `92,93,…,99`, not the range `92-99`, or it aborts with a
+`ValueError` before simulating.)
+
+### 10.4 Verification still to do (the crash-confirmation sub-phase)
+
+Per the §8.8 / §9.5 plan, still outstanding (qualitatively riskier —
+long runs, possible live debugging — so gated on a checkpoint per the
+project working style):
+- **§1a-style bare-repro batch at `MAX_TICKS=2e9`** (reaches the
+  ≈5.306e9 crash tick): expect **0 crashes / 20 runs** (pre-fix rate was
+  3/20 ≈ 15%).
+- **§7 TSan A/B re-run** on `build/X86_MESI_Three_Level_TSAN/gem5.opt`:
+  expect the four §8.7 race signatures to disappear and the `diag2`/
+  `diag4` standalone repro to go clean (use the flat launch form, not the
+  wrapper script — §7.4; set `TSAN_OPTIONS=halt_on_error=0`).
 
 ---
 
