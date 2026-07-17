@@ -98,8 +98,28 @@ OUTCOME-NEUTRAL. Short-window regression byte-identical, 0 relaxation
 events.** The relaxation is deliberate + quantified (atomic counters +
 capped warn + DPRINTF). §9.4 falsifier-2 resolved by this narrow change,
 not by the 5b architecture. Branch `s015-packetqueue-retry-race` holds
-the working fix; ready to propose for `--no-ff` merge to `main` pending
-an optional TSan hygiene pass. Full detail: §11.**
+the working fix. Full detail: §11.**
+
+**§12 (2026-07-17): the optional TSan hygiene re-run is now DONE — race
+signatures confirmed gone, plus a NEW finding that revises §7.4.** Fresh
+TSAN build off this branch's tip, re-ran the §7 A/B (flat launch, not
+§7.4's wrapper script). **Both spin arms ran the full 2e9-tick window
+clean (`finalTick` matching the historical reference) with ZERO TSan
+race reports** — the four §7/§8.7-confirmed races are gone, confirming
+`pqLock` actually serializes them (not just coincidentally avoiding
+them). One spin arm hit a tolerate-spurious relaxation event at the
+exact historical crash tick with no accompanying race report, as
+expected. **Both serial arms hung** (frozen `utime`,
+`wchan=futex_wait_queue`, no crash marker) — same signature as §7.4, but
+this time under the *flat* launch method §7.4's `diag2/3/4` used
+without issue, which **disproves §7.4's "wrapper-script launch"
+hypothesis** for the hang (it recurs regardless of launch method) and
+points instead at a genuine TSan-build-specific issue, still not
+root-caused. Not the S-015 race (serial mode = one thread, no
+cross-domain concurrency possible) — a separate, tooling-only problem.
+Branch is unchanged by this section (measurement only) and is now
+**ready to propose for `--no-ff` merge to `main`**, TSan hygiene pass
+included. Full detail: §12.
 
 ## 1. What happened
 
@@ -1636,6 +1656,124 @@ produces and what the reschedule corrects.
 fix** (hybrid + tolerate-spurious), two-plus commits, verified as above.
 Ready to propose for merge to `main` (`--no-ff`) pending the user's call
 on whether to run the TSan hygiene pass first.
+
+---
+
+**Related**: [S-014](./S-014-occupylayer-crossdomain-crash-beyond-tested-window.md)
+(where this was found, while confirming §8's fix), [S-009 §18-25](./S-009-raise-fs-quantum-past-iobus-edge-design.md)
+(the `layerLock`/`pioLock` precedent), [S-011](./S-011-consumer-lock-owner-race-audit.md)
+(prior non-deterministic-race investigation in this project, including
+the "designed a stress test, user chose not to run it" precedent)
+
+## 12. §11.4 item (a) done: TSan A/B re-run — race-hygiene CONFIRMED clean,
+and a separate finding that revises §7.4's launch-method hypothesis
+
+Per §11.4's remaining open item, re-ran the §7 TSan A/B protocol against
+the current branch tip (`c693e9777d`, §11's hybrid `pqLock` +
+tolerate-spurious-retry fix in place) — not to re-check the crash (already
+fixed, §11.3) but to confirm the four §8.7 TSan-confirmed race signatures
+are actually gone now that `pqLock` serializes `PacketQueue`'s state.
+
+**Build**: fresh `build/X86_MESI_Three_Level_TSAN/gem5.opt` (this branch's
+tmpfs build dir had no prior TSAN variant), `taskset -c 0-53,56-91` (off
+the reserved isolcpus ranges), clean build. Smoke-tested
+(`MAX_TICKS=1e6`) before committing to the full run — exit 0, no issues.
+
+**Launch method**: used the flat form (`env VAR=... taskset -c N binary
+-d dir script > log 2>&1 &`) throughout, per §7.4's recorded lesson, not
+the nested wrapper script blamed there for the serial hang.
+
+**A/B layout**: same operating point as every S-015 batch
+(`x86-threads3-roi-classic`, `SIM_QUANTUM_TICKS=6660`, `MAX_TICKS=2e9`,
+`TSAN_OPTIONS=halt_on_error=0`) — `spin1`→core 92 + `HOST_PIN_CPUS=
+92,93,...,99`, `spin2`→core 100 + `HOST_PIN_CPUS=100,101,...,107`,
+`serial1`→core 54, `serial2`→core 55.
+
+### 12.1 Spin arms: BOTH clean, ZERO TSan race reports — the four §8.7
+signatures are gone
+
+Both `spin1` and `spin2` ran the full `MAX_TICKS=2e9` window (spanning the
+historical crash-tick cluster at `5305999323366`) to completion:
+`finalTick=5306177114066` in both, byte-identical to the long-established
+serial reference. **Zero `WARNING: ThreadSanitizer: data race` lines and
+zero `SUMMARY: ThreadSanitizer` lines in either log** — none of the four
+§8.7-confirmed races (`waitingOnRetry` read/write, `transmitList` size,
+`retry()`/`deferredPacketReady()`, the `eventq.cc` reschedule path)
+reappeared. This is the race-hygiene confirmation §11.4 flagged as
+outstanding: `pqLock` (plus the B2 handoff) genuinely serializes the
+races TSan caught in §7, not merely coincidentally avoiding them.
+
+`spin1` additionally logged **one** tolerate-spurious relaxation event,
+at the **exact historical crash tick** `5305999323366`, on the same hot
+object as §11.3 (`board.cache_hierarchy.ruby_system.l1_controllers0.
+sequencer.pio-response-port-RespPacketQueue`, "head not yet ready") — and
+critically, **no TSan race report accompanies it**: the relaxation path
+itself is racing against nothing, consistent with §11's design (the
+cross-object `Layer`↔`PacketQueue` ordering issue §10.5 identified was
+never a data race to begin with, just an ordering assumption violated
+under relaxed cross-domain timing). `spin2` logged zero relaxation
+events, matching §11.3's "interleaving-dependent, not every run hits it"
+characterization.
+
+### 12.2 Serial arms: BOTH hung — same signature as §7.4, but this
+DISPROVES §7.4's leading "wrapper-script launch" hypothesis
+
+`serial1`/`serial2` (flat-launched, not wrapper-launched) both hung:
+confirmed via a direct 30-second `/proc/<pid>/stat` `utime` recheck on
+each (zero movement, `3758`→`3758` and `3762`→`3762`), single thread,
+`wchan=futex_wait_queue` — the identical signature §7.4 found for the
+wrapper-launched `serial1`/`serial2` that session. No crash/assert/panic
+marker in either log; both `stats.txt` are 0 bytes (killed mid-run, not a
+clean exit). Killed both via `SIGTERM` after confirming zero progress,
+same handling as §7.4.
+
+**This is new information, not a repeat of §7.4**: that session's two
+live hypotheses for the hang were (a) a TSan-build-specific issue
+independent of this investigation, or (b) something about the specific
+`nohup driver.sh -> function(){...} & -> wait` wrapper-script launch
+structure. This session used the flat launch form throughout (the same
+form §7.4's `diag2/3/4` used successfully, no hangs) — **and the serial
+hang still occurred**. That rules out (b) as the (or at least *a*)
+explanation: the hang is not specific to the wrapper-script launch
+structure. Hypothesis (a) — a genuine TSan-build-specific issue (TSan-
+internal deadlock, or an interaction between TSan's instrumentation and
+some gem5 primitive that assumes real wall-clock progress, e.g. a
+spin-wait or timeout path that never fires under TSan's slowdown) — is
+now the better-supported explanation, though still not root-caused.
+
+**Not the S-015 race, same reasoning as §7.4**: serial mode has exactly
+one `EventQueue`/one host thread (`inParallelMode` false), so no
+cross-domain race of any kind is possible — this hang cannot be a variant
+of S-015's bug. It is a separate, TSan-build-specific problem, now with
+one more data point (launch-method-independent) but still unresolved.
+
+### 12.3 Correctness cross-check
+
+The serial arms' hang means they don't provide a same-session serial
+`finalTick` to diff against — but `spin1`/`spin2`'s
+`finalTick=5306177114066` already matches the long-established historical
+serial reference (S-015 §1, §7.3's `diag3`, §11.3) exactly, serving the
+same cross-check purpose §7.4's `diag3` served when its wrapper-launched
+serial arms hung.
+
+### 12.4 Bottom line
+
+**§11.4 item (a) is done**: the `pqLock` half of the §8/§11 fix is
+TSan-confirmed to have actually closed the four races §7 found — this
+was race-hygiene confirmation, not a crash gate (the crash itself was
+already fixed and re-confirmed clean here as a side effect). **The
+TSan-build serial-mode hang is a distinct, still-unresolved, tooling-only
+issue** — unrelated to S-015's correctness, but real, and now confirmed
+independent of the wrapper-vs-flat launch-method question §7.4 left open.
+Anyone running this project's TSan protocol under the serial arm should
+expect to need to detect and kill a hang (utime-frozen +
+`futex_wait_queue`, no crash marker) rather than assume a long runtime is
+just slow.
+
+**Branch state**: `s015-packetqueue-retry-race` unchanged by this
+section (measurement only, no code changes) — still holds the working
+fix (§8 hybrid + §11 tolerate-spurious), now with the TSan hygiene pass
+also complete. Ready to propose for merge to `main` (`--no-ff`).
 
 ---
 
