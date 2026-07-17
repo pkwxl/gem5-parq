@@ -1,10 +1,10 @@
-# S-016: Unbounded serial-mode run hangs — root cause narrowed to
-S-009's `layerLock`/`pioLock` change; exact reentrancy site not yet
-pinpointed
+# S-016: Unbounded serial-mode run hangs — root cause found:
+`NoncoherentXBar::recvReqRetry` holds `layerLock` across a synchronous
+call chain that re-enters it; fix not yet written
 
-> **Status: OPEN, root cause narrowed to one commit, exact mechanism not
-> yet pinpointed (2026-07-17, continued same day).** Discovered by
-> accident while checking on another session's live confirmation run for
+> **Status: OPEN, root cause found by code reading (2026-07-17, continued
+> same day), fix not yet written or verified.** Discovered by accident
+> while checking on another session's live confirmation run for
 > S-014/S-015. §2's original four reproductions were read as ruling out
 > all of this fork's S-009-S-015 cross-domain locks — **that conclusion
 > was wrong** (§3a): the "pre-S-009" bisection commit was mislabeled and
@@ -16,13 +16,24 @@ pinpointed
 > `interrupts.cc:530` line every prior reproduction froze at — §3b);
 > commit `94a0365951` itself (`layerLock`+`pioLock`, no `AddrRangeMap`
 > lock yet) **does** hang, same signature, confirmed by two stall
-> checkpoints (§3d). **This is a bug in this fork's own S-009
-> `layerLock`/`pioLock` change (or its interaction with pre-existing
-> code), not a pre-existing stock-gem5 bug** — §5's original hypothesis
-> is superseded on that point, though the underlying
-> `UncontendedMutex`-reentrancy mechanism it describes likely still
-> applies, just triggered by this fork's own lock rather than a stock
-> one. Exact reentrancy call path not yet read to a conclusion (§3c/§6).
+> checkpoints (§3d). Reading `94a0365951`'s code end to end (§6) then
+> found a complete, self-contained mechanism: `NoncoherentXBar::
+> recvReqRetry` holds `layerLock` across `retryWaiting`→`sendRetry`→a
+> peer's `PacketQueue::sendDeferredPacket`, which stock gem5's own
+> (unmodified) comment already documents as re-entrant ("sending of the
+> packet in some cases causes a new packet to be enqueued... leading to
+> a new response") — the second, nested `recvTimingReq` call tries to
+> re-acquire the same non-reentrant `UncontendedMutex`, self-deadlocking
+> on the futex. No cross-domain execution needed; structurally the same
+> class of bug S-014/S-015 already fixed in `packet_queue.cc`, just not
+> yet applied to `layerLock`. High confidence from code reading, not yet
+> confirmed by a live backtrace (`ptrace_scope=1` still blocks
+> `gdb`/`strace`) or by writing/testing a fix. **This is a bug in this
+> fork's own S-009 `layerLock`/`pioLock` change, not a pre-existing
+> stock-gem5 bug** — §5's original hypothesis is superseded on that
+> point, though the underlying `UncontendedMutex`-reentrancy mechanism it
+> describes was correct in kind, just misattributed to a stock lock
+> rather than this fork's own (§6).
 
 ## 1. What happened
 
@@ -390,15 +401,94 @@ best-supported hypothesis given the evidence (deterministic timing,
 variable tested, and now a positive lock-in via bisection), not a
 demonstrated mechanism.
 
-## 6. Not yet done
+## 6. Root cause found by direct code reading: `recvReqRetry` holds
+`layerLock` across a call chain stock gem5 already documents as
+re-entrant
 
-- Read `94a0365951`'s diff against `BaseXBar`/`NoncoherentXBar`/
-  `PioDevice` directly for a concrete reentrancy path: does any
-  south-bridge `PioDevice`'s `read()`/`write()` (PIT/RTC/IDE/console)
-  synchronously call back into the *same* device's `pioLock`, or does
-  `NoncoherentXBar`'s `layerLock`-guarded body synchronously re-enter
-  itself (e.g. via a retry callback fired from within the locked
-  region)? This is now the most promising concrete next step (§3d).
+Read `94a0365951`'s `NoncoherentXBar`/`BaseXBar::Layer`/`PacketQueue`
+code (the exact commit that reproduces, per §3d) end to end for the
+concrete mechanism, rather than a live backtrace (still blocked by
+`ptrace_scope=1`). Found a complete, self-contained reentrant-lock bug:
+
+1. `NoncoherentXBar::recvReqRetry(mem_side_port_id)`
+   (`noncoherent_xbar.cc:241-249` at `94a0365951`) takes
+   `std::lock_guard<UncontendedMutex> lock(layerLock)` for its whole
+   body, then calls `reqLayers[mem_side_port_id]->recvRetry()`.
+2. `BaseXBar::Layer::recvRetry()` (`xbar.cc:307-326`), if the layer is
+   `IDLE`, calls `retryWaiting()` — **still inside the `layerLock`
+   critical section**, since `releaseLayer()` is the only other caller
+   of `retryWaiting()` and at this commit does not yet lock
+   independently (that's a separate later change, S-015 — see below).
+3. `retryWaiting()` (`xbar.cc:274-303`) calls `sendRetry(retryingPort)`.
+   Its own comment says plainly: *"tell the port to retry, which **in
+   some cases ends up calling the layer again**"* (`xbar.cc:296-297`).
+4. `sendRetry(ResponsePort*)` (`xbar.hh:274-278`) calls
+   `retry_port->sendRetryReq()` — a synchronous call to whatever is
+   wired to this xbar's cpu-side port.
+5. For any peer using the standard `QueuedRequestPort`
+   (`qport.hh:121`), `recvReqRetry()` → `reqQueue.retry()` →
+   `PacketQueue::retry()` (`packet_queue.cc`, stock/unmodified at this
+   commit — no `pqLock` yet) → `sendDeferredPacket()`, whose own
+   pre-existing, unmodified comment says: *"take the packet off the
+   list before sending it, as sending of the packet in some cases
+   causes a new packet to be enqueued (most notably when responding to
+   the timing CPU, leading to a new request hitting in the L1 icache,
+   leading to a new response)"* — i.e. this calls `sendTiming(pkt)`
+   **synchronously**, which for a request headed back to the same xbar
+   port lands on `NoncoherentXBar::recvTimingReq()` — trying to
+   acquire `layerLock` a second time, on the same thread, inside the
+   still-live `lock_guard` from step 1.
+
+`UncontendedMutex` is explicitly documented as non-reentrant
+(`addr_range_map.hh:175`, `io_device.hh`). Step 5's second `lock_guard`
+construction blocks on the futex forever — the observed
+`wchan=futex_wait_queue`, frozen `utime`, deterministic freeze point
+(same boot-time PIO retry pattern every run, no dependence on
+wall-clock scheduling).
+
+**This requires no cross-domain execution or second thread at all** —
+pure same-thread, same-object reentrancy, which is exactly why it
+reproduces in single-threaded serial mode and does not require any of
+S-009's cross-domain motivation to trigger. It is also, structurally,
+**the identical class of bug S-014 (`occupyLayer` grid snap) and S-015
+(`pqLock` leaf-lock + tolerate-spurious-retry) already found and fixed
+in `packet_queue.cc`** — a lock wrapped around "the full body" of an
+entry point that stock gem5's own synchronous port-retry protocol can
+recurse back into — just not yet applied to `layerLock`/`xbar.cc`
+itself. S-015 §8's "leaf lock" design principle (hold the lock only
+around the minimal critical section that touches shared state; release
+it before calling into anything that can call back into the same
+object) is the established precedent for the fix shape here too:
+`recvReqRetry` should not hold `layerLock` across the
+`retryWaiting`/`sendRetry`/downstream-`sendTiming` call chain.
+
+Confirms (not merely narrows) §3c's "ordinary PIO device traffic, not
+the broadcast IPI" reading: this mechanism has nothing to do with
+`interrupts.cc` or local APICs specifically — any `PioDevice`
+(PIT/RTC/IDE/console, all active during FS boot) whose upstream port
+gets blocked-then-retried on the classic `iobus` (a `NoncoherentXBar`)
+hits this. `interrupts.cc:530`'s `hack_once` print is coincidental
+boot-sequence timing, not causal.
+
+**Confidence**: high, but not backed by an actual debugger backtrace
+(still blocked by this sandbox's `ptrace_scope=1`) — this is a code
+-reading proof of a viable, sufficient mechanism, matching every
+observed symptom, not a captured stack trace of the live hang. The
+next concrete step, if this needs to be nailed down further before
+fixing, would be adding a `DPRINTF`/temporary log at
+`NoncoherentXBar::recvReqRetry`'s `lock_guard` construction and at
+`NoncoherentXBar::recvTimingReq`'s, to confirm the second acquisition
+attempt's call stack matches this chain exactly. Not yet done. No fix
+has been written or applied.
+
+## 7. Not yet done
+
+- Confirm §6's mechanism with a `DPRINTF`/log-based trace (no debugger
+  needed) rather than relying on code reading alone, if a live
+  confirmation is wanted before writing the fix.
+- Write and verify the fix: apply S-015's leaf-lock pattern to
+  `NoncoherentXBar::recvReqRetry`/`recvTimingReq`/`recvTimingResp` in
+  `layerLock`'s use (§6) — not yet started, no code changes made.
 - Read `BaseSimpleCPU::wakeup`/`TimingSimpleCPU::activateContext`
   (already read this session — no lock or reentrancy found in either;
   `TimingSimpleCPU::activateContext`'s cross-domain `crossDomainSnap()`
