@@ -370,6 +370,41 @@ more-representative critical-path window for the four-core-balance
 question this spec is about. No further verification of S-013's own
 question is possible until S-014 is resolved or worked around.
 
+## 10. Follow-up: retried the longer window after S-014/S-015/S-016 landed -- blocked by a new, unrelated bug
+
+New session (2026-07-18), own worktree/branch
+(`s013-balanced-four-core-workload-checkpoint`, per ADR 0001 -- this
+spec's original commit had gone straight onto `main`, unlike later
+investigations). Since `INDEX.md` showed S-014 (the `occupyLayer`
+cross-domain crash that blocked §9) as fixed and merged, re-ran the same
+critical-path protocol against `x86-threads-balanced3-roi-classic` with
+`MAX_TICKS` raised from the previously-only-tested `2e8` to `2e9`
+(same operating point otherwise: `SIM_QUANTUM_TICKS=6660`,
+`EVENTQ_BARRIER_MODE=spin`, `EVENTQ_CRITPATH_TRACE=1`; host-pinned to
+CPUs 100-107, chosen after discovering a live ~8.7h three-arm comparison
+job already had 54-55/92-99 pinned).
+
+**The simulation itself got much further than before**: 20 periodic stat
+dumps (`STAT_DUMP_PERIOD=1e8`) each showing ~50-58K instructions retired,
+consistent throughout -- unlike §9's 74,588-instruction result, this
+window is not obviously stuck in guest boot, and the S-014 `occupyLayer`
+crash did not recur across the full 2e9-tick budget.
+
+**But the run crashed at exit anyway**, in a different, unrelated place:
+a segfault inside `critPathFlush()`, root-caused to a pre-existing
+thread-safety gap in `OutputDirectory` (S-012's own critical-path-tracing
+infrastructure never having been exercised at this window length before).
+Full writeup: **[S-012 §15](./S-012-eventq-critical-path-instrumentation-design.md#15-新发现的问题未修复长窗口下-critpathflush-段错误outputdirectory-非线程安全)**
+-- not this spec's topic, filed there since the bug is in S-012's own
+deliverable, not in anything S-013 changed. This session did not attempt
+a fix.
+
+**Net effect on S-013's own question**: still unanswered. The blocker
+just changed from S-014's crash (now fixed) to this new one -- no
+critical-path histogram data from a real full-benchmark-length window
+exists yet for either the original or the balanced checkpoint. §8's
+options are all still open and still pending a decision.
+
 ---
 
 **Previous**: [S-012: EventQueue critical-path instrumentation design](./S-012-eventq-critical-path-instrumentation-design.md)

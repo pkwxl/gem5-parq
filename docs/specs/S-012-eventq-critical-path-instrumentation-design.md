@@ -1007,6 +1007,78 @@ vector 重新分配"这条路径本身**没有专门跑一次验证**——§13.
   比例"的分母是自洽的,不涉及跨运行比较,这里的用法没有违反 §5 的
   警告。
 
+## 15. 新发现的问题（未修复）：长窗口下 `critPathFlush()` 段错误——`OutputDirectory` 非线程安全
+
+S-013 分支的一次会话（2026-07-18）想验证 S-014/S-015/S-016 修复合并进
+`main` 后，能否重新跑通 S-013 §9 因为 `occupyLayer` 崩溃而中断的长窗口
+关键路径校验——把 `MAX_TICKS` 从之前唯一验证过的 `2e8` 提到 `2e9`（同一
+工作点：`SIM_QUANTUM_TICKS=6660`、`EVENTQ_BARRIER_MODE=spin`、
+`EVENTQ_CRITPATH_TRACE=1`、检查点 `x86-threads-balanced3-roi-classic`，
+宿主 CPU 100-107，避开了同时段另一个在跑的 ~8.7h 三臂对照任务占用的
+54-55/92-99）。这次校验不是本文档的话题，但撞上的问题出在本文档设计/
+实现的插桩基础设施本身，记在这里而不是 S-013。
+
+**仿真本身跑到头了**：`STAT_DUMP_PERIOD=1e8` 周期性打点 20 次，每个
+周期约 5.0-5.8 万条指令，量级持续、没有"还卡在 guest 启动阶段"的迹象
+——跟 S-013 §9 那次只有 74588 条指令、明显还在启动阶段的结果不同，这
+次窗口大概率已经覆盖到了 benchmark 真正的并行计算阶段，`occupyLayer`
+崩溃（S-014）这次全程没有再出现。
+
+**但退出阶段段错误了**：崩溃点在 `critPathFlush()`
+（`src/base/critpath_trace.cc:59`），backtrace 顶部经过
+`OutputDirectory::create`/`open`（`src/base/output.cc`）内部的分配
+路径，底部是 `_start → __libc_start_main → …exit handler… →
+critPathFlush`——即域 0 通过 `std::atexit(critPathFlush)`
+（`src/sim/simulate.cc:274`）注册的那次调用，运行在主线程、在
+`simulate()` 已经正常返回、7 个子线程都已经 `join()` 完之后。
+
+**根因（读代码确认，未做进一步复现/调试）**：`OutputDirectory`（全局
+单例 `simout`）的文件表是一个普通
+`std::map<std::string, OutputStream*> files`
+（`src/base/output.hh:141/147`），整个类没有任何锁（`mutex`/`lock`
+零命中）。本文档 §4 的插桩设计是"每个域线程退出时自己调
+`critPathFlush()`"（`thread_main` 里 `terminate` 变 true 之后，
+`src/sim/simulate.cc:221`）——因为所有域共享同一个 quantum 屏障，7 个
+子线程大概率在几乎同一个 wall-clock 时刻一起看到 `terminate==true`
+并几乎同时各自调用 `simout.create()`，对同一个 `files` map 做并发
+`operator[]` 插入/红黑树重新平衡——这是未定义行为，能造成堆损坏，
+表现为之后（不一定是触发那次插入本身）某次分配崩溃，跟这次崩溃恰好
+出现在"最后一个、也是覆盖时间最长的"域 0 atexit 调用里的现象吻合。
+
+**一个还没解释清楚的细节**：输出目录里只有一个空的
+`critpath-domain0.csv`（0 字节），域 1-7 一个文件都没有产生——如果
+纯粹是堆损坏在域 0 这次调用才触发崩溃，域 1-7 的 flush 应该已经在
+此之前成功完成、留下非空文件才对。目前没有确认这是"域 1-7 的
+`critPathBuffer` 在这次跑里实际上是空的"（插桩没生效，另一个功能性
+bug）、还是"域 1-7 也崩了但某种原因没有终止整个进程"（不太像，一个
+线程段错误通常会终止整个进程）、还是别的原因——需要进一步读代码/
+复现才能确定，这次会话没有做。
+
+**范围**：这个 bug 独立于 S-013 本身的问题（四核不均衡）和
+S-014/S-015/S-016——是本文档（S-012）自己的插桩基础设施里一个此前
+从未触发过的线程安全缺口，因为之前所有开着 `EVENTQ_CRITPATH_TRACE`
+的跑（§13、S-013 §7）都只验证过 `MAX_TICKS=2e8` 这个短窗口，从没有
+真正让 8 个域线程在同一时刻各自触发过退出路径。S-013 §9 遗留的"更长
+窗口下四核是否依然不均衡"这个问题因此继续被挡住——现在挡路的是这个
+新问题，不再是 S-014 的 `occupyLayer` 崩溃（那个已经在这次跑里被绕过，
+2e9 ticks 全程跑完都没有再触发）。
+
+**本次会话未做、留给后续**：
+1. 确认域 1-7 CSV 缺失的原因。
+2. 在 `OutputDirectory::create`/`open`/`find`/`createSubdirectory` 等
+   公共接口上补一把互斥锁（最直接的修法，范围小，风险主要在于
+   `OutputDirectory` 是否有别的地方假设它不会被并发调用，需要审计）。
+3. 修复后用同样的长窗口（`MAX_TICKS=2e9`，同检查点）重跑一次确认不再
+   崩溃，且 8 份 CSV 都产生、内容合理。
+4. 确认之后再回到 S-013 自己的问题——用这份长窗口的关键路径数据判断
+   域 3 的不均衡在完整 benchmark 尺度下是否依然存在。
+
+这份记录只是"如实报告一次意外的崩溃并定位到读代码能确认的根因"，不是
+一次完整调试/修复的记录——按 CLAUDE.md 的 checkpoint 约定，动手修
+`src/base/output.cc` 属于新的、更有风险的子阶段（触碰的是 gem5 通用
+基础设施而不是本项目自己的代码，且目前的根因分析还没有实际复现/调试
+验证过），需要先跟用户确认范围再开始。
+
 ---
 
 **上一篇**：[S-011：Consumer 锁 owner 字段竞争审计](./S-011-consumer-lock-owner-race-audit.md)
