@@ -125,6 +125,7 @@ OutputDirectory::OutputDirectory(const std::string &name)
 
 OutputDirectory::~OutputDirectory()
 {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     for (auto& f: files) {
         if (f.second)
             delete f.second;
@@ -151,6 +152,7 @@ OutputDirectory::close(OutputStream *file)
         return;
     }
 
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     auto i = files.find(file->name());
     if (i == files.end())
         fatal("Attempted to close an unregistred file stream");
@@ -163,6 +165,7 @@ OutputDirectory::close(OutputStream *file)
 void
 OutputDirectory::setDirectory(const std::string &d)
 {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     const std::string old_dir(dir);
 
     dir = d;
@@ -194,6 +197,7 @@ OutputDirectory::setDirectory(const std::string &d)
 const std::string &
 OutputDirectory::directory() const
 {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     if (dir.empty())
         panic("Output directory not set!");
 
@@ -203,6 +207,7 @@ OutputDirectory::directory() const
 std::string
 OutputDirectory::resolve(const std::string &name) const
 {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     return !isAbsolute(name) ? dir + name : name;
 }
 
@@ -213,6 +218,7 @@ OutputDirectory::create(const std::string &name, bool binary, bool no_gz)
     if (file)
         return file;
 
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     const std::ios_base::openmode mode(
         std::ios::trunc | (binary ? std::ios::binary : (std::ios::openmode)0));
     const bool recreateable(!isAbsolute(name));
@@ -226,6 +232,7 @@ OutputDirectory::open(const std::string &name,
                       bool recreateable,
                       bool no_gz)
 {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     OutputStream *os;
 
     if (!no_gz && name.find(".gz", name.length() - 3) < name.length()) {
@@ -250,6 +257,7 @@ OutputDirectory::find(const std::string &name) const
     if (file)
         return file;
 
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     auto i = files.find(name);
     if (i != files.end())
         return (*i).second;
@@ -271,6 +279,7 @@ OutputDirectory::findOrCreate(const std::string &name, bool binary)
 bool
 OutputDirectory::isFile(const std::string &name) const
 {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     // definitely a file if in our data structure
     if (find(name) != NULL) return true;
 
@@ -282,6 +291,7 @@ OutputDirectory::isFile(const std::string &name) const
 OutputDirectory *
 OutputDirectory::createSubdirectory(const std::string &name)
 {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     const std::string new_dir = resolve(name);
     if (new_dir.find(directory()) == std::string::npos)
         fatal("Attempting to create subdirectory not in m5 output dir\n");
@@ -295,6 +305,7 @@ OutputDirectory::createSubdirectory(const std::string &name)
 void
 OutputDirectory::remove(const std::string &name, bool recursive)
 {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     const std::string fname = resolve(name);
 
     if (fname.find(directory()) == std::string::npos)
