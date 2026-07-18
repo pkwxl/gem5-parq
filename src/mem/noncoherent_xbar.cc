@@ -101,7 +101,14 @@ NoncoherentXBar::~NoncoherentXBar()
 bool
 NoncoherentXBar::recvTimingReq(PacketPtr pkt, PortID cpu_side_port_id)
 {
-    std::lock_guard<UncontendedMutex> lock(layerLock);
+    // S-016: layerLock is no longer taken for this whole function body --
+    // tryTiming()/failedTiming()/succeededTiming() each manage it
+    // internally now (xbar.cc), scoped to just the Layer state they touch,
+    // since sendTimingReq() below can synchronously recurse back into this
+    // same xbar (via a peer's retry handling) and a whole-body lock would
+    // then self-deadlock trying to re-acquire itself. Only routeTo below
+    // still needs its own explicit narrow lock_guard, since it isn't part
+    // of Layer.
 
     // determine the source port based on the id
     ResponsePort *src_port = cpuSidePorts[cpu_side_port_id];
@@ -164,6 +171,7 @@ NoncoherentXBar::recvTimingReq(PacketPtr pkt, PortID cpu_side_port_id)
 
     // remember where to route the response to
     if (expect_response) {
+        std::lock_guard<UncontendedMutex> lock(layerLock);
         assert(routeTo.find(pkt->req) == routeTo.end());
         routeTo[pkt->req] = cpu_side_port_id;
     }
@@ -181,15 +189,21 @@ NoncoherentXBar::recvTimingReq(PacketPtr pkt, PortID cpu_side_port_id)
 bool
 NoncoherentXBar::recvTimingResp(PacketPtr pkt, PortID mem_side_port_id)
 {
-    std::lock_guard<UncontendedMutex> lock(layerLock);
-
     // determine the source port based on the id
     RequestPort *src_port = memSidePorts[mem_side_port_id];
 
-    // determine the destination
-    const auto route_lookup = routeTo.find(pkt->req);
-    assert(route_lookup != routeTo.end());
-    const PortID cpu_side_port_id = route_lookup->second;
+    // determine the destination. S-016: looked up under a narrow lock and
+    // by key (not by holding the iterator) since schedTimingResp() below
+    // can recurse back into this xbar's recvTimingReq/recvTimingResp on
+    // the same thread, and a concurrent cross-domain insert into routeTo
+    // in that window could rehash the map and invalidate a held iterator.
+    PortID cpu_side_port_id;
+    {
+        std::lock_guard<UncontendedMutex> lock(layerLock);
+        const auto route_lookup = routeTo.find(pkt->req);
+        assert(route_lookup != routeTo.end());
+        cpu_side_port_id = route_lookup->second;
+    }
     assert(cpu_side_port_id != InvalidPortID);
     assert(cpu_side_port_id < respLayers.size());
 
@@ -225,8 +239,12 @@ NoncoherentXBar::recvTimingResp(PacketPtr pkt, PortID mem_side_port_id)
     cpuSidePorts[cpu_side_port_id]->schedTimingResp(pkt,
                                         curTick() + latency);
 
-    // remove the request from the routing table
-    routeTo.erase(route_lookup);
+    // remove the request from the routing table (by key -- see the
+    // narrow-lock comment above)
+    {
+        std::lock_guard<UncontendedMutex> lock(layerLock);
+        routeTo.erase(pkt->req);
+    }
 
     respLayers[cpu_side_port_id]->succeededTiming(packetFinishTime);
 
@@ -241,7 +259,10 @@ NoncoherentXBar::recvTimingResp(PacketPtr pkt, PortID mem_side_port_id)
 void
 NoncoherentXBar::recvReqRetry(PortID mem_side_port_id)
 {
-    std::lock_guard<UncontendedMutex> lock(layerLock);
+    // S-016: no lock here -- recvRetry() (xbar.cc) manages xbar.layerLock
+    // itself now, scoped to avoid holding it across the synchronous
+    // sendRetry() call it can end in (which recurses back into this same
+    // xbar's recvTimingReq/recvTimingResp).
 
     // responses never block on forwarding them, so the retry will
     // always be coming from a port to which we tried to forward a

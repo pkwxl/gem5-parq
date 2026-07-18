@@ -179,6 +179,14 @@ BaseXBar::Layer<SrcType, DstType>::crossDomainSnap(Tick until) const
 template <typename SrcType, typename DstType>
 void BaseXBar::Layer<SrcType, DstType>::occupyLayer(Tick until)
 {
+    // Caller must already hold xbar.layerLock (S-016): this only touches
+    // Layer-local state (occupancy) and schedules releaseEvent, both of
+    // which need the same cross-domain protection as the rest of this
+    // class's state, but this function itself never calls anything that
+    // can recurse back into the xbar, so unlike tryTiming/succeededTiming/
+    // failedTiming/retryWaiting it does not manage the lock itself --
+    // doing so would self-deadlock against a caller that already holds it.
+
     // ensure the state is busy at this point, as the layer should
     // transition from idle as soon as it has decided to forward the
     // packet to prevent any follow-on calls to sendTiming seeing an
@@ -206,6 +214,12 @@ template <typename SrcType, typename DstType>
 bool
 BaseXBar::Layer<SrcType, DstType>::tryTiming(SrcType* src_port)
 {
+    // S-016: locked here (not by the caller) so the critical section
+    // covers only this state check/transition, not whatever the caller
+    // does with the result (which can include a synchronous call back
+    // into this same xbar -- see retryWaiting()).
+    std::lock_guard<UncontendedMutex> lock(xbar.layerLock);
+
     // if we are in the retry state, we will not see anything but the
     // retrying port (or in the case of the snoop ports the snoop
     // response port that mirrors the actual CPU-side port) as we leave
@@ -237,6 +251,8 @@ template <typename SrcType, typename DstType>
 void
 BaseXBar::Layer<SrcType, DstType>::succeededTiming(Tick busy_time)
 {
+    std::lock_guard<UncontendedMutex> lock(xbar.layerLock);
+
     // we should have gone from idle or retry to busy in the tryTiming
     // test
     assert(state == BUSY);
@@ -250,6 +266,8 @@ void
 BaseXBar::Layer<SrcType, DstType>::failedTiming(SrcType* src_port,
                                               Tick busy_time)
 {
+    std::lock_guard<UncontendedMutex> lock(xbar.layerLock);
+
     // ensure no one got in between and tried to send something to
     // this port
     assert(waitingForPeer == NULL);
@@ -272,34 +290,42 @@ void
 BaseXBar::Layer<SrcType, DstType>::releaseLayer()
 {
     // This is releaseEvent's callback, invoked directly by this layer's
-    // own domain's EventQueue::serviceOne() -- unlike recvTimingReq/
-    // recvTimingResp/recvReqRetry (noncoherent_xbar.cc), which each take
-    // xbar.layerLock around their whole body before touching this same
-    // Layer/PacketQueue state, nothing protected this call chain
-    // (retryWaiting -> occupyLayer/sendRetry -> the peer's
-    // PacketQueue::retry()) before now. recvTimingReq can run on a
-    // different domain's host thread than this one, so without this
-    // lock the two call chains could mutate the same state
-    // unsynchronized (S-015). Only acquired here, not in
-    // retryWaiting()/occupyLayer() themselves, since retryWaiting() is
-    // also reached via recvRetry() <- NoncoherentXBar::recvReqRetry(),
-    // which already holds this same (non-recursive) lock.
-    std::lock_guard<UncontendedMutex> lock(xbar.layerLock);
+    // own domain's EventQueue::serviceOne(). recvTimingReq/recvTimingResp/
+    // recvReqRetry (noncoherent_xbar.cc) and this method can run on
+    // different domains' host threads and touch the same Layer state, so
+    // the state transition below needs xbar.layerLock (S-015). S-016:
+    // narrowed to just the state transition -- retryWaiting()/
+    // signalDrainDone() run unlocked below, since retryWaiting() ends in a
+    // synchronous sendRetry() call that can recurse back into this same
+    // xbar (see xbar.hh's layerLock comment); holding the lock across that
+    // call self-deadlocks the very first time it happens.
+    bool do_retry = false;
+    bool do_signal_drain_done = false;
+    {
+        std::lock_guard<UncontendedMutex> lock(xbar.layerLock);
 
-    // releasing the bus means we should now be idle
-    assert(state == BUSY);
-    assert(!releaseEvent.scheduled());
+        // releasing the bus means we should now be idle
+        assert(state == BUSY);
+        assert(!releaseEvent.scheduled());
 
-    // update the state
-    state = IDLE;
+        // update the state
+        state = IDLE;
 
-    // bus layer is now idle, so if someone is waiting we can retry
-    if (!waitingForLayer.empty()) {
-        // there is no point in sending a retry if someone is still
-        // waiting for the peer
-        if (waitingForPeer == NULL)
-            retryWaiting();
-    } else if (waitingForPeer == NULL && drainState() == DrainState::Draining) {
+        // bus layer is now idle, so if someone is waiting we can retry
+        if (!waitingForLayer.empty()) {
+            // there is no point in sending a retry if someone is still
+            // waiting for the peer
+            if (waitingForPeer == NULL)
+                do_retry = true;
+        } else if (waitingForPeer == NULL &&
+                   drainState() == DrainState::Draining) {
+            do_signal_drain_done = true;
+        }
+    }
+
+    if (do_retry) {
+        retryWaiting();
+    } else if (do_signal_drain_done) {
         DPRINTF(Drain, "Crossbar done draining, signaling drain manager\n");
         //If we weren't able to drain before, do it now.
         signalDrainDone();
@@ -310,34 +336,45 @@ template <typename SrcType, typename DstType>
 void
 BaseXBar::Layer<SrcType, DstType>::retryWaiting()
 {
-    // this should never be called with no one waiting
-    assert(!waitingForLayer.empty());
+    SrcType* retryingPort;
+    {
+        std::lock_guard<UncontendedMutex> lock(xbar.layerLock);
 
-    // we always go to retrying from idle
-    assert(state == IDLE);
+        // this should never be called with no one waiting
+        assert(!waitingForLayer.empty());
 
-    // update the state
-    state = RETRY;
+        // we always go to retrying from idle
+        assert(state == IDLE);
 
-    // set the retrying port to the front of the retry list and pop it
-    // off the list
-    SrcType* retryingPort = waitingForLayer.front();
-    waitingForLayer.pop_front();
+        // update the state
+        state = RETRY;
 
-    // tell the port to retry, which in some cases ends up calling the
-    // layer again
+        // set the retrying port to the front of the retry list and pop it
+        // off the list
+        retryingPort = waitingForLayer.front();
+        waitingForLayer.pop_front();
+    }
+
+    // Tell the port to retry, which in some cases ends up calling the
+    // layer again -- i.e. a synchronous call back into this same xbar's
+    // recvTimingReq/recvTimingResp/recvReqRetry, on the same thread
+    // (S-016). Must not hold xbar.layerLock across this call.
     sendRetry(retryingPort);
 
-    // If the layer is still in the retry state, sendTiming wasn't
-    // called in zero time (e.g. the cache does this when a writeback
-    // is squashed)
-    if (state == RETRY) {
-        // update the state to busy and reset the retrying port, we
-        // have done our bit and sent the retry
-        state = BUSY;
+    {
+        std::lock_guard<UncontendedMutex> lock(xbar.layerLock);
 
-        // occupy the crossbar layer until the next clock edge
-        occupyLayer(xbar.clockEdge());
+        // If the layer is still in the retry state, sendTiming wasn't
+        // called in zero time (e.g. the cache does this when a writeback
+        // is squashed)
+        if (state == RETRY) {
+            // update the state to busy and reset the retrying port, we
+            // have done our bit and sent the retry
+            state = BUSY;
+
+            // occupy the crossbar layer until the next clock edge
+            occupyLayer(xbar.clockEdge());
+        }
     }
 }
 
@@ -345,25 +382,33 @@ template <typename SrcType, typename DstType>
 void
 BaseXBar::Layer<SrcType, DstType>::recvRetry()
 {
-    // we should never get a retry without having failed to forward
-    // something to this port
-    assert(waitingForPeer != NULL);
+    // S-016: retryWaiting() is called unlocked, below, since it ends in a
+    // synchronous call that can recurse back into this same xbar.
+    bool do_retry;
+    {
+        std::lock_guard<UncontendedMutex> lock(xbar.layerLock);
 
-    // add the port where the failed packet originated to the front of
-    // the waiting ports for the layer, this allows us to call retry
-    // on the port immediately if the crossbar layer is idle
-    waitingForLayer.push_front(waitingForPeer);
+        // we should never get a retry without having failed to forward
+        // something to this port
+        assert(waitingForPeer != NULL);
 
-    // we are no longer waiting for the peer
-    waitingForPeer = NULL;
+        // add the port where the failed packet originated to the front of
+        // the waiting ports for the layer, this allows us to call retry
+        // on the port immediately if the crossbar layer is idle
+        waitingForLayer.push_front(waitingForPeer);
 
-    // if the layer is idle, retry this port straight away, if we
-    // are busy, then simply let the port wait for its turn
-    if (state == IDLE) {
-        retryWaiting();
-    } else {
-        assert(state == BUSY);
+        // we are no longer waiting for the peer
+        waitingForPeer = NULL;
+
+        // if the layer is idle, retry this port straight away, if we
+        // are busy, then simply let the port wait for its turn
+        do_retry = (state == IDLE);
+        if (!do_retry)
+            assert(state == BUSY);
     }
+
+    if (do_retry)
+        retryWaiting();
 }
 
 PortID

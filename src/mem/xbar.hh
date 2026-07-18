@@ -352,10 +352,46 @@ class BaseXBar : public ClockedObject
     /**
      * Under the parallel-EventQueue split, this crossbar can be entered by a
      * synchronous cross-domain call chain running on a different domain's
-     * host thread (S-009 S 18/S 23) while sharing this same object with every
+     * host thread (S-009 S18/S23) while sharing this same object with every
      * other domain's calls; no other part of the class provides mutual
-     * exclusion for routeTo/reqLayers/respLayers. Held for the full body of
-     * the timing entry points, not scoped to individual field accesses.
+     * exclusion for routeTo/reqLayers/respLayers.
+     *
+     * S-016: originally held for the full body of each timing entry point
+     * (recvTimingReq/recvTimingResp/recvReqRetry) and of Layer::releaseLayer.
+     * That self-deadlocks in single-threaded (serial) mode: Layer::
+     * retryWaiting()'s sendRetry() call is a synchronous callback that, via a
+     * peer's PacketQueue::sendDeferredPacket() (whose own long-standing
+     * comment already documents this as expected -- "sending of the packet
+     * in some cases causes a new packet to be enqueued... leading to a new
+     * response"), can call straight back into this same xbar's
+     * recvTimingReq/recvTimingResp on the *same* thread, which then blocks
+     * trying to re-acquire this same non-reentrant UncontendedMutex. No
+     * second thread is needed to hit this -- it happens on ordinary
+     * boot-time south-bridge PIO retry traffic.
+     *
+     * Fixed by narrowing each acquisition to the specific fields it
+     * protects (Layer::state/waitingForLayer/waitingForPeer/occupancy, and
+     * BaseXBar::routeTo), released before calling into anything that can
+     * recurse (Layer::sendRetry(), and the sendTimingReq/schedTimingResp
+     * calls in recvTimingReq/recvTimingResp). See Layer::tryTiming/
+     * succeededTiming/failedTiming/retryWaiting/recvRetry/releaseLayer
+     * (xbar.cc) for the resulting per-method critical sections, and
+     * recvTimingReq/recvTimingResp/recvReqRetry (noncoherent_xbar.cc).
+     *
+     * This narrows, but does not fully close, the cross-domain window: a
+     * different domain's thread can now interleave a tryTiming() call
+     * while this layer is transiently in the RETRY state (between
+     * dropping the lock before sendRetry() and re-acquiring it after).
+     * That specific interleaving was already possible in stock gem5's
+     * single-threaded design (the RETRY state is deliberately re-entrant
+     * for the *same* retrying port's synchronous resend); under the
+     * parallel-EventQueue split it is now also reachable from a genuinely
+     * different thread, not just a same-thread recursive call. This is a
+     * deliberate, narrow relaxation in the same spirit as S-015's
+     * tolerate-spurious-retry change (relaxed cross-domain timing over a
+     * hard lock that cannot be held across a recursive call), not an
+     * oversight -- fully closing it would require restructuring the retry
+     * protocol to be asynchronous, out of scope here.
      */
     mutable UncontendedMutex layerLock{CritPathLockTag::LayerLock};
 
