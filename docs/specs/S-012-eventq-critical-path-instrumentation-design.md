@@ -1560,6 +1560,95 @@ X86_MESI_Three_Level_TSAN`，同一均衡检查点，`MAX_TICKS=2e8`，**开**
   去掉 `CacheLock` 竞争看份额是否变化）去证明因果，如实记录为相关性
   观察。
 
+## 18. 小时级别真实并行负载测试（§17.4 第一条遗留项的部分回应）
+
+用户要求：先把 §17 的结果记录下来（已完成），再"进行小时级别的测试，看看
+真实的并行负载下的情况是怎样的"。这一节记录那次跑的结果——**部分成功**：
+拿到了跨 70 分钟真实 wall-clock 的稳定性数据，但没能拿到 hour-scale 的
+关键路径 CSV（域级 last-arriver / 锁等待），原因是一个新发现的、跟 §16
+修复的 UAF 不同的操作性缺口。
+
+### 18.1 跑法
+
+沿用 S-013 §10 均衡检查点 `x86-threads-balanced3-roi-classic`，不设
+`MAX_TICKS`（即 §16.6 验证过的"跑到真实 `m5 exit`"模式），`STAT_DUMP_PERIOD=
+2000000000`（每 2e9 tick 落一次 stats.txt），`EVENTQ_CRITPATH_TRACE=1`，
+8 核心 `100-107`（核 92-99 当时被另一个并发会话的三臂对比任务占用，
+54-55/92-99 已用，只有 100-111 空闲——按 CLAUDE.md 的按核互斥策略选了
+100-107）。外层套了 `timeout 4200`（70 分钟）作为安全网，不是预期的
+终止方式：
+
+```
+CHECKPOINT_DIR=/workspace/gem5-ckpt/x86-threads-balanced3-roi-classic \
+PARALLEL_EVENTQ=1 SIM_QUANTUM_TICKS=6660 EVENTQ_BARRIER_MODE=spin \
+HOST_PIN_CPUS=100,101,102,103,104,105,106,107 \
+EVENTQ_CRITPATH_TRACE=1 STAT_DUMP_PERIOD=2000000000 \
+timeout 4200 taskset --cpu-list 100-107 ./build/X86_MESI_Three_Level/gem5.opt \
+  -d /tmp/s012-step5-hourscale docs/refs/scripts/x86_fs_mesi3_parallel_eventq.py
+```
+
+进程在 4200 秒（70 分钟）安全网到点后被 `timeout` 用默认信号
+（`SIGTERM`）杀掉，退出码 124——这是预期内的"没跑到真实 `m5 exit`"，
+不是崩溃。
+
+### 18.2 拿到了什么：1039 个周期的 wall-clock 吞吐数据
+
+`stats.txt` 长到 746 MB，包含 1039 个完整的周期性 dump（每个 2,000,006,660
+tick，累计约 2.078×10¹² tick 的模拟窗口，压在 70 分钟真实时间里）。逐个
+dump 的 `hostSeconds`（该 2e9-tick 周期消耗的真实墙钟秒数）：
+
+- 稳态（跳过前 20 个周期的暖机）均值 3.01s，但中位数/众数落在
+  2.63–2.72s 附近——吞吐大约 (2×10⁹ tick)/2.7s ≈ 7.4×10⁸ tick/s，
+  跟 S-013 §10 短窗口测的速率量级一致，**长跑 70 分钟没有看到平均
+  吞吐随时间系统性下降**（这是这次测试原本想确认的问题之一）。
+- 但有 **17 个周期的 `hostSeconds` 超过 5 秒**，最大 121.44s（第 893
+  个周期）和 60.29s（第 446 个周期），这 17 个异常周期加起来占了
+  386.82 秒，即整个 70 分钟真实时间的 **12.4%**。异常周期在跑的前半
+  段（1039 个周期的前 519 个）出现 12 次，后半段出现 5 次——不是简单
+  的单调恶化，但两个最大的异常值（60.29s、121.44s）都出现在后半段。
+  没有做根因排查（跟这次跑共存的还有另一个会话占用 92-99 核心的三臂
+  任务，可能是共享 LLC/内存带宽争用；也可能是 746MB `stats.txt`
+  增长带来的 I/O 开销；也可能是宿主机上无关的周期性任务）——如实记录
+  为**未解释的长尾停顿**，不归因。
+
+### 18.3 拿不到的东西：关键路径 CSV 全部丢失，一个新的操作性缺口
+
+`EVENTQ_CRITPATH_TRACE=1` 本该在退出时把每个域的 critpath buffer 落盘成
+`critpath-domain{0..7}.csv`（§13.4 起用于 `critpath_aggregate.py`），但
+`/tmp/s012-step5-hourscale/` 下一个 CSV 都没有。
+
+根因：`src/sim/simulate.cc` 里 `critPathFlush()` 是通过 Python 层
+`atexit.register()` 挂的（§16.3/§16.5 的修复——特意选 atexit 而不是
+signal handler，是为了避开 §16 那次 UAF）。`timeout` 默认发 `SIGTERM`，
+而 Python 进程对 `SIGTERM` **没有默认处理器**，OS 直接终止进程，不会
+触发解释器正常退出路径，因此不会跑 `atexit` 注册的回调——`critPathFlush()`
+根本没被调用。相比之下，gem5 原生 `Stats` 框架的周期性 dump
+（`STAT_DUMP_PERIOD`）是同步写入的，每次 dump 立即落盘，不依赖进程
+干净退出，所以 §18.2 的 1039 个周期数据完整保留了下来。
+
+这是一个跟 §15/§16 的 `critPathFlush()` UAF **不同的**缺口——§16 修的是
+"正常退出路径下线程没 join 导致用后释放"，这次暴露的是"非正常退出路径
+（外部信号杀掉）压根不会走到这条 atexit 路径"。两者都指向同一个更通用
+的问题：`critPathFlush()` 目前只在真实 `m5 exit`（`simulate.run()` 正常
+返回）时可靠，不管是崩溃、外部 kill，还是——理论上——`MAX_TICKS` 之外
+的任何非正常终止路径，关键路径 CSV 都会丢失，而 `stats.txt` 不会。
+
+### 18.4 这次测试对 §17.4 遗留项的净贡献
+
+- §17.4 第一条"2-3 次重复跑评估直方图跑间稳定性"**仍未解决**——这次
+  70 分钟跑没能提供任何新的关键路径直方图数据（§18.3），跟 §17.3 的
+  单次 `2e9`-tick 样本没有可比对象。
+- 新拿到的是一个 §17.3 没有覆盖的问题的答案："真实并行负载跑到小时
+  尺度，wall-clock 吞吐是否稳定"——答案是稳态吞吐确实稳定（§18.2 第一
+  条），但叠加了一个此前未知的、量级不小的长尾停顿现象（§18.2 第二
+  条），值得作为后续投资"出路 3"（往哪塞工作）之前的一个新警示信号，
+  而不是可以忽略的噪声——12.4% 的真实时间花在 17 个异常周期上，如果
+  这些停顿被证明系统性存在（而非这次跑偶然撞上邻居任务），会直接影响
+  用 wall-clock 时间做速度对比的可信度。
+- 若要真正拿到 hour-scale 的关键路径 CSV，需要改用有界 `MAX_TICKS`
+  （让 `simulator.run(max_ticks=...)` 正常返回，走干净退出路径），而
+  不是用 `timeout` 外部杀进程；本节没有做这次重跑，留给下一步。
+
 ---
 
 **上一篇**：[S-011：Consumer 锁 owner 字段竞争审计](./S-011-consumer-lock-owner-race-audit.md)
