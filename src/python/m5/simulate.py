@@ -264,6 +264,20 @@ def simulate(*args, **kwargs):
         # register our C++ exit callback function with Python
         atexit.register(_m5_core.doExitCleanup)
 
+        # Join the parallel-EventQueue subordinate threads (if any were
+        # started) and flush domain 0's own critical-path trace buffer,
+        # if S-012 tracing is on (see src/sim/simulate.cc's
+        # terminateEventQueueThreads() for why this must happen here
+        # rather than via a C++-level std::atexit(), and why it must
+        # run before the other two handlers above so the threads are
+        # fully wound down first -- registered last so it runs first,
+        # per the reverse-order comment above). Previously this was
+        # only called from fork(), which meant on an ordinary run the
+        # subordinate threads were simply never joined at all (S-012
+        # §16). Always safe to call even when parallel EventQueues were
+        # never used.
+        atexit.register(_m5_event.terminateEventQueueThreads)
+
         # Reset to put the stats in a consistent state.
         stats.reset()
 

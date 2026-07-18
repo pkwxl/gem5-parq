@@ -265,13 +265,11 @@ simulate(Tick num_cycles)
     if (!simulatorThreads) {
         simulatorThreads.reset(new SimulatorThreads(numMainEventQueues));
 
-        // Domain 0 (this thread) never "exits" the way subordinate
-        // threads do (design §4.4) -- simulate() returns and is
-        // re-entered many times from Python. Flush its critPathBuffer
-        // exactly once, at process exit, for symmetry with the
-        // subordinate threads' one-shot flush at thread exit. Registered
-        // only on the first simulate() call.
-        std::atexit(critPathFlush);
+        // Domain 0's own critPathBuffer flush, and joining the
+        // subordinate threads, both happen in terminateEventQueueThreads()
+        // -- see the comment there (S-012 §16) for why this used to be a
+        // std::atexit(critPathFlush) call here and why that was a
+        // deterministic use-after-free.
     }
 
     if (!simulate_limit_event) {
@@ -369,7 +367,43 @@ Tick get_max_tick()
 void
 terminateEventQueueThreads()
 {
-    simulatorThreads->terminateThreads();
+    // Historically only called from m5.simulate.fork() (Python), right
+    // before os.fork(), to avoid a child process inheriting threads
+    // parked mid-barrier. On an ordinary (non-fork) run that left this
+    // function never called at all: ~SimulatorThreads() (the only other
+    // caller of terminateThreads()) is a static-storage-duration
+    // object's destructor, registered at load time, so by C++'s
+    // reverse-registration-order exit sequence it runs very late --
+    // after the subordinate threads would ever get a chance to reach
+    // their own thread_main()-local critPathFlush() call (S-012 §16.2).
+    // Since S-012 §16, m5/simulate.py also registers this via
+    // atexit.register() so it runs once on every simulate() invocation,
+    // not just before a fork().
+    //
+    // simulatorThreads can be null if m5.simulate() was never called at
+    // all (e.g. a script that errors out before instantiating), so this
+    // must tolerate that rather than assume simulate() ran.
+    if (simulatorThreads)
+        simulatorThreads->terminateThreads();
+
+    // Domain 0 runs on the calling thread and never "exits" the way
+    // subordinate threads do (S-012 §4.4) -- simulate() returns and is
+    // re-entered many times from Python -- so there's no thread-join
+    // point to hang its own critPathFlush() off of the way subordinate
+    // domains do. This used to be a std::atexit(critPathFlush)
+    // registration instead, on the assumption that atexit-registered
+    // callbacks and this thread's own thread_local critPathBuffer
+    // destructor would race in a safe order. They don't: critPathBuffer
+    // registers its destructor lazily, on first use inside doSimLoop --
+    // which happens *after* simulate()'s atexit registration -- so by
+    // the LIFO exit sequence the buffer's destructor ran first,
+    // leaving critPathFlush() to iterate freed memory (S-012 §16.3, a
+    // deterministic use-after-free, confirmed under gdb). Calling it
+    // explicitly here instead, from a Python-level atexit callback
+    // (which runs during Py_Finalize(), strictly before any C++-level
+    // atexit/thread_local teardown), sidesteps that ordering hazard
+    // entirely rather than relying on it working out.
+    critPathFlush();
 }
 
 

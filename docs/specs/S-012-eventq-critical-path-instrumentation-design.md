@@ -1255,9 +1255,13 @@ CSV 都产生、内容合理"**？§16.2 的"子线程从不 join"和 §16.3 的
 "子线程正常退出时会被 join、各自 flush"之后，子线程并发 flush 的
 场景就会被真实触发，到时候这把锁就是必需的，不是防御性冗余。
 
-### 16.5 还没做的：真正的修复方案，需要用户确认范围再动手
+### 16.5 真正的修复方案（已实现，见 §16.6）
 
-§16.3 指出了两个需要修的独立缺口：
+用户明确的方向确认："不是应该每个核自己记录自己的信息，输出独立的
+文件，就行了吗？有没有说必须要生成一个统一的文件"——纠正了本节
+最初的框架（"找一个统一的清理钩子"听起来像是要重新设计），确认了
+本来的每域独立文件设计不用变，缺口只是"让每个域已经写好的自己那份
+flush 代码真正被执行到"。§16.3 指出了两个需要修的独立缺口：
 
 1. **子线程在正常（非 fork）退出路径上从未被终止/join**——
    `terminateEventQueueThreads()` 需要在正常退出路径上也被调用一次
@@ -1275,11 +1279,113 @@ CSV 都产生、内容合理"**？§16.2 的"子线程从不 join"和 §16.3 的
    `atexit`/`thread_local` 析构的注册顺序这种实现细节。
 
 这两处改动都会碰到 `src/sim/simulate.cc`（本项目已经改过的文件）和
-可能的 `src/python/m5/simulate.py`（尚未碰过、影响所有 gem5
-使用者的通用 Python 驱动代码，不只是本项目的脚本）——比 §15 原来
-设想的"给一个类加锁"的范围明显更大，属于 CLAUDE.md 说的"新的、更有
-风险的子阶段"，本节到此为止先如实报告根因，不在没有用户确认范围之前
-动手改这两处。
+`src/python/m5/simulate.py`（影响所有 gem5 使用者的通用 Python 驱动
+代码，不只是本项目的脚本）——比 §15 原来设想的"给一个类加锁"的范围
+明显更大，属于 CLAUDE.md 说的"新的、更有风险的子阶段"，报告完根因后
+先等用户确认了方向（§16.5 开头）才动手，没有自行展开。
+
+### 16.6 实现 + 验证
+
+**`src/sim/simulate.cc`**：删掉 `simulate()` 里的
+`std::atexit(critPathFlush);`。`terminateEventQueueThreads()`
+（原来只有 `simulatorThreads->terminateThreads();` 一行）改成两步：
+先给 `simulatorThreads` 补一个判空（`m5.simulate()`
+从未被调用过的脚本也能安全调用这个函数，不会解引用空指针）再调用
+`terminateThreads()`，然后显式调用一次 `critPathFlush()`——domain 0
+的 flush 从此和子线程的 flush 走同一个调用点，不再单独依赖
+`atexit`。
+
+**`src/python/m5/simulate.py`**：在 `simulate()` 函数
+`if need_startup:` 分支里，紧跟着已有的
+`atexit.register(_m5_core.doExitCleanup)` 之后，新增
+`atexit.register(_m5_event.terminateEventQueueThreads)`。选择"跟在
+`doExitCleanup` 后面注册"是为了让它比 `doExitCleanup`/`stats.dump`
+都先执行（Python exit handler 是后注册先执行，这份文件自己
+`stats.dump` 那行上面的注释已经点出这条规则）——线程 join
+和两类 flush 应该在其它退出期清理动作之前就确定性地完成，不依赖
+`doExitCleanup` 到底做了什么。这是 Python 层的
+`atexit.register()`，在 `Py_Finalize()` 阶段运行，保证先于 §16.3
+说的 C++ 层 `atexit()`/主线程 `thread_local` 析构顺序，从根上绕开
+了那场时序赌局，不是"调整时序赢下这场赌局"。
+
+**编译**：`X86_MESI_Three_Level` 干净重编译（这次改动会牵连
+`python/m5/defines.py.cc` 之类的内嵌 Python 产物，触发的重编译范围
+比只改 `output.cc` 大）。
+
+**崩溃修复验证**：用 §16.1 完全相同的长窗口协议（`MAX_TICKS=2e9`，
+其余参数不变）重跑——**不再崩溃，8 份 `critpath-domain{0..7}.csv`
+全部生成，每份 60-69 万行、22-25MB，内容格式正确**（`kind,tick,
+domainId,barrierPass,isLast,eventCount,dur_ns,lockTag` 表头 +
+逐行有效数据，抽查过 `critpath-domain3.csv` 开头几行）。日志里
+grep 不到任何 `segmentation`/`SIGSEGV`/`panic`/`fatal`/`dumped
+core` 字样。
+
+**正确性回归**（这处改动影响*每一次* gem5 运行，不只是开
+critpath tracing 的场合，所以不能只验证崩溃修好了）：同一检查点，
+`SIM_QUANTUM_TICKS=6660`、`MAX_TICKS=2e8`、**不开**
+`EVENTQ_CRITPATH_TRACE`，serial 臂（`taskset -c 100`）+ parallel/spin
+臂（host-pin 100-107）各跑一次，均 `exit=0`，两份 `stats.txt`
+（排除 `host*` 行）**逐字节相同**，日志里没有任何 error/exception/
+traceback。确认这个改动对已经验证过的行为没有引入回归——`
+terminateEventQueueThreads()` 现在会在**每一次** gem5 运行结束时
+被调用（以前只有 `fork()` 前才调用），但 `simulatorThreads`
+判空 + `terminateThreads()` 自己的 `if (threads.empty()) return;`
++ `critPathFlush()` 自己的 `if (critPathBuffer.empty()) return;`
+三层保护让它在"没开并行 EventQueue"/"没开 critpath tracing"的
+普通场景下都是安全的空操作。
+
+**TSan 验证**：`build_opts/X86_MESI_Three_Level_TSAN` + `scons
+--with-tsan` 编译（沙盒里第一次装 TSan build，之前的会话都是复用
+已经编译好的，这次确认 `--with-tsan` 这条路径本身也是通的）。同一
+长窗口协议缩到 `MAX_TICKS=2e8`（保持开着 `EVENTQ_CRITPATH_TRACE`，
+跑到真正触发 join+双重 flush 这条新代码路径即可，不需要重跑 2e9
+去省时间）——**不崩溃，8 份 CSV 正常产生**，但 TSan 报了 3 条新
+警告：
+
+1. 一条在 `EventQueue::getCurTick()`（`eventq.hh:875`）——T3 通过
+   `Consumer::commitTick → EventQueue::schedule → getCurTick()`
+   读某个 EventQueue 的 `curTick`，和 T5 自己 `serviceOne()` 里的
+   `setCurTick()` 写并发。
+2. 两条在 `Flags<unsigned short>::set()`/`isSet()`
+   （`flags.hh:116`/`83`）——同一个 `Event`（挂在一个 `Switch`
+   路由器对象上）的标志位，T3 通过同一条
+   `Consumer::commitTick → EventQueue::schedule` 调用链写
+   （给事件打 "Scheduled" 一类的标志），T5 在自己的
+   `serviceOne() → Event::isExitEvent()` 里并发读。
+
+这三条都出在 `Consumer::scheduleEventAbsolute`/`commitTick`
+（`src/mem/ruby/common/Consumer.cc`）跨域调度 `Throttle`/`Switch`
+的 wakeup 事件这条路径上——**跟这次改动完全无关**（没碰
+`Consumer.cc`/`eventq.cc`/`eventq.hh`/`flags.hh`，这次只改了
+`output.cc`/`simulate.cc`/`simulate.py`）。`Consumer.cc:94` 自己的
+注释说"Always called under lock()...so all the scheduling state
+here is race-free"，指的是 `Consumer` 自己的记账状态
+（`m_inflight_ticks` 等）在并发调用间受 `m_wakeup_mutex`
+（CLAUDE.md 列的四把已知跨域锁之一）保护；但 TSan 抓到的读写发生
+在 `em->schedule(...)` **内部**、直接触达**目标域自己的**
+`EventQueue`/`Event` 状态，而目标域自己的 `serviceOne()`
+循环并不知道、也不需要去拿这把 `Consumer` 锁——`Consumer.cc:131-134`
+的注释("schedule() is legal from any thread -- ... routed through
+asyncInsert() ... quantum snap guarantees is still ahead")暗示这条
+路径本来设计上应该走异步安全的插入通道，但 TSan 抓到的这两个具体
+操作（`getCurTick()` 读、`Flags::set()` 写）看起来发生在真正路由
+到 `asyncInsert()` 之前——是不是这个设计缝隙、还是本来就该被前面
+某层挡住，需要专门去读 `EventQueue::schedule()` 内部实现才能确认，
+本次没有做这一步。
+
+**这三条警告不是这次改动引入的新竞态**——`Consumer::
+scheduleEventAbsolute` 跨域调度贯穿整个仿真过程，不只是退出阶段，
+S-002/S-003 就已经在处理这一类问题。但这大概率是**这三条竞态第一次
+在这个项目的 TSan 记录里被观测到**：在这次修复之前，任何一次
+critpath-traced 或者非-traced 的正常（非 fork）退出，子线程都从未
+真正被 join 过（§16.2）——包括 S-009 §24/§25、S-016 §8
+等历史上所有跑过 TSan 扩时长 A/B 的会话，因为它们同样从未调用过
+`terminateEventQueueThreads()`。这次是这个项目历史上第一次有 TSan
+观测覆盖到"多个域几乎同时收敛到退出条件、同时结束各自 doSimLoop"
+这个特定时间窗口——不是这次改动本身制造了竞态，而是这次改动第一次
+让 TSan 有机会看到这个一直存在、但从未被真正跑到退出路径的窗口。
+是否需要单独立项（新 S-NNN）追查 `EventQueue::schedule()`
+跨域路径这个具体缝隙，留给用户决定，本节到此为止不展开。
 
 ---
 
