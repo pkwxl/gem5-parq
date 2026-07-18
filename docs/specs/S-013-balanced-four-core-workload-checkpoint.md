@@ -1,14 +1,18 @@
 # S-013 — Balanced four-core workload + new checkpoint (in progress)
 
-**Status: new benchmark + new checkpoint built and verified against
-S-012's critpath protocol -- but the fix did NOT balance the four cores.**
-The imbalance persists at essentially the same magnitude, just on a
-different domain (domain 3 instead of domain 1). §7 reports this plainly,
-and a determinism re-run (same checkpoint, repeated) shows domain 3 wins
-reproducibly (~51-53% both times) rather than by chance -- ruling out a
-pure per-run-chaos explanation, but leaving the actual structural cause
-unidentified. §8 lists next-step options; none taken yet, pending a
-decision. This is a direct follow-on to
+**Status: new benchmark + new checkpoint built; the fix partially
+balanced the four cores.** §7's short-window verification (mostly
+boot-phase, per §9) found the imbalance persisting at the same
+magnitude on a different domain (domain 3 instead of domain 1).
+§11's real-window data (after S-012 §16 fixed the crash blocking
+this) tells a different, better story: the imbalance is now spread
+across **three** domains (1/3/4, ~21-31% each) rather than one
+dominating domain, though a new asymmetry (domain 2 an outlier-low
+3.9%) remains unexplained, and lock-wait data suggests part of it may
+be contention-driven rather than pure compute imbalance. §8 lists
+next-step options, updated by §11's findings; the highest-value
+remaining one is understanding domain 2's outlier-low share. This is
+a direct follow-on to
 [S-012](./S-012-eventq-critical-path-instrumentation-design.md) §13.5's
 open question ("why is domain 1 / core 0 specifically the last-arriver"),
 filed as its own spec per the `INDEX.md` numbering convention rather than
@@ -369,6 +373,134 @@ but noted here since it blocks any further attempt to get a longer,
 more-representative critical-path window for the four-core-balance
 question this spec is about. No further verification of S-013's own
 question is possible until S-014 is resolved or worked around.
+
+## 10. Follow-up: retried the longer window after S-014/S-015/S-016 landed -- blocked by a new, unrelated bug
+
+New session (2026-07-18), own worktree/branch
+(`s013-balanced-four-core-workload-checkpoint`, per ADR 0001 -- this
+spec's original commit had gone straight onto `main`, unlike later
+investigations). Since `INDEX.md` showed S-014 (the `occupyLayer`
+cross-domain crash that blocked §9) as fixed and merged, re-ran the same
+critical-path protocol against `x86-threads-balanced3-roi-classic` with
+`MAX_TICKS` raised from the previously-only-tested `2e8` to `2e9`
+(same operating point otherwise: `SIM_QUANTUM_TICKS=6660`,
+`EVENTQ_BARRIER_MODE=spin`, `EVENTQ_CRITPATH_TRACE=1`; host-pinned to
+CPUs 100-107, chosen after discovering a live ~8.7h three-arm comparison
+job already had 54-55/92-99 pinned).
+
+**The simulation itself got much further than before**: 20 periodic stat
+dumps (`STAT_DUMP_PERIOD=1e8`) each showing ~50-58K instructions retired,
+consistent throughout -- unlike §9's 74,588-instruction result, this
+window is not obviously stuck in guest boot, and the S-014 `occupyLayer`
+crash did not recur across the full 2e9-tick budget.
+
+**But the run crashed at exit anyway**, in a different, unrelated place:
+a segfault inside `critPathFlush()`, root-caused to a pre-existing
+thread-safety gap in `OutputDirectory` (S-012's own critical-path-tracing
+infrastructure never having been exercised at this window length before).
+Full writeup: **[S-012 §15](./S-012-eventq-critical-path-instrumentation-design.md#15-新发现的问题未修复长窗口下-critpathflush-段错误outputdirectory-非线程安全)**
+-- not this spec's topic, filed there since the bug is in S-012's own
+deliverable, not in anything S-013 changed. This session did not attempt
+a fix.
+
+**Net effect on S-013's own question**: still unanswered. The blocker
+just changed from S-014's crash (now fixed) to this new one -- no
+critical-path histogram data from a real full-benchmark-length window
+exists yet for either the original or the balanced checkpoint. §8's
+options are all still open and still pending a decision.
+
+## 11. §10's blocker fixed (S-012 §16) -- the original question finally
+has a real-window answer, and it changes the picture substantially
+
+Same session, after S-012's `critPathFlush()` bug (§10's blocker) got
+root-caused and fixed (S-012 §16.3/§16.6: the crash was an
+`atexit`/`thread_local`-destructor ordering use-after-free, not the
+concurrent-map race originally guessed, and separately the subordinate
+threads were never joined on a normal exit at all). That fix has nothing
+to do with this spec's own topic, but it unblocks exactly the data this
+spec needed: `/tmp/s013-recheck/spin-2e9-fixed2/` is the first
+`critpath-domain*.csv` set ever produced from a real, full-window
+(`MAX_TICKS=2e9`, 300,300 quanta -- vs. §7's 30,030-quanta short window
+that §9 showed was mostly still inside guest thread startup) run against
+this spec's balanced checkpoint. Running it through the same
+`critpath_aggregate.py` used throughout S-012/S-013:
+
+```
+=== barrier pass 1 (quantum-local events done) -- 300300 quanta ===
+  domain   last-arriver count    share   avg eventCount when last
+       4                94622    31.5%                       28.0
+       3                74905    24.9%                       27.3
+       1                63531    21.2%                       27.3
+       5                25009     8.3%                        7.4
+       6                15219     5.1%                        4.8
+       7                13436     4.5%                        5.1
+       2                11852     3.9%                       18.6
+       0                 1726     0.6%                        1.0
+```
+
+This is a **materially different shape** from §7's short-window result
+(domain 3 alone at 51-53%, everything else in low single digits). At
+real scale, the imbalance is spread across **three** core-private
+domains -- domain 4 (core 3, 31.5%), domain 3 (core 2, 24.9%), domain 1
+(core 0, 21.2%), roughly 21-31% each -- not one domain dominating the
+other seven. Domain 2 (core 1) is the outlier in the *other* direction,
+rarely last (3.9%, even below the shared L3/memory domains 5-7). §7's
+"domain 3 wins reproducibly" result, taken at face value, was measuring
+mostly boot-phase behavior (§9 already established the short window
+under-covers the real benchmark) -- it wasn't wrong that domain 3 shows
+up often, but it overstated how dominant any single domain is once the
+window actually covers the parallel compute phase this spec's fix
+targeted.
+
+This doesn't fully vindicate §3's balancing fix either: a perfectly
+balanced four-core partition would put all four core-private domains
+(1-4) at roughly the same ~25% share, and domain 2 sitting at 3.9% while
+domains 1/3/4 sit at 21-31% is still a real, if much smaller,
+asymmetry -- three-way imbalance instead of one-way domination. Why
+domain 2 (core 1) specifically finishes fastest/most-consistently is a
+new, narrower open question, not one this session investigated (would
+need the same kind of guest-side `sched_getcpu()` diagnostic §8 option 1
+proposed, or a closer look at whether `threads_balanced.cpp`'s
+block-cyclic partition happens to give core 1's index range a smaller or
+less contended slice).
+
+**A bonus data point this run has that §7's didn't**: this build already
+included S-012 Step 4 (lock-wait instrumentation), so the same trace
+also has lock-wait data (S-012 §14's "unknown 2"):
+
+```
+  domain   total lock-wait ns  % of hostSeconds
+       1            129540325            10.795%
+       2             33280133             2.773%
+       3             13153144             1.096%
+       4            131717829            10.976%
+       5              1950751             0.163%
+       6              1560932             0.130%
+       7              1329582             0.111%
+```
+
+Domains 1 and 4 -- the two biggest last-arrivers besides domain 3 --
+also spend by far the most time blocked on `CacheLock` (~11% of
+`hostSeconds` each, vs. ~1-3% for domains 2/3 and under 0.2% for the
+shared domains). That's a real correlation, not proof of causation, and
+worth flagging rather than over-interpreting in the same session that
+found it: it suggests at least part of domains 1/4's last-arriver share
+may be lock-contention-driven rather than pure compute-volume-driven,
+which would be a different story from §2's original "it's raw
+element-op count" explanation for the *old* (pre-balancing) checkpoint.
+Not investigated further here.
+
+**Status update**: the checkpoint and benchmark from this spec are not
+being abandoned or judged newly successful -- they measurably changed
+the shape of the problem (one dominant domain -> three domains sharing
+the imbalance, plus a lock-wait correlation worth a closer look) but
+did not fully balance the four cores. §8's option list is superseded by
+this real-window data for options 2-3 (chunk_size experiments and
+"just proceed to Step 4 on the old checkpoint" are both less urgent now
+that Step 4 data already exists on the *new* checkpoint); option 1
+(guest-side `sched_getcpu()`/affinity diagnostic, now aimed at
+explaining domain 2's outlier-low share rather than a single dominant
+domain) remains the most direct next step if this gets picked back up.
 
 ---
 

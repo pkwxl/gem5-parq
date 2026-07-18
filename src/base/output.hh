@@ -44,6 +44,7 @@
 
 #include <ios>
 #include <map>
+#include <mutex>
 #include <string>
 
 #include "base/compiler.hh"
@@ -151,6 +152,20 @@ class OutputDirectory
 
     /** Name of this directory */
     std::string dir;
+
+    /**
+     * Guards files/dirs/dir. S-012's parallel-EventQueue critical-path
+     * tracing (critPathFlush(), base/critpath_trace.cc) calls into this
+     * object from multiple domain threads at once (they all flush right
+     * after the same quantum barrier releases them), so every public
+     * entry point below must serialize against that. Recursive because
+     * several public methods call each other on the same instance
+     * (create() -> open() -> OutputFile ctor -> resolve();
+     * createSubdirectory()/remove() call resolve()/directory()/isFile()
+     * internally; remove() also recurses into itself) -- a plain mutex
+     * would self-deadlock on that nesting.
+     */
+    mutable std::recursive_mutex mtx;
 
     /** System-specific path separator character */
     static const char PATH_SEPARATOR = '/';

@@ -1007,6 +1007,386 @@ vector 重新分配"这条路径本身**没有专门跑一次验证**——§13.
   比例"的分母是自洽的,不涉及跨运行比较,这里的用法没有违反 §5 的
   警告。
 
+## 15. 新发现的问题（根因已改判，见 §16）：长窗口下 `critPathFlush()` 段错误——`OutputDirectory` 非线程安全
+
+> **本节的根因假设已经被 §16 用调试器证据推翻。** 按本节假设加的
+> `OutputDirectory` 互斥锁（`src/base/output.hh`/`.cc`）已经实现、编译、
+> 用同样的长窗口重跑验证——**段错误原样复现，一字不差**（同一个函数、
+> 同一个源码行）。这说明本节"8 个域线程并发插入同一个 `std::map`"的
+> 假设是错的，至少不是这次崩溃的真正原因。锁本身不是坏改动（§16 会
+> 说明它仍然值得保留，理由不一样了），但不能靠它宣布这个 bug 已修——
+> 保留本节作为"第一次读代码给出的假设，以及为什么这个假设看似合理"的
+> 记录，真正的根因和证据见 §16。
+
+S-013 分支的一次会话（2026-07-18）想验证 S-014/S-015/S-016 修复合并进
+`main` 后，能否重新跑通 S-013 §9 因为 `occupyLayer` 崩溃而中断的长窗口
+关键路径校验——把 `MAX_TICKS` 从之前唯一验证过的 `2e8` 提到 `2e9`（同一
+工作点：`SIM_QUANTUM_TICKS=6660`、`EVENTQ_BARRIER_MODE=spin`、
+`EVENTQ_CRITPATH_TRACE=1`、检查点 `x86-threads-balanced3-roi-classic`，
+宿主 CPU 100-107，避开了同时段另一个在跑的 ~8.7h 三臂对照任务占用的
+54-55/92-99）。这次校验不是本文档的话题，但撞上的问题出在本文档设计/
+实现的插桩基础设施本身，记在这里而不是 S-013。
+
+**仿真本身跑到头了**：`STAT_DUMP_PERIOD=1e8` 周期性打点 20 次，每个
+周期约 5.0-5.8 万条指令，量级持续、没有"还卡在 guest 启动阶段"的迹象
+——跟 S-013 §9 那次只有 74588 条指令、明显还在启动阶段的结果不同，这
+次窗口大概率已经覆盖到了 benchmark 真正的并行计算阶段，`occupyLayer`
+崩溃（S-014）这次全程没有再出现。
+
+**但退出阶段段错误了**：崩溃点在 `critPathFlush()`
+（`src/base/critpath_trace.cc:59`），backtrace 顶部经过
+`OutputDirectory::create`/`open`（`src/base/output.cc`）内部的分配
+路径，底部是 `_start → __libc_start_main → …exit handler… →
+critPathFlush`——即域 0 通过 `std::atexit(critPathFlush)`
+（`src/sim/simulate.cc:274`）注册的那次调用，运行在主线程、在
+`simulate()` 已经正常返回、7 个子线程都已经 `join()` 完之后。
+
+**根因（读代码确认，未做进一步复现/调试）**：`OutputDirectory`（全局
+单例 `simout`）的文件表是一个普通
+`std::map<std::string, OutputStream*> files`
+（`src/base/output.hh:141/147`），整个类没有任何锁（`mutex`/`lock`
+零命中）。本文档 §4 的插桩设计是"每个域线程退出时自己调
+`critPathFlush()`"（`thread_main` 里 `terminate` 变 true 之后，
+`src/sim/simulate.cc:221`）——因为所有域共享同一个 quantum 屏障，7 个
+子线程大概率在几乎同一个 wall-clock 时刻一起看到 `terminate==true`
+并几乎同时各自调用 `simout.create()`，对同一个 `files` map 做并发
+`operator[]` 插入/红黑树重新平衡——这是未定义行为，能造成堆损坏，
+表现为之后（不一定是触发那次插入本身）某次分配崩溃，跟这次崩溃恰好
+出现在"最后一个、也是覆盖时间最长的"域 0 atexit 调用里的现象吻合。
+
+**一个还没解释清楚的细节**：输出目录里只有一个空的
+`critpath-domain0.csv`（0 字节），域 1-7 一个文件都没有产生——如果
+纯粹是堆损坏在域 0 这次调用才触发崩溃，域 1-7 的 flush 应该已经在
+此之前成功完成、留下非空文件才对。目前没有确认这是"域 1-7 的
+`critPathBuffer` 在这次跑里实际上是空的"（插桩没生效，另一个功能性
+bug）、还是"域 1-7 也崩了但某种原因没有终止整个进程"（不太像，一个
+线程段错误通常会终止整个进程）、还是别的原因——需要进一步读代码/
+复现才能确定，这次会话没有做。
+
+**范围**：这个 bug 独立于 S-013 本身的问题（四核不均衡）和
+S-014/S-015/S-016——是本文档（S-012）自己的插桩基础设施里一个此前
+从未触发过的线程安全缺口，因为之前所有开着 `EVENTQ_CRITPATH_TRACE`
+的跑（§13、S-013 §7）都只验证过 `MAX_TICKS=2e8` 这个短窗口，从没有
+真正让 8 个域线程在同一时刻各自触发过退出路径。S-013 §9 遗留的"更长
+窗口下四核是否依然不均衡"这个问题因此继续被挡住——现在挡路的是这个
+新问题，不再是 S-014 的 `occupyLayer` 崩溃（那个已经在这次跑里被绕过，
+2e9 ticks 全程跑完都没有再触发）。
+
+**本次会话未做、留给后续**：
+1. 确认域 1-7 CSV 缺失的原因。
+2. 在 `OutputDirectory::create`/`open`/`find`/`createSubdirectory` 等
+   公共接口上补一把互斥锁（最直接的修法，范围小，风险主要在于
+   `OutputDirectory` 是否有别的地方假设它不会被并发调用，需要审计）。
+3. 修复后用同样的长窗口（`MAX_TICKS=2e9`，同检查点）重跑一次确认不再
+   崩溃，且 8 份 CSV 都产生、内容合理。
+4. 确认之后再回到 S-013 自己的问题——用这份长窗口的关键路径数据判断
+   域 3 的不均衡在完整 benchmark 尺度下是否依然存在。
+
+这份记录只是"如实报告一次意外的崩溃并定位到读代码能确认的根因"，不是
+一次完整调试/修复的记录——按 CLAUDE.md 的 checkpoint 约定，动手修
+`src/base/output.cc` 属于新的、更有风险的子阶段（触碰的是 gem5 通用
+基础设施而不是本项目自己的代码，且目前的根因分析还没有实际复现/调试
+验证过），需要先跟用户确认范围再开始。
+
+## 16. §15 假设被推翻；用 gdb 实测到的真正根因——`critPathBuffer` 的
+线程本地析构在 `atexit(critPathFlush)` 之前跑掉，是 use-after-free；
+子线程在正常退出路径上从未被 join 过
+
+用户明确要求"直接修 bug，这样合并回 main 后 S-012 能继续、不用再带着
+这个 bug"。按 §15 的假设加了互斥锁（`std::recursive_mutex mtx`，
+`OutputDirectory::create`/`open`/`find`/`close`/`isFile`/
+`createSubdirectory`/`remove`/`setDirectory`/`directory`/`resolve`/
+析构函数全部加锁，recursive 是因为这些方法互相调用，`create()` 内部
+调 `open()`）。`X86_MESI_Three_Level` 干净重编译，用 §15 完全相同的
+长窗口协议重跑——**段错误一字不差地复现**：同一个函数
+（`critPathFlush`）、同一个符号偏移（`+0xe0`）、同样的空
+`critpath-domain0.csv`、域 1-7 同样一个文件都没有。这排除了"8 个域
+线程并发插入同一个 map"这个假设——锁已经把所有并发路径都串行化了，
+崩溃还在，说明根本不是并发问题。
+
+### 16.1 装 gdb，实测到真正的崩溃现场
+
+沙盒里没有 gdb，`sudo apt-get install -y gdb`（本项目此前的会话记录
+里没有用过 sudo，这次确认可用）装上后，把同一个跑法包进
+`gdb -batch -ex run -ex bt -ex "thread apply all bt" -ex quit --args
+./build/.../gem5.opt -d ... docs/refs/scripts/x86_fs_mesi3_parallel_
+eventq.py`（env 变量在 gdb 前面 export，不走 `--args` 之外的机制），
+崩溃点复现只花了大约 80 秒（不是几小时）。带符号的 backtrace：
+
+```
+Thread 1 "gem5.opt" received signal SIGSEGV, Segmentation fault.
+#0  gem5::critPathFlush () at src/base/critpath_trace.cc:72
+#1  __run_exit_handlers (...) at ./stdlib/exit.c:108
+#2  __GI_exit (...) at ./stdlib/exit.c:138
+#3  __libc_start_call_main (...) 
+#4  __libc_start_main_impl (...)
+#5  _start ()
+
+Thread 2..8 (全部 7 个子线程，均):
+#0  __futex_abstimed_wait_common64 (...)
+...
+#5  gem5::Barrier::waitCv (this=0x...) at src/base/barrier.hh:171
+#6  gem5::Barrier::wait (ctx=0x0, this=0x...) at src/base/barrier.hh:146
+#7  gem5::SimulatorThreads::thread_main (...) at src/sim/simulate.cc:214
+```
+
+两个事实一次性都验证了：
+
+1. **7 个子线程全部还卡在 `barrier.wait()`（`simulate.cc:214`，
+   `while (!terminate) { doSimLoop(queue); barrier.wait(); }` 里退出
+   一轮之后的那次 wait），一次都没有跑到自己的
+   `critPathFlush()`**——它们的 `critPathBuffer` 从未被 flush，这就是
+   §15 记录的"域 1-7 一个文件都没有"的**完整**解释，跟并发/竞态无关：
+   它们根本没有机会执行到那行代码。
+2. **主线程（域 0）不在任何屏障上，已经在
+   `__run_exit_handlers`（glibc 正常 `exit()` 流程）里**，说明主线程
+   越过了"等子线程"这一步，直接朝进程退出走，途中触发
+   `std::atexit(critPathFlush)` 注册的回调，在
+   `critpath_trace.cc:72`（`for` 循环体内第一条 `*s << ...` 语句）
+   崩溃。
+
+### 16.2 为什么子线程从未被 join——`terminateEventQueueThreads()`
+只接在 `m5.simulate.fork()` 上，不接在正常退出路径上
+
+读 `src/sim/simulate.cc`：`simulate()` 函数本身只调用一次
+`simulatorThreads->runUntilLocalExit()`（释放子线程开始跑，§4.2/
+§11.2 记录过的设计）加一次 `doSimLoop(mainEventQueue[0])`
+（主线程自己的份），然后直接 `return global_exit_event;`
+（§16 引用的行号：simulate.cc:324/327/343）——**`simulate()` 自己从来
+不调用 `simulatorThreads->terminateThreads()`**。会调用它的只有两处：
+
+- `~SimulatorThreads()`（对象析构时兜底）。
+- `terminateEventQueueThreads()`（`simulate.cc:369-373`），这是一个
+  单独导出给 Python 的函数（`pybind11/event.cc:112`），全仓库唯一的
+  调用点是 `src/python/m5/simulate.py:551` 的 `fork()`
+  ——"Terminate helper threads that service parallel event queues"，
+  只在**进程 fork**前才需要（避免子进程继承一堆卡在 barrier 上的
+  线程）。本项目用的驱动脚本
+  （`docs/refs/scripts/x86_fs_mesi3_parallel_eventq.py`）从不调用
+  `m5.simulate.fork()`，所以在**普通**（非 fork）的一次跑完退出路径
+  上，`terminateEventQueueThreads()` 从来没有被调用过——子线程只能
+  靠 `simulatorThreads`（`static std::unique_ptr<SimulatorThreads>`，
+  `simulate.cc:230`）自己的析构函数兜底，而这个析构函数的运行时机，
+  见下一节，恰好排在 `critPathFlush` 的 atexit 回调**之后**。
+
+这不是本次改动引入的新问题——`terminateEventQueueThreads()` 这个
+"只接在 fork 上"的接线方式在 S-012 插桩之前就是这样，S-012 的
+`critPathFlush()` 设计（§4.4 的注释："subordinate threads... normally
+be waiting on the barrier"）其实已经**默认承认**了子线程在正常退出时
+不会被主动终止，只是没有意识到这对 domain 0 自己的 atexit flush
+意味着什么。
+
+### 16.3 真正的根因——`atexit` 与主线程 `thread_local` 析构的 LIFO
+顺序竞争，是确定性的 use-after-free，不是并发竞态
+
+`std::atexit()` 注册的回调和"静态存储期对象析构 + 主线程的
+`thread_local` 对象析构"共享**同一个** LIFO（后注册先执行）退出序列
+（Itanium C++ ABI 里都是通过 `__cxa_atexit`/`__cxa_thread_atexit`
+挂到同一张表）。关键的两个注册时刻：
+
+- `std::atexit(critPathFlush)`：在 `simulate()` 函数**最开头**、
+  `if (!simulatorThreads) {...}` 分支里、**在**
+  `doSimLoop(mainEventQueue[0])` 第一次被调用**之前**注册
+  （`simulate.cc:274`，先于 §16.2 提到的 324/327 行）。
+- `critPathBuffer`（`thread_local std::vector<CritPathRecord>`，
+  `critpath_trace.cc:19`）的析构函数注册：`thread_local` 变量的
+  析构注册是**惰性**的——只有在这个变量第一次被真正访问（读/写）时，
+  编译器生成的 TLS wrapper 才会顺带调用 `__cxa_thread_atexit`
+  登记析构函数。主线程第一次真正碰
+  `critPathBuffer` 是在 `critPathRecordBarrierPass()`
+  （`critpath_trace.cc:34`，`critPathBuffer.push_back(r)`），这只会在
+  `doSimLoop` 跑起来、真正经过一次带 `ctx` 的
+  `Barrier::wait()`（quantum 屏障）之后才第一次执行——**晚于**
+  `atexit(critPathFlush)` 的注册时刻。
+
+后注册的先执行——`critPathBuffer` 的析构（晚注册）比
+`critPathFlush`（早注册）**先**跑。于是真正的退出序列是：
+
+1. `critPathBuffer.~vector()` 先执行，释放它持有的堆内存，vector 对象
+   自身进入"已析构"状态（libstdc++ 的 `~vector()` 不保证事后把
+   `_M_start`/`_M_finish` 清零）。
+2. `critPathFlush()`（`atexit` 回调）后执行，`if
+   (critPathBuffer.empty())` 读的是一个**已经析构的** vector 对象——
+   这个检查本身已经是未定义行为，多半不会按预期返回 true，于是继续走
+   到 `for (const auto &r : critPathBuffer)`，用 `_M_start`/`_M_finish`
+   这两个悬空指针遍历一段已经释放的堆内存，循环体第一条语句
+   （`critpath_trace.cc:72`，`*s << (r.kind == ...)`）解引用垃圾内存
+   ——段错误。
+
+这完整解释了**所有**观测到的现象，且不需要任何并发假设：
+
+- **100% 确定性、逐字节相同的崩溃位置**（§16 开头提到的复现）——这是
+  纯单线程的 UAF，不是竞态，同样的堆布局每次都读到同样的坏内存，不是
+  "有时候崩有时候不崩"的模式，跟真正的数据竞争的典型症状不一样。
+- **`critpath-domain0.csv` 存在但是空的**——`simout.create()`（UAF
+  发生**之前**，在 for 循环之前）确实成功创建了文件、表头那行文字确实
+  写进了 `ofstream` 的用户态缓冲区，但崩溃发生在 `simout.close(os)`
+  （唯一会真正 flush/close 底层文件的调用）之前，缓冲区里的内容从来
+  没有落盘。
+- **域 1-7 一个文件都没有**——§16.1 已经证实：不是它们的
+  `critPathFlush()` 跑了但输出丢了，是它们的 `critPathFlush()`
+  从未被调用过（§16.2）。
+
+一个仍然没有完全查清、不影响上面结论但值得记录的疑点：**为什么 S-012
+§13、S-013 §7 那些短窗口（`MAX_TICKS=2e8`）的跑清清楚楚报告过"8 份
+CSV 都产生、内容合理"**？§16.2 的"子线程从不 join"和 §16.3 的
+"atexit 顺序"这两条推理对窗口长度并不敏感，理论上短窗口也应该踩中
+同一个 bug。留给下一步复现确认，候选解释包括：那几次运行的驱动方式
+（是否走了 `m5.simulate.fork()` 或某种当时没记录下来的额外清理调用）
+和这次不同；或者短窗口下 `critPathBuffer` 很小，释放后的那块堆内存
+恰好还没被覆盖/取消映射，`_M_start==_M_finish`
+恰好凑巧仍然成立（`empty()` 恰好读到"看起来是空"的垃圾值，提前
+`return`，绕过了后面真正解引用悬空指针的代码）——纯属侥幸而非设计
+上安全，只是"读了未初始化/已释放的内存但没有踩到近期被覆盖或已经
+`munmap` 的页"，跟长窗口下更大的 buffer 更容易被 `munmap` 整块归还
+系统、访问必然触发缺页从而必然段错误的情形不同。这条待确认，不影响
+"必须修" 这个结论——即使短窗口"恰好没崩"，代码本身仍然是 UAF，是
+定时炸弹。
+
+### 16.4 §15 加的 `OutputDirectory` 锁怎么处理
+
+这把锁**不是**这次崩溃的病因，但也不是无意义的改动——`OutputDirectory
+::files`/`dirs` 本来就没有任何线程安全保证，而这份插桩设计的另一条
+合法路径（子线程各自在自己的 `thread_main` 里调用
+`critPathFlush()`，§4.4 设计、§14 实现）**确实**会让多个域线程并发
+调用 `simout.create()`——只是这次崩溃复现时子线程从未真正跑到那一步
+（§16.2），所以这把锁在这次复现里"没用上"，不代表它保护的场景不存在。
+决定：**保留这把锁**，作为独立于本次崩溃修复的加固；下一步真正修好
+"子线程正常退出时会被 join、各自 flush"之后，子线程并发 flush 的
+场景就会被真实触发，到时候这把锁就是必需的，不是防御性冗余。
+
+### 16.5 真正的修复方案（已实现，见 §16.6）
+
+用户明确的方向确认："不是应该每个核自己记录自己的信息，输出独立的
+文件，就行了吗？有没有说必须要生成一个统一的文件"——纠正了本节
+最初的框架（"找一个统一的清理钩子"听起来像是要重新设计），确认了
+本来的每域独立文件设计不用变，缺口只是"让每个域已经写好的自己那份
+flush 代码真正被执行到"。§16.3 指出了两个需要修的独立缺口：
+
+1. **子线程在正常（非 fork）退出路径上从未被终止/join**——
+   `terminateEventQueueThreads()` 需要在正常退出路径上也被调用一次
+   （不只是 `fork()` 前），这样每个子线程能跑到自己
+   `thread_main()` 里的显式 `critPathFlush()` 调用（§4.4/§14 设计的
+   本意），而不是永远卡在 barrier 上直到进程整个退出。这个改动的
+   落点在 Python 层（`m5/simulate.py`）还是 C++ 层（`core.cc`
+   `doExitCleanup` 之类的既有钩子，如果存在的话）需要先找到 gem5
+   现有的"一次跑真正结束"的钩子点，不能假设。
+2. **domain 0 自己的 flush 不能再靠 `std::atexit()` 卡这个
+   LIFO 时序赌局**——即使 §16.5-1 修好了子线程的 join，domain 0
+   这次用 `atexit` 注册的隐患还在（这次复现只暴露了它，没有证明它是
+   唯一受害者）。更稳妥的做法是把 domain 0 的 flush 也挪到跟
+   §16.5-1 同一个"确定性早于任何析构"的显式清理点上调用，不再依赖
+   `atexit`/`thread_local` 析构的注册顺序这种实现细节。
+
+这两处改动都会碰到 `src/sim/simulate.cc`（本项目已经改过的文件）和
+`src/python/m5/simulate.py`（影响所有 gem5 使用者的通用 Python 驱动
+代码，不只是本项目的脚本）——比 §15 原来设想的"给一个类加锁"的范围
+明显更大，属于 CLAUDE.md 说的"新的、更有风险的子阶段"，报告完根因后
+先等用户确认了方向（§16.5 开头）才动手，没有自行展开。
+
+### 16.6 实现 + 验证
+
+**`src/sim/simulate.cc`**：删掉 `simulate()` 里的
+`std::atexit(critPathFlush);`。`terminateEventQueueThreads()`
+（原来只有 `simulatorThreads->terminateThreads();` 一行）改成两步：
+先给 `simulatorThreads` 补一个判空（`m5.simulate()`
+从未被调用过的脚本也能安全调用这个函数，不会解引用空指针）再调用
+`terminateThreads()`，然后显式调用一次 `critPathFlush()`——domain 0
+的 flush 从此和子线程的 flush 走同一个调用点，不再单独依赖
+`atexit`。
+
+**`src/python/m5/simulate.py`**：在 `simulate()` 函数
+`if need_startup:` 分支里，紧跟着已有的
+`atexit.register(_m5_core.doExitCleanup)` 之后，新增
+`atexit.register(_m5_event.terminateEventQueueThreads)`。选择"跟在
+`doExitCleanup` 后面注册"是为了让它比 `doExitCleanup`/`stats.dump`
+都先执行（Python exit handler 是后注册先执行，这份文件自己
+`stats.dump` 那行上面的注释已经点出这条规则）——线程 join
+和两类 flush 应该在其它退出期清理动作之前就确定性地完成，不依赖
+`doExitCleanup` 到底做了什么。这是 Python 层的
+`atexit.register()`，在 `Py_Finalize()` 阶段运行，保证先于 §16.3
+说的 C++ 层 `atexit()`/主线程 `thread_local` 析构顺序，从根上绕开
+了那场时序赌局，不是"调整时序赢下这场赌局"。
+
+**编译**：`X86_MESI_Three_Level` 干净重编译（这次改动会牵连
+`python/m5/defines.py.cc` 之类的内嵌 Python 产物，触发的重编译范围
+比只改 `output.cc` 大）。
+
+**崩溃修复验证**：用 §16.1 完全相同的长窗口协议（`MAX_TICKS=2e9`，
+其余参数不变）重跑——**不再崩溃，8 份 `critpath-domain{0..7}.csv`
+全部生成，每份 60-69 万行、22-25MB，内容格式正确**（`kind,tick,
+domainId,barrierPass,isLast,eventCount,dur_ns,lockTag` 表头 +
+逐行有效数据，抽查过 `critpath-domain3.csv` 开头几行）。日志里
+grep 不到任何 `segmentation`/`SIGSEGV`/`panic`/`fatal`/`dumped
+core` 字样。
+
+**正确性回归**（这处改动影响*每一次* gem5 运行，不只是开
+critpath tracing 的场合，所以不能只验证崩溃修好了）：同一检查点，
+`SIM_QUANTUM_TICKS=6660`、`MAX_TICKS=2e8`、**不开**
+`EVENTQ_CRITPATH_TRACE`，serial 臂（`taskset -c 100`）+ parallel/spin
+臂（host-pin 100-107）各跑一次，均 `exit=0`，两份 `stats.txt`
+（排除 `host*` 行）**逐字节相同**，日志里没有任何 error/exception/
+traceback。确认这个改动对已经验证过的行为没有引入回归——`
+terminateEventQueueThreads()` 现在会在**每一次** gem5 运行结束时
+被调用（以前只有 `fork()` 前才调用），但 `simulatorThreads`
+判空 + `terminateThreads()` 自己的 `if (threads.empty()) return;`
++ `critPathFlush()` 自己的 `if (critPathBuffer.empty()) return;`
+三层保护让它在"没开并行 EventQueue"/"没开 critpath tracing"的
+普通场景下都是安全的空操作。
+
+**TSan 验证**：`build_opts/X86_MESI_Three_Level_TSAN` + `scons
+--with-tsan` 编译（沙盒里第一次装 TSan build，之前的会话都是复用
+已经编译好的，这次确认 `--with-tsan` 这条路径本身也是通的）。同一
+长窗口协议缩到 `MAX_TICKS=2e8`（保持开着 `EVENTQ_CRITPATH_TRACE`，
+跑到真正触发 join+双重 flush 这条新代码路径即可，不需要重跑 2e9
+去省时间）——**不崩溃，8 份 CSV 正常产生**，但 TSan 报了 3 条新
+警告：
+
+1. 一条在 `EventQueue::getCurTick()`（`eventq.hh:875`）——T3 通过
+   `Consumer::commitTick → EventQueue::schedule → getCurTick()`
+   读某个 EventQueue 的 `curTick`，和 T5 自己 `serviceOne()` 里的
+   `setCurTick()` 写并发。
+2. 两条在 `Flags<unsigned short>::set()`/`isSet()`
+   （`flags.hh:116`/`83`）——同一个 `Event`（挂在一个 `Switch`
+   路由器对象上）的标志位，T3 通过同一条
+   `Consumer::commitTick → EventQueue::schedule` 调用链写
+   （给事件打 "Scheduled" 一类的标志），T5 在自己的
+   `serviceOne() → Event::isExitEvent()` 里并发读。
+
+这三条都出在 `Consumer::scheduleEventAbsolute`/`commitTick`
+（`src/mem/ruby/common/Consumer.cc`）跨域调度 `Throttle`/`Switch`
+的 wakeup 事件这条路径上——**跟这次改动完全无关**（没碰
+`Consumer.cc`/`eventq.cc`/`eventq.hh`/`flags.hh`，这次只改了
+`output.cc`/`simulate.cc`/`simulate.py`）。`Consumer.cc:94` 自己的
+注释说"Always called under lock()...so all the scheduling state
+here is race-free"，指的是 `Consumer` 自己的记账状态
+（`m_inflight_ticks` 等）在并发调用间受 `m_wakeup_mutex`
+（CLAUDE.md 列的四把已知跨域锁之一）保护；但 TSan 抓到的读写发生
+在 `em->schedule(...)` **内部**、直接触达**目标域自己的**
+`EventQueue`/`Event` 状态，而目标域自己的 `serviceOne()`
+循环并不知道、也不需要去拿这把 `Consumer` 锁——`Consumer.cc:131-134`
+的注释("schedule() is legal from any thread -- ... routed through
+asyncInsert() ... quantum snap guarantees is still ahead")暗示这条
+路径本来设计上应该走异步安全的插入通道，但 TSan 抓到的这两个具体
+操作（`getCurTick()` 读、`Flags::set()` 写）看起来发生在真正路由
+到 `asyncInsert()` 之前——是不是这个设计缝隙、还是本来就该被前面
+某层挡住，需要专门去读 `EventQueue::schedule()` 内部实现才能确认，
+本次没有做这一步。
+
+**这三条警告不是这次改动引入的新竞态**——`Consumer::
+scheduleEventAbsolute` 跨域调度贯穿整个仿真过程，不只是退出阶段，
+S-002/S-003 就已经在处理这一类问题。但这大概率是**这三条竞态第一次
+在这个项目的 TSan 记录里被观测到**：在这次修复之前，任何一次
+critpath-traced 或者非-traced 的正常（非 fork）退出，子线程都从未
+真正被 join 过（§16.2）——包括 S-009 §24/§25、S-016 §8
+等历史上所有跑过 TSan 扩时长 A/B 的会话，因为它们同样从未调用过
+`terminateEventQueueThreads()`。这次是这个项目历史上第一次有 TSan
+观测覆盖到"多个域几乎同时收敛到退出条件、同时结束各自 doSimLoop"
+这个特定时间窗口——不是这次改动本身制造了竞态，而是这次改动第一次
+让 TSan 有机会看到这个一直存在、但从未被真正跑到退出路径的窗口。
+是否需要单独立项（新 S-NNN）追查 `EventQueue::schedule()`
+跨域路径这个具体缝隙，留给用户决定，本节到此为止不展开。
+
 ---
 
 **上一篇**：[S-011：Consumer 锁 owner 字段竞争审计](./S-011-consumer-lock-owner-race-audit.md)
