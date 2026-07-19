@@ -1387,6 +1387,55 @@ critpath-traced 或者非-traced 的正常（非 fork）退出，子线程都从
 是否需要单独立项（新 S-NNN）追查 `EventQueue::schedule()`
 跨域路径这个具体缝隙，留给用户决定，本节到此为止不展开。
 
+**订正（后续会话，2026-07-19，专门回来查这三条警告）**：上一段"这三条
+竞态第一次在这个项目的 TSan 记录里被观测到"这句话**不准确，需要订正**
+——`EventQueue::getCurTick()`/`Flags<unsigned short>::set()`/`isSet()`
+这组签名（连同 `Event::isExitEvent()`/`EventQueue::schedule()` 这条调用
+链）**早在 S-009 §24.4-24.5（`_curTick`）就已经被独立观测、读代码定位、
+并明确归类为"CLAUDE.md Primary research goal 一节写的项目自己的设计
+取舍——relaxed cross-domain timing，不是遗漏"**；S-009 §24.5 的原文
+甚至已经点名同一条 `flags.hh:116` 报告、同一条
+`Event::isExitEvent()`/`EventQueue::schedule()` 调用链，判定"和 24.4 记录
+的 `_curTick` 竞争同一类"；S-010 §11.2 的扩时长 TSan A/B（76 次警告）、
+S-011 §1 的开篇引用，都各自独立重新撞见并重新确认了同一组签名，是这个
+项目历史上第三/第四次观测到它,不是第一次。§16.6 会把这个说成"第一次",
+是因为核对范围只看了"这次改动前有没有跑过覆盖退出路径的 TSan"，没有去
+交叉查这组具体的 `#0` 帧签名在更早的 S-009/S-010 会话里是否已经出现
+过——**只是漏检索，不是新证据推翻了旧结论**。
+
+同一次订正顺带把根因钉死到具体代码：`EventQueue::schedule()`
+（`src/sim/eventq.hh:781-807`）里 `assert(when >= getCurTick())`
+（读目标域自己的 `_curTick`，无同步）和 `event->setWhen(when, this)`/
+`event->flags.set(Event::Scheduled)`（写目标 `Event` 自己的 `_when`/
+`flags`，调试构建下还有 `queue`）**在 `inParallelMode &&
+(this != curEventQueue() || global)` 为真、真正走 `asyncInsert()`
+"跨域安全"分支时，也无条件地在 `asyncInsert()` 调用前后各执行一次**——
+`asyncInsert()` 本身对 `async_queue`/`async_queue_mutex` 是安全的，但这
+三处触达的是 `Event` 对象自己的字段，不受 `asyncInsert()` 的锁保护。
+对端（拥有这个 `EventQueue` 的线程）在 `EventQueue::serviceOne()`
+（`src/sim/eventq.cc:231-271`）里对刚 fire 完的同一个 `Event` 继续touch
+`isExitEvent()`（:259）/`release()`（:268）——而这两步发生在
+`event->process()`（:257）**之后**，也就是 `Consumer::processCurrentEvent()`
+已经 `unlock()` 过 `m_wakeup_mutex`（Consumer.cc:200）**之后**——这就是
+跨域调用方 `commitTick()` 拿到 Consumer 锁后立刻能碰到同一个 `Event`
+对象的窗口来源。**严重度评估（本次新做的部分，S-009/§16.6 都没做过）**：
+`m_wakeup_event`（`Consumer.hh:126`）构造时 `del=false`
+（`Consumer.cc:50`），即 `Event::Managed`/`AutoDelete` 未置位，`acquire()`/
+`release()`（`eventq.cc:120-131`）对它是空操作——不存在 S-011 那种"读到
+错误答案破坏不变式"或 UAF 风险，实际触达的是 `flags` 里两个不重叠的
+位（`Scheduled` vs `IsExitEvent`）和一个允许滞后读的 `_when`/`_curTick`
+时间戳，跟 S-009 §24.4 论证 `_curTick` 安全性的理由（x86-64 对齐读写不
+撕裂、quantum 上界容忍陈旧值）是同一个论证，可以直接复用，不需要新论证。
+**结论：不是新 bug，维持 S-009 §24.4-24.5/S-010 §11.2/S-011 §1 一致的
+既有分类——已知、有意为之、可容忍，不需要为此单独立 S-NNN 或安排修法**；
+这次的增量只是把"哪一行代码、哪几个具体字段"钉实，以及补上此前几次都
+没做的"这个具体 site 会不会有 UAF/破坏不变式风险"的严重度检查（答案是
+不会）。`docs/decisions/`/CLAUDE.md 均不需要改动。以后再撞见这组 `#0`
+帧签名（`eventq.hh:862/875`、`flags.hh:83/116`，调用链经过
+`Consumer::commitTick`/`scheduleEventAbsolute`→`EventQueue::schedule`
+或 `EventQueue::serviceOne`→`Event::isExitEvent`），可以直接引用本段
++ S-009 §24.4-24.5，不需要重新调查。
+
 ## 17. 实现记录：Step 5（正式关键路径分析 + 全量 TSan/正确性回归）
 
 新会话（2026-07-18），专属 worktree/branch
