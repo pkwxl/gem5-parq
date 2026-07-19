@@ -174,19 +174,41 @@ producing coherence/message traffic shaped differently enough to hit an
 existing gap that Timing-CPU's low concurrency never reached. Not yet
 isolated which.
 
+**Isolation test, to separate O3 from the concurrency bump**: reran the
+identical protocol against a scratch copy of the O3 script
+(`/tmp/s018-o3-default16.py`, not committed) with
+`MAX_OUTSTANDING_REQUESTS` changed from 32 back to the stdlib default
+(16) -- everything else (O3 CPU, checkpoint, quantum, host pins)
+unchanged. Result: **the divergence still reproduces**, ruling out the
+`max_outstanding_requests` bump as the cause -- this is O3 itself (or
+O3's interaction with the existing default-16 sequencer cap), not
+something the §3 tuning introduced. Two details worth noting rather than
+smoothing over: the bogus values are **not the same as the 32-request
+run** (`int_links102.buffers1` reads 9223371114517.761719 here vs.
+1844674222903.647949 at 32 requests), and this run has **three**
+divergent lines instead of two (`int_links79.buffers2` newly appears,
+value 3689348445807.183105 -- suspiciously close to but not identical
+to the 32-request run's `int_links104.buffers0` value,
+3689348445807.124512). The bogus values scale with something about the
+run rather than being a fixed sentinel/constant, and which specific
+buffers are affected isn't stable across configs either -- both facts
+argue for tracing the actual tick-arithmetic rather than guessing further
+from the numbers.
+
 ## 7. Not done yet
 
-- Root cause of §6's divergence -- not traced. Candidates not yet
-  distinguished: (a) an existing cross-domain tick-sampling gap in
-  `statistics::Average`/`MessageBuffer` that only O3's higher request
-  concurrency reaches, in the same family as this project's long history
-  of cross-domain-read bugs (S-009 through S-016), or (b) something
-  specific to the `max_outstanding_requests` bump rather than O3 per se
-  (untested: O3 at the stdlib default of 16, isolating the two
-  variables). (a) would mean this bug has been *latent* in the shared
-  `xbar.cc`/`MessageBuffer` code this whole project, just never
-  triggered by Timing-CPU's concurrency-1 access pattern -- worth
-  keeping in mind before assuming it's O3-script-local.
+- Root cause of §6/§6.1's divergence -- not traced, despite ruling out
+  the concurrency bump. Leading candidate now: an existing cross-domain
+  tick-sampling gap in `statistics::Average`/`MessageBuffer` that only
+  O3's traffic pattern (rather than TimingSimpleCPU's) reaches, in the
+  same family as this project's long history of cross-domain-read bugs
+  (S-009 through S-016) -- consistent with the bug being O3-triggered but
+  not O3-caused, i.e. latent in shared `xbar.cc`/`MessageBuffer` code
+  this whole project rather than newly introduced, just never triggered
+  by Timing-CPU's concurrency-1 access pattern before. Not confirmed --
+  worth keeping in mind before assuming it's O3-script-local, since a
+  fix would then belong in shared code rather than this spec's own
+  script.
 - No real-window run of any kind yet -- everything so far is the 10M-tick
   smoke test. S-013 §9's own lesson (a 2e8-tick window was still
   boot-phase) suggests this smoke window is nowhere near representative;
