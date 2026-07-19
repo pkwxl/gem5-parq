@@ -1,13 +1,16 @@
 # S-017 — Balanced checkpoint, bounded three-arm `hostSeconds` comparison
 
-> **Status: DONE — all three arms completed cleanly, §5 has real numbers.**
-> The plan below (§1-§4) was drafted in a prior session. This session
-> executed it: rebuilt a stale `main` binary, re-verified core occupancy,
-> launched all three arms, monitored them to completion, and wrote §5 with
-> the actual measurements — including a headline result that contradicts
-> this project's speedup goal (see §5.4). Do not skip §5 when reading this
-> file; §1-§4 is the plan as originally written and is superseded wherever
-> §5 says otherwise (see §5.5 for the corrections).
+> **Status: DONE — all three arms completed cleanly, §5 has real numbers,
+> §6 explains most of the slowdown.** The plan below (§1-§4) was drafted in
+> a prior session. This session executed it: rebuilt a stale `main` binary,
+> re-verified core occupancy, launched all three arms, monitored them to
+> completion, and wrote §5 with the actual measurements — including a
+> headline result that contradicts this project's speedup goal (see §5.4).
+> A same-session follow-up (§6) reran Current Parallel alone with
+> `EVENTQ_CRITPATH_TRACE=1` and found that quantum-barrier spin-wait
+> (`spread_ns`) alone sums to *more* than the entire real-speedup shortfall.
+> Do not skip §5/§6 when reading this file; §1-§4 is the plan as originally
+> written and is superseded wherever later sections say otherwise.
 
 ## 1. Motivation
 
@@ -391,3 +394,136 @@ traffic rate; (c) compare against S-012 §18's earlier hour-scale
 parallel-only throughput figure (~7.4×10⁸ tick/s steady-state, tracing-on,
 different — non-balanced — checkpoint) to see whether the ~2× slowdown
 found here is checkpoint-specific or general.
+
+## 6. Follow-up: critpath-traced rerun explains most of the slowdown
+(obtained 2026-07-19, same session)
+
+Per §5.6(a), reran Current Parallel alone — same checkpoint, `MAX_TICKS`,
+quantum, host-pin (`100-107`) — with `EVENTQ_CRITPATH_TRACE=1`. Output
+routed to `/workspace/shm/gem5/s017-balanced-bounded-three-arm-hostseconds/
+critpath-rerun/` (the 378GB tmpfs used for large trace data per CLAUDE.md's
+`build/` convention and S-012 §19.1's precedent — `/tmp`'s 16GB tmpfs can't
+hold it), not `/tmp` like the tracing-off arms.
+
+### 6.1 The rerun itself: clean, and reproduces §5's numbers
+
+670/670 periodic dumps, identical tick range to all three §5 arms
+(`5,305,194,846,983 → 6,643,194,840,323`, first-dump offset from the serial
+arms again exactly one `SIM_QUANTUM_TICKS` — same expected artifact as
+§5.3), final `simInsts` **26460** — identical to all three original arms
+despite tracing being on this time. No crash/assert. 8 domain CSVs,
+`critpath-domain{0..7}.csv`, ~14.7-14.8GB each (~118GB total, in the same
+ballpark as S-012 §19.1's ~111GB for the same configuration — expected,
+since row count is fixed by `MAX_TICKS/SIM_QUANTUM_TICKS` independent of
+which build produced it, confirmed in §6.2 below).
+
+Two invocation gaps this time, both caught before launch (learned from
+§5.2's earlier mistakes, not repeated): `CHECKPOINT_DIR` env var (not a
+flag) and cwd `/workspace/gem5` — both applied correctly on the first
+attempt.
+
+### 6.2 Extracting `spread_ns`: not a raw CSV column, joined via S-012's
+validated row-position trick
+
+The CSV schema (`kind,tick,domainId,barrierPass,isLast,eventCount,dur_ns,
+lockTag`, see `docs/refs/scripts/critpath_aggregate.py`) has no literal
+`spread_ns` field. Per that script's own logic: for each `(tick,
+barrierPass)` group, every non-last-arriving domain's `dur_ns` ≈ (last
+arriver's arrival time − its own arrival time); `spread_ns` for that
+barrier crossing = `max(dur_ns)` over the non-last domains. Running the
+existing `critpath_aggregate.py` directly was not attempted — S-012 §19.2
+already found pure-Python `csv.DictReader` unusable at this row count
+(~4×10⁸ rows/domain there; confirmed identical here, see below), and
+warned against materializing everything into Python `dict`/`list`
+structures at this scale.
+
+Reused S-012 §19.2's validated shortcut instead: all 8 domains' `barrier`-
+kind rows are in strict tick order with **identical row counts**, so
+filtering each domain's CSV to `barrier` rows only and aligning by line
+position (no real join) is valid — this session re-verified that
+invariant directly rather than assuming it, and all 8 domains came back at
+exactly **402,402,402** rows, matching S-012 §19.2's own count for this
+identical `MAX_TICKS`/quantum configuration (expected: row count is
+deterministic from `MAX_TICKS/SIM_QUANTUM_TICKS`, not wall-clock rate, so
+this cross-run match is a real invariant check, not a coincidence).
+
+Pipeline (all in background per the S-012 §19.2 lesson about the Bash
+tool's 120s foreground timeout on pipelines this size):
+1. 8 parallel `awk` passes, one per domain: filter `kind=="barrier"` rows,
+   emit `(isLast=="1") ? -1 : dur_ns` per row (the `-1` sentinel keeps the
+   last-arriving domain's own `dur_ns` — which isn't a wait — out of the
+   max in step 2).
+2. `paste -d,` the 8 filtered columns row-wise (valid per the row-position
+   invariant above), then a single `awk` pass computing `max` across the 8
+   fields per row (= `spread_ns` for that `(tick, barrierPass)` group),
+   accumulating count/sum/min/max and a log2-bucketed histogram — plain
+   `paste`/`awk` (C, not Python) to actually finish in reasonable time at
+   4×10⁸ rows.
+
+Total wall-clock for extraction: a few minutes (8 parallel filters, ~15GB
+of intermediate column files, then one streaming `paste`/`awk` pass).
+
+### 6.3 Result: `spread_ns` alone more than accounts for the real-speedup
+gap
+
+```
+count:      402,402,402 barrier crossings
+sum:        1,097,340,755,756 ns  = 1097.34 s
+mean:       2,726.97 ns/crossing
+min:        781 ns
+max:        10,158,071,295 ns  (10.16 s -- a single crossing)
+```
+
+Compare to §5.5's Current-Parallel-vs-Baseline gap:
+`1692.77 s − 777.10 s = 915.67 s`.
+
+**`spread_ns` sums to 1097.34s — 1.20× the entire 915.67s gap.** Barrier
+spin-wait time alone is not just a contributor but is, at face value,
+*more than sufficient* to explain the whole real-speedup shortfall found
+in §5.5. (This is a magnitude match, not a proven exact decomposition —
+`spread_ns` summed across quanta measures aggregate imbalance-driven idle
+time, which is a different quantity from "excess wall-clock time relative
+to baseline" in the strict sense; see the caveat at the end of this
+section. But landing at 120%, not 5% or 500%, is strong evidence the
+mechanism discussed with the user this session — quantum-barrier spin-wait
+exposed by `TimingSimpleCPU`'s lack of MLP — is the dominant one, not a
+minor contributor.)
+
+The histogram splits the total into two distinct sub-mechanisms:
+
+| Contribution | Share of total `spread_ns` sum | Event count | Character |
+|---|---|---|---|
+| Bulk (`2^10`-`2^12` ns, i.e. ~1-4 µs) | ~73% (~900s) | ~396M of 402.4M (98.5%) | A near-universal small tax paid at almost *every* barrier crossing — consistent with a fixed per-crossing synchronization cost (cache-line bounce on the barrier counter, atomic ops) rather than workload-driven imbalance. |
+| Long tail (≥`2^20` ns, i.e. ≥~1ms) | ~16% (~200s) | 847 of 402.4M (0.0002%) | A tiny number of catastrophic individual stalls, up to 10.16s for a single crossing — same phenomenon S-012 §18 flagged as "17 unexplained long-tail stalls worth ~12.4% of wall-time" in a *different* (tracing-on, non-balanced-checkpoint) run. This is now the second independent observation of the same class of event; still not root-caused. |
+
+(Remaining ~11% is the `2^12`-`2^19` ns range — likely genuine per-quantum
+load-imbalance rather than either extreme.)
+
+### 6.4 What this changes about §5.6's open question
+
+§5.6 asked *why* real hour-scale parallel throughput is ~2× worse than
+both the serial arms and S-009 §27's short-window 0.91× figure. This
+section's answer: **mechanically, it is overwhelmingly barrier spin-wait**,
+not (per §5.5's overhead-ratio finding) the cross-domain correctness locks,
+and not something else entirely. Candidates (a) and (b) from §5.6 are now
+answered — (a) done in this section, (b) `SIM_QUANTUM_TICKS=6660` does
+look implicated, since ~73% of the cost is a near-fixed per-crossing tax
+multiplied by 402M crossings, and a coarser quantum would directly reduce
+that crossing count. Still open: (c) (comparison to S-012 §18's earlier
+non-balanced-checkpoint figure), and — new — *why* the fixed per-crossing
+cost is ~1-4µs rather than near-zero (candidate mechanisms discussed with
+the user: cache-line contention on the barrier's shared state across 8
+spinning cores, and/or `TimingSimpleCPU`'s single-outstanding-request
+limit fully exposing whatever latency a cross-domain round-trip adds,
+rather than overlapping it behind other useful work) — neither was
+directly instrumented this session, both are candidate next steps, not
+conclusions. Also still open: whether a larger `SIM_QUANTUM_TICKS` would
+net-improve real speedup, or merely trade barrier-crossing-count for
+worse relaxed-timing accuracy — this section only shows where the current
+cost is, not that increasing the quantum is free.
+
+Raw data retained at `/workspace/shm/gem5/
+s017-balanced-bounded-three-arm-hostseconds/critpath-rerun/` (8 CSVs,
+~118GB) and `.../spread-cols/` (8 filtered intermediate columns, ~15GB) —
+both on tmpfs, **not persisted across a reboot**; copy out or re-derive
+before that if needed for further analysis.
