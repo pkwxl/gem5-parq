@@ -22,6 +22,38 @@ Full design history, decisions, and empirical results live in `docs/specs/INDEX.
 this file, for anything related to this work. New investigations get their own `docs/specs/S-NNN-slug.md`
 (see the index for the numbering convention); don't append to an existing spec file for a new topic.
 
+### Measurement methodology: three-arm comparison
+
+Any speedup measurement for this project must use **three** arms, not two — don't just toggle
+`PARALLEL_EVENTQ` on the current tree and call the ratio "the speedup":
+
+1. **Baseline** — the code *before any of this fork's parallel-EventQueue changes* (i.e. built from the
+   commit where this fork's work branches off upstream, not just "before the current S-NNN's own change").
+   This is the true "existing single-`EventQueue` serial simulator" the project goal above refers to.
+2. **Current Serial** — current `main`, `PARALLEL_EVENTQ=0`. Because this fork's cross-domain correctness
+   locks (`layerLock`, `pioLock`, `pqLock`, `crossDomainSnap` checks, etc.) run unconditionally regardless of
+   the flag, this arm is **not** the same as Baseline — it's Baseline plus whatever tax that machinery costs
+   even single-threaded. Don't substitute this arm for Baseline, and don't substitute Baseline for this arm;
+   they answer different questions.
+3. **Current Parallel** — current `main`, `PARALLEL_EVENTQ=1` (the actual multi-`EventQueue` mode).
+
+From these three, derive:
+- **Overhead ratio** = Current Serial / Baseline — the cost this fork's correctness machinery adds in serial
+  mode alone (expected >1; if it's ever indistinguishable from 1, that's worth noting, not assuming).
+- **Real speedup** (the headline number for the project goal) = Baseline / Current Parallel.
+- **Internal speedup** = Current Serial / Current Parallel — isolates the threading/domain-split benefit
+  itself, with the lock-overhead tax canceled out of both sides.
+
+Practical notes from getting this running once (2026-07-17): the specific ISA+Ruby-protocol build target
+this project uses (`X86_MESI_Three_Level`) is itself a fork-added `build_opts` defconfig — it doesn't exist
+at the pre-fork commit, but the X86 ISA and `MESI_Three_Level` SLICC protocol it combines both already exist
+upstream independently, so the defconfig file (a handful of `Kconfig` lines) can just be copied into a
+worktree at the pre-fork commit rather than treated as new/risky territory. The FS driver script
+(`docs/refs/scripts/x86_fs_mesi3_parallel_eventq.py`) only touches fork-added `Root` params inside its
+`if PARALLEL_EVENTQ:` branch, so the same unmodified script file works against a Baseline build's binary too
+— no separate stock script needed. Give the Baseline build its own `git worktree` + tmpfs build dir per the
+usual convention below, keyed to the pre-fork commit hash rather than an `sNNN-slug` branch name.
+
 **Working style for this project** (empirically validated over many sessions, not just a preference):
 - Report inconvenient measurements plainly, and write them into the relevant `docs/specs/S-NNN` file
   immediately, in the same session — not just mentioned in chat and left for later. Whenever a result
