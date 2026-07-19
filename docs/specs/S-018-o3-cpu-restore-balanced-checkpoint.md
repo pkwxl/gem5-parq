@@ -1,6 +1,9 @@
 # S-018 — O3 CPU restore onto the balanced checkpoint (in progress)
 
-**Status: script implemented, not yet built or run.** This session wrote
+**Status: builds and restores cleanly; smoke test surfaced a real
+serial-vs-parallel stats divergence that is O3-specific (does NOT
+reproduce with the unmodified TimingSimpleCPU script at the same tiny
+window) -- root cause not yet found, see §6.** This session wrote
 `docs/refs/scripts/x86_fs_mesi3_parallel_eventq_o3.py` (an O3-CPU sibling
 of `x86_fs_mesi3_parallel_eventq.py`) and bumped `RubySequencer.
 max_outstanding_requests` to 32 on both scripts' shared restore path. No
@@ -103,33 +106,106 @@ encodes a CPU timing model. `python3 -m py_compile` passes; gem5-specific
 imports (`m5`, `gem5.*`) aren't checkable outside `gem5.opt`'s embedded
 interpreter, so this is a syntax check only, not a functional one.
 
-## 5. Not done yet
+## 5. Build
 
-- No build. `X86_MESI_Three_Level` needs (re)building in this worktree's
-  tmpfs `build/` before anything can run; unclear yet whether O3 is
-  already compiled into an existing build this worktree could reuse, or
-  whether O3 is even gated by any Kconfig option in this build target
-  (`build_opts/X86_MESI_Three_Level` doesn't obviously exclude it, but
-  this hasn't been confirmed by an actual build attempt).
-- No verification that O3 actually restores cleanly from a checkpoint
-  that was saved via `CPUTypes.ATOMIC` and has only ever been restored
-  into `CPUTypes.TIMING` before now -- O3's pipeline-state
-  initialization on restore/takeover is a plausible new failure surface
-  that Timing-CPU restores wouldn't have exercised.
-- No short-window sanity run (the S-009 §27 / S-014 §8 style
-  `MAX_TICKS`-bounded smoke test) to confirm the restore boots, runs,
-  and exits cleanly before committing to any real-window measurement.
-- No measurement of whether O3 + the 32-outstanding-request bump
-  actually produces more concurrent cross-domain traffic than the
-  Timing-CPU config did (e.g. via S-012's critical-path instrumentation)
-  -- §3's reasoning is a plausibility argument from stdlib defaults, not
-  an observed result yet.
+`taskset --cpu-list 0-53,56-91 scons build/X86_MESI_Three_Level/gem5.opt
+-j 88` (constrained to the unreserved host cores per `CLAUDE.md`, since a
+different session's long-running S-016/S-017-family three-arm job was
+live on the isolated cores at the time -- confirmed via `taskset -pc` on
+its PIDs, pinned to 54/55/92, before starting this build). Clean full
+build from an empty tmpfs `build/`, no errors -- O3 is compiled into
+`X86_MESI_Three_Level` with no Kconfig changes needed, confirming §5's
+open question from the pre-build version of this section.
+
+## 6. Smoke test: restore works, but surfaced a real O3-specific stats divergence
+
+Protocol: `CHECKPOINT_DIR=x86-threads-balanced3-roi-classic`,
+`SIM_QUANTUM_TICKS=6660`, `MAX_TICKS=10000000` (10M ticks -- deliberately
+tiny, just to test "does it restore and run at all" before spending any
+real wall-clock time), serial (`PARALLEL_EVENTQ=0`, `taskset -c 10`) and
+parallel (`PARALLEL_EVENTQ=1`, `HOST_PIN_CPUS=11..18`) arms, both against
+the new `x86_fs_mesi3_parallel_eventq_o3.py`.
+
+**Both arms restore and exit cleanly, no crash.** `hostSeconds` ~1.15s
+(serial) / ~1.19s (parallel); both hit the `MAX_TICKS` bound and dumped
+stats normally. `simInsts`/`simOps` match exactly between the two arms
+(5481/10892). In this tiny window only core 2 (of 4) committed any
+instructions in either arm -- consistent with S-013 §9's finding that
+short windows on this checkpoint mostly cover guest thread-startup
+serialization, not a new problem. This answers §5's (renumbered from the
+pre-build version) main open question: **O3 does restore correctly from
+an Atomic-booted checkpoint that has only ever been restored into Timing
+before** -- no new failure surface there.
+
+**But a full `diff` of the two `stats.txt` (excluding `host*` lines)
+found a real divergence**, not present anywhere else in either file:
+
+```
+< board.cache_hierarchy.ruby_system.network.int_links102.buffers1.m_buf_msgs     0.109890
+> board.cache_hierarchy.ruby_system.network.int_links102.buffers1.m_buf_msgs 1844674222903.647949
+< board.cache_hierarchy.ruby_system.network.int_links104.buffers0.m_buf_msgs     0.056610
+> board.cache_hierarchy.ruby_system.network.int_links104.buffers0.m_buf_msgs 3689348445807.124512
+```
+
+(`<` = serial, `>` = parallel.) `m_buf_msgs` (`src/mem/ruby/network/
+MessageBuffer.hh:299`) is a `statistics::Average` -- a time-weighted
+average of buffer occupancy, incremented/decremented at message
+enqueue/dequeue (`MessageBuffer.cc:316,361`) and integrated against
+elapsed ticks at dump time. The two bogus parallel-arm values are ~1.8e12
+and ~3.7e12 -- roughly a 2x multiple of each other, and in the same
+order of magnitude as `finalTick` (5.3e12), which smells like a
+tick-arithmetic bug (e.g. sampling `curTick()` from the wrong domain's
+`EventQueue` when computing the elapsed-time denominator) rather than
+random corruption, but this is a first impression from the numbers, not
+a traced root cause.
+
+**Control test, to isolate scope**: reran the exact same protocol
+(same checkpoint, same `MAX_TICKS`/`SIM_QUANTUM_TICKS`, same host pins)
+against the **unmodified** `x86_fs_mesi3_parallel_eventq.py`
+(`CPUTypes.TIMING`, no `max_outstanding_requests` override) on the same
+freshly-built binary. Result: **`diff` of the two stats.txt is empty --
+byte-for-byte identical, zero divergent lines.** This rules out "short
+windows on this checkpoint are just generally prone to this stat glitch,
+nobody tested small windows before" -- the exact same tiny-window
+protocol is clean on Timing and dirty on O3. The divergence is specific
+to something in the O3 script: the O3 CPU model itself, the
+`max_outstanding_requests=32` bump, or (most likely) the combination
+producing coherence/message traffic shaped differently enough to hit an
+existing gap that Timing-CPU's low concurrency never reached. Not yet
+isolated which.
+
+## 7. Not done yet
+
+- Root cause of §6's divergence -- not traced. Candidates not yet
+  distinguished: (a) an existing cross-domain tick-sampling gap in
+  `statistics::Average`/`MessageBuffer` that only O3's higher request
+  concurrency reaches, in the same family as this project's long history
+  of cross-domain-read bugs (S-009 through S-016), or (b) something
+  specific to the `max_outstanding_requests` bump rather than O3 per se
+  (untested: O3 at the stdlib default of 16, isolating the two
+  variables). (a) would mean this bug has been *latent* in the shared
+  `xbar.cc`/`MessageBuffer` code this whole project, just never
+  triggered by Timing-CPU's concurrency-1 access pattern -- worth
+  keeping in mind before assuming it's O3-script-local.
+- No real-window run of any kind yet -- everything so far is the 10M-tick
+  smoke test. S-013 §9's own lesson (a 2e8-tick window was still
+  boot-phase) suggests this smoke window is nowhere near representative;
+  no conclusions about O3 exposing more parallel-EventQueue benefit
+  should be drawn until §6's divergence is understood (a stats
+  correctness bug undermines trusting any throughput number from this
+  config) and a real window is run.
+- No measurement of whether O3 + the concurrency bump actually produces
+  more concurrent cross-domain traffic than Timing-CPU did (e.g. via
+  S-012's critical-path instrumentation) -- still just a plausibility
+  argument from stdlib defaults (§3), now additionally clouded by not
+  yet knowing whether §6's divergence affects the traffic-shape metrics
+  that would answer this.
 
 Per this project's checkpoint-before-risky-step convention (`CLAUDE.md`
-"Working style"), the build + first restore attempt is a new,
-qualitatively riskier phase (first O3 use in this project, first restore
-of an Atomic-booted checkpoint into anything other than Timing) and
-should be checked in on before running, not started unattended.
+"Working style"), root-causing §6's divergence is new, unexplored
+territory (first real bug found in this project's first-ever O3 use, no
+existing design doc or fix pattern obviously covers it) and should be
+checked in on before diving in further, not pursued unattended.
 
 ---
 
