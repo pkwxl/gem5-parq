@@ -210,7 +210,7 @@ class ParallelX86Board(X86Board):
 
         if HOST_PIN_CPUS:
             root.eventq_host_cpus = [
-                int(c) for c in HOST_PIN_CPUS.split(",")
+                int(c) for c in HOST_PIN_CPUS.replace("..", ",").split(",")
             ]
 
         root.eventq_barrier_mode = EVENTQ_BARRIER_MODE

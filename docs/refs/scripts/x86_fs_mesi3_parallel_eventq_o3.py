@@ -248,7 +248,7 @@ class ParallelX86Board(X86Board):
 
         n_dom = mem_dom0 + n_dir  # 0..(mem_dom0+n_dir-1)
         print(
-            f"[parallel-eventq-o3] 3-level split: {n_dom} EventQueues "
+            f"[parallel-eventq] 3-level split: {n_dom} EventQueues "
             f"(cores 1..{n}, L3={l3_dom}, mem={mem_dom0}..{mem_dom0 + n_dir - 1}), "
             f"sim_quantum={quantum} ticks"
             + (f", host-pin={HOST_PIN_CPUS}" if HOST_PIN_CPUS else "")
