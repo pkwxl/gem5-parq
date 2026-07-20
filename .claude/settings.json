@@ -12,6 +12,10 @@
       "Edit(//tmp/**)",
       "Read(//workspace/**)",
       "Edit(//workspace/gem5/**)",
+      "Edit(//workspace/gem5-wt/**)",
+      "Edit(//workspace/gem5-bin/**)",
+      "Edit(//workspace/gem5-ckpt/**)",
+      "Edit(//workspace/gem5-resources/**)",
       "Edit(//workspace/shm/**)",
       "Read(/home/wxl/**)",
       "Edit(/home/wxl/**)"
