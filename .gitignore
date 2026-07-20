@@ -43,3 +43,4 @@ typings
 # gem5 checkpoint output (accidentally written under the repo instead of
 # an explicit -d/--outdir elsewhere, e.g. /tmp)
 cpt.*/
+.aider*
