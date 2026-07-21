@@ -95,7 +95,17 @@ NUM_CORES = 4
 PARALLEL_EVENTQ = os.environ.get("PARALLEL_EVENTQ", "0") == "1"
 # Comma-separated host CPU ids to pin the per-EventQueue threads to
 # (index i pins the thread driving event queue i), e.g. "0,1,2,3,4,5,6,7".
+#
+# For **functionality validation** (this file's use case): leave empty,
+# let OS scheduler assign threads to any CPU.
+#
+# For **strict performance comparison** (S-007/S-012/S-017): set to isolated
+# CPUs only (e.g. "100,101,102,103,104,105,106,107") to prevent scheduling
+# noise from interfering with accurate wall-clock measurements.
 HOST_PIN_CPUS = os.environ.get("HOST_PIN_CPUS", "")
+if HOST_PIN_CPUS and not PARALLEL_EVENTQ:
+    # For serial mode with HOST_PIN_CPUS set: warn because it has no effect.
+    print(f"[warning] HOST_PIN_CPUS={HOST_PIN_CPUS} has no effect in serial mode")
 # Per-quantum global barrier mechanism: "cv" (default), "spin", or "hybrid".
 # "spin" only pays off with HOST_PIN_CPUS pinning (design-doc 10.4/12).
 EVENTQ_BARRIER_MODE = os.environ.get("EVENTQ_BARRIER_MODE", "cv")
