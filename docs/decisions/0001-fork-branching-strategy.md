@@ -1,6 +1,11 @@
 # ADR 0001 — Branching strategy for the parallel-EventQueue research fork
 
-- **Status**: Accepted (2026-07-17)
+- **Status**: Accepted (2026-07-17). The branch-**naming** clause ("One branch per
+  investigation", `sNNN-slug` matching the spec filename) is amended by
+  [0005](./0005-short-branch-names.md) (2026-07-22): branches are now
+  `sNNN-<word>`, ≤16 chars, keyed to the spec by **number** rather than slug.
+  Everything else here stands; per this record's own rule the body is not
+  rewritten.
 - **Scope**: this fork's research work only (the parallel-`EventQueue` +
   shared-L2/L3 project). Upstream-contribution rules are unchanged; see the last
   section.

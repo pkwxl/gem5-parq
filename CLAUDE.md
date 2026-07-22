@@ -52,7 +52,7 @@ worktree at the pre-fork commit rather than treated as new/risky territory. The 
 (`docs/refs/scripts/x86_fs_mesi3_parallel_eventq.py`) only touches fork-added `Root` params inside its
 `if PARALLEL_EVENTQ:` branch, so the same unmodified script file works against a Baseline build's binary too
 — no separate stock script needed. Give the Baseline build its own `git worktree` + tmpfs build dir per the
-usual convention below, keyed to the pre-fork commit hash rather than an `sNNN-slug` branch name.
+usual convention below, keyed to the pre-fork commit hash rather than an `sNNN-<word>` branch name.
 
 **Working style for this project** (empirically validated over many sessions, not just a preference):
 - Report inconvenient measurements plainly, and write them into the relevant `docs/specs/S-NNN` file
@@ -102,8 +102,9 @@ repo — research backup + integration home). `upstream` = `https://github.com/g
 read it before starting a new investigation):
 - `main` (tracks `origin/main`) is this fork's **research trunk** — the analogue of upstream `develop`.
   Keep it buildable and spec-consistent; **do not commit exploratory work directly on `main`.**
-- **One branch per S-NNN investigation**, named `sNNN-slug` to match its `docs/specs/S-NNN-slug.md` spec,
-  branched from `main`. **Claim the number on `main` first** (add the `INDEX.md` row, status `进行中`,
+- **One branch per S-NNN investigation**, named `sNNN-<word>` — one lowercase word, **≤16 characters**
+  total (`s019-avgstor`, `s020-numa`), branched from `main`. The spec filename keeps its long descriptive
+  slug; branch and spec are keyed to each other by the **number**, not the slug (decision 0005). **Claim the number on `main` first** (add the `INDEX.md` row, status `进行中`,
   commit) before branching, so parallel investigations don't collide on the next number.
 - Give each investigation its own `git worktree` under `/workspace/gem5-wt/<branch>/`, with its `build/`
   symlinked into namespaced tmpfs `/workspace/shm/gem5/<branch>/build/` (volatile — builds regenerate;
@@ -191,7 +192,8 @@ and once a branch+worktree exists for an `S-NNN`, the **Architect never touches 
 
 1. **PI** (main) claims the number — `INDEX.md` row, status `进行中` — and commits.
 2. **Architect** (main) writes the `S-NNN` initial version plus any decision note, and commits.
-3. **PI** creates `sNNN-slug` from that commit plus its worktree and tmpfs `build/` symlink.
+3. **PI** creates `sNNN-<word>` (≤16 chars, decision 0005) from that commit plus its worktree and tmpfs
+   `build/` symlink.
 4. In the worktree: **Researcher** deepens a research point and writes the experiment plan →
    **Implementor** makes the code change it needs → **Experimenter** runs the three arms and writes the
    results back → **Debugger** if something breaks. Each is its own session with its own role.
