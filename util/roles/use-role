@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# use-role — 切换本会话的研究角色，并施加写权门（阶段一：chmod 门）。
+#
+# 用法：util/roles/use-role <role>
+#
+# 角色分两类，按**工作树位置**划分（CLAUDE.md「Research role workflow」）：
+#   主树 /workspace/gem5      → pi, architect
+#   worktree /workspace/gem5-wt/<branch> → researcher, experimenter, implementor, debugger
+#
+# 本脚本只做 chmod 门（覆盖文档区）。src/ configs/ tests/ 的写权、以及本项目
+# 特有的实验纪律硬红线（SIGUSR1、隔离核、scons -j），由阶段二的
+# .claude/hooks/role-gate.py 承担。chmod 只改权限位，不改 mtime，也不会让
+# git status 变脏（git 只跟踪可执行位）。
+set -euo pipefail
+
+MAIN_ROLES=(pi architect)
+WT_ROLES=(researcher experimenter implementor debugger)
+ALL_ROLES=("${MAIN_ROLES[@]}" "${WT_ROLES[@]}")
+
+ROLE="${1:-}"
+if [[ -z "$ROLE" ]]; then
+    echo "用法：util/roles/use-role <role>" >&2
+    echo "主树角色：${MAIN_ROLES[*]}" >&2
+    echo "worktree 角色：${WT_ROLES[*]}" >&2
+    exit 1
+fi
+
+contains() { local x="$1"; shift; for i in "$@"; do [[ "$i" == "$x" ]] && return 0; done; return 1; }
+
+if ! contains "$ROLE" "${ALL_ROLES[@]}"; then
+    echo "错误：未知角色 '$ROLE'" >&2
+    echo "可用角色：${ALL_ROLES[*]}" >&2
+    exit 1
+fi
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# 主树 vs linked worktree：主树的 .git 是目录，worktree 的 .git 是文件。
+# 这个判据与路径无关，比匹配 /workspace/gem5-wt/ 前缀更可靠。
+if [[ -d "$REPO_ROOT/.git" ]]; then TREE=main; else TREE=worktree; fi
+
+if [[ "$TREE" == "main" ]] && ! contains "$ROLE" "${MAIN_ROLES[@]}"; then
+    echo "错误：'$ROLE' 是 worktree 角色，不能在主树 $REPO_ROOT 上激活。" >&2
+    echo "主树只对 ${MAIN_ROLES[*]} 开放；请到 /workspace/gem5-wt/<branch>/ 下再运行。" >&2
+    exit 1
+fi
+if [[ "$TREE" == "worktree" ]] && ! contains "$ROLE" "${WT_ROLES[@]}"; then
+    echo "错误：'$ROLE' 是主树角色，不能在 worktree $REPO_ROOT 上激活。" >&2
+    echo "worktree 只对 ${WT_ROLES[*]} 开放；请到 /workspace/gem5 下再运行。" >&2
+    exit 1
+fi
+
+PROTOCOL="$REPO_ROOT/docs/roles/$ROLE/PROTOCOL.md"
+if [[ ! -f "$PROTOCOL" ]]; then
+    echo "错误：协议文件不存在：$PROTOCOL" >&2
+    exit 1
+fi
+
+PREV_ROLE=""
+[[ -f "$REPO_ROOT/.active-role" ]] && PREV_ROLE="$(cat "$REPO_ROOT/.active-role")"
+
+# 干净检查点前置条件：会话内切换必须等上一个角色的交付物提交或明确挂起。
+if [[ -n "$PREV_ROLE" && "$PREV_ROLE" != "$ROLE" ]]; then
+    if [[ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]]; then
+        echo "错误：角色切换 $PREV_ROLE -> $ROLE 被拒绝：工作树不干净。" >&2
+        echo "切换要求一个干净检查点——先提交当前交付物，或以 docs-only 提交把它挂起，再重试。" >&2
+        exit 1
+    fi
+fi
+
+echo "$ROLE" > "$REPO_ROOT/.active-role"
+
+# ---- 写权门（幂等）。矩阵的散文正本在仓库根 CLAUDE.md，这里是可执行副本 ----
+gate_dir() {
+    local dir="$REPO_ROOT/$1"; shift
+    [[ -d "$dir" ]] || return 0
+    if contains "$ROLE" "$@"; then
+        find "$dir" -type f -exec chmod u+w {} +
+    else
+        find "$dir" -type f -exec chmod a-w {} +
+    fi
+}
+
+gate_file() {
+    local f="$REPO_ROOT/$1"; shift
+    [[ -f "$f" ]] || return 0
+    if contains "$ROLE" "$@"; then chmod u+w "$f"; else chmod a-w "$f"; fi
+}
+
+# S-NNN spec 正文：主树归 architect（写初版），worktree 归研究/实验/实现/调试。
+# 同一路径、不同树，两边不会同时可写——这是整套划分的支点。
+gate_specs() {
+    local f
+    while IFS= read -r -d '' f; do
+        if contains "$ROLE" "$@"; then chmod u+w "$f"; else chmod a-w "$f"; fi
+    done < <(find "$REPO_ROOT/docs/specs" -maxdepth 1 -type f -name 'S-*.md' -print0 2>/dev/null)
+}
+
+if [[ "$TREE" == "main" ]]; then
+    gate_dir  docs/roadmap             pi
+    gate_file docs/specs/INDEX.md      pi
+    gate_file docs/specs/OPEN-ISSUES.md pi
+    gate_specs                         architect
+    gate_dir  docs/decisions           architect
+    gate_dir  docs/roles               architect
+    gate_dir  .claude                  architect
+    gate_dir  util/roles               architect
+    gate_file CLAUDE.md                architect
+else
+    gate_specs                         researcher experimenter implementor debugger
+    # INDEX / OPEN-ISSUES 只在主树由 PI 维护——worktree 里改必然引发合并冲突。
+    gate_file docs/specs/INDEX.md
+    gate_file docs/specs/OPEN-ISSUES.md
+    gate_dir  docs/roadmap
+    gate_dir  docs/decisions
+    gate_dir  docs/roles
+    gate_dir  .claude
+    gate_dir  util/roles
+    gate_file CLAUDE.md
+    # 驱动脚本改动会改变被测对象本身——只有 implementor 可改，实验员不可。
+    gate_dir  docs/refs/scripts        implementor
+fi
+
+chmod +x "$REPO_ROOT/util/roles/use-role" 2>/dev/null || true
+
+echo "当前角色：$ROLE（$TREE 树：$REPO_ROOT）"
+echo "协议：docs/roles/$ROLE/PROTOCOL.md"
+
+if [[ -n "$PREV_ROLE" && "$PREV_ROLE" != "$ROLE" ]]; then
+    cat <<EOF
+
+# 会话内切换：$PREV_ROLE -> $ROLE —— 在新角色下动手前必须完成以下全部步骤
+1. 输出交接块：
+     # 角色交接
+     离开角色：$PREV_ROLE
+     状态：<最后一个 commit sha + 一行说明 | 挂起：<原因>>
+     在途产物：<spec/任务、涉及文件、未决问题 —— 或「无」>
+     进入角色：$ROLE —— <用户 ROLE SWITCH 指令里给的理由>
+2. 完整读 docs/roles/$ROLE/PROTOCOL.md。
+3. 用 2-3 行宣告新角色的职权，以及现在哪些事出了范围。
+4. 新角色的 Phase A Checkpoint 1 门控第一个动作 —— 等用户明确确认，
+   用户沉默不算同意。
+来自 $PREV_ROLE 的残留上下文仍在对话里，但与 $ROLE 红线冲突处，红线优先。
+EOF
+fi

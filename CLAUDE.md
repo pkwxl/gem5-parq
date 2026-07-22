@@ -102,6 +102,66 @@ read it before starting a new investigation):
 `upstream/develop` (not `main` or `stable`), keep fork-research commits out, and open the PR against
 `gem5/gem5`'s `develop`. Check which branch you're on before starting work.
 
+## Research role workflow
+
+Work on this fork's research project runs in **exactly one role per session**. The role's full contract
+lives in `docs/roles/<role>/PROTOCOL.md`; this section is the role-neutral registry and is always in force.
+
+**Session start (mandatory).** Run `/load-protocol` at the start of every session: it reads the working
+tree's `.active-role` and loads that role's `PROTOCOL.md` in full. If it has not been run, ask the user to
+run it before doing anything else. Fallback: Read `.active-role`, then Read the protocol yourself — never
+skip or summarise it. If `.active-role` is missing, ask the user to run `util/roles/use-role <role>`.
+
+Role protocols define **checkpoints**; wait for the user's explicit confirmation at each one — **user
+silence is not consent.**
+
+**Roles are split by working tree.** The main tree is the research trunk (design and bookkeeping); every
+worktree is one investigation (research, code, experiments). The same `docs/specs/S-NNN-*.md` path is
+therefore owned by different roles in different trees, which is what keeps main and a branch from
+double-writing one file.
+
+| Tree | Role | Mandate | Writable areas |
+|---|---|---|---|
+| main `/workspace/gem5` | **pi** | Direction, priorities, claiming S-NNN numbers, creating branches+worktrees, doc↔data↔code consistency audit (report, don't fix), go/no-go and the `--no-ff` merge back. | `docs/roadmap/**`, `docs/specs/INDEX.md`, `docs/specs/OPEN-ISSUES.md` |
+| main | **architect** | Mechanism-selection decision notes and the **initial version** of an `S-NNN` spec (background, research points, design, acceptance criteria). Sole owner of the role system itself. | `docs/decisions/**`, `docs/specs/S-*.md`, `docs/roles/**`, `CLAUDE.md`, `.claude/**`, `util/roles/**` |
+| worktree `/workspace/gem5-wt/<branch>/` | **researcher** | Deepen one research point; produce an experiment plan executable without further judgement (arms, workpoint, pinning, metrics, **pre-registered** criteria). | this branch's `docs/specs/S-NNN-*.md` |
+| worktree | **experimenter** | Execute a plan faithfully: build, run, measure, analyse, write results back — including inconvenient ones, same session. | this branch's `docs/specs/S-NNN-*.md` (results sections) |
+| worktree | **implementor** | Code changes governed by an accepted spec task or decision note. | `src/**`, `configs/**`, `build_opts/**`, `tests/**`, `docs/refs/scripts/**`, spec change log |
+| worktree | **debugger** | Root-cause and minimally fix **one** specific failure. | `src/**`, `tests/**`, spec debug log |
+
+`util/roles/use-role <role>` records `.active-role`, refuses a role that does not belong to the current
+tree, refuses an in-session switch while the tree is dirty, and applies the **writability gate** — red
+lines are mechanism, not prose. Stage 1 gates the documentation areas by `chmod`; `src/**` and this
+project's operational red lines (no `SIGUSR1`/`SIGUSR2` to a parallel run, the reserved isolated cores, a
+`scons -j` that would eat them) are gated in stage 2 by `.claude/hooks/role-gate.py`. This table is the
+**prose original**; the script and the hook are downstream executable copies — when they drift, this file
+wins.
+
+Two rules exist purely to keep main and its branches from colliding, and they are not negotiable:
+`docs/specs/INDEX.md` and `OPEN-ISSUES.md` are **PI-only and main-only** (a worktree never edits them);
+and once a branch+worktree exists for an `S-NNN`, the **Architect never touches that spec again** on main.
+
+**The lifecycle of one investigation:**
+
+1. **PI** (main) claims the number — `INDEX.md` row, status `进行中` — and commits.
+2. **Architect** (main) writes the `S-NNN` initial version plus any decision note, and commits.
+3. **PI** creates `sNNN-slug` from that commit plus its worktree and tmpfs `build/` symlink.
+4. In the worktree: **Researcher** deepens a research point and writes the experiment plan →
+   **Implementor** makes the code change it needs → **Experimenter** runs the three arms and writes the
+   results back → **Debugger** if something breaks. Each is its own session with its own role.
+5. **PI** audits doc↔data↔code, decides go/no-go, merges `--no-ff`, updates the `INDEX.md` row.
+
+**Role switching.** One session, one role — a fresh session is the strongest isolation and is always
+acceptable. An in-session switch happens only on the explicit user instruction `ROLE SWITCH: <role> —
+<reason>`. A role may *recommend* a switch when work crosses its boundary, but must **never initiate
+one**. On receiving the instruction, run `util/roles/use-role <role>` and follow the switch procedure it
+prints. Residual context from the previous role stays in the conversation, but where it conflicts with the
+new role's red lines, the red lines win.
+
+**Protocol evolution.** A problem found in this section or any role protocol mid-task is never fixed by
+improvisation: record it where the protocol says, finish the current deliverable, then revise it in an
+Architect session on main (commit prefix `docs,roles:`).
+
 ## Build
 
 Build system is SCons, configured via `SConstruct`/`SConscript` files throughout the tree, with Kconfig-style

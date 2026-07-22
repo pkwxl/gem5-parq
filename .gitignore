@@ -44,3 +44,6 @@ typings
 # an explicit -d/--outdir elsewhere, e.g. /tmp)
 cpt.*/
 .aider*
+
+# 角色工作流的会话状态（每个工作树各一份，不入库）
+.active-role
