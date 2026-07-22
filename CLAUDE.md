@@ -80,8 +80,12 @@ usual convention below, keyed to the pre-fork commit hash rather than an `sNNN-s
   a job pinned to those cores by the host or another container is invisible here. Before occupying them,
   run the `check-cores` skill — it samples `/proc/stat` (which is *not* namespaced, so it does see the
   outside world) per core and reports the measured busy percentage against the configured idle threshold.
-  A "busy" verdict goes into the Experimenter's Checkpoint 1 for the user to judge; do not silently pick
-  substitute cores.
+  A core measured busy is treated as busy until a later sample shows it idle — re-run the skill rather than
+  guessing when it frees up; a core never measured busy counts as free. If the arm's own reserved set has
+  enough idle cores for the plan, use them and start: perturbing another experiment sharing the box is
+  explicitly not a reason to wait unless the plan or the user says so. Never borrow across arms (they sit on
+  different NUMA nodes), always record which cores were actually used, and record a concurrent experiment as
+  a known perturbation source — pinning isolates CPU occupancy, not LLC or memory bandwidth.
 
 ## Branches
 

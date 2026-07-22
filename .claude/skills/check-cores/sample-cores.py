@@ -76,6 +76,30 @@ def snapshot() -> dict[int, tuple[int, int]]:
     return out
 
 
+def fmt_list(cores: list[int]) -> str:
+    """把核号压成 taskset 的 cpu-list 写法：[100,101,102,105] → 100-102,105。"""
+    if not cores:
+        return "无"
+    out, start, prev = [], cores[0], cores[0]
+    for c in cores[1:] + [None]:
+        if c is not None and c == prev + 1:
+            prev = c
+            continue
+        out.append(str(start) if start == prev else f"{start}-{prev}")
+        if c is not None:
+            start = prev = c
+    return ",".join(out)
+
+
+def exit_code(result: dict[str, dict]) -> int:
+    """0 = 两条臂都全空闲；1 = 至少一条臂一个空闲核都没有；2 = 部分空闲。"""
+    if all(r["idle"] for r in result.values()):
+        return 0
+    if any(r["free_count"] == 0 for r in result.values()):
+        return 1
+    return 2
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=float, default=None, help="采样时长，默认取配置值")
@@ -105,11 +129,14 @@ def main() -> int:
             dt = b[c][0] - a[c][0]
             di = b[c][1] - a[c][1]
             cores[c] = 100.0 * (dt - di) / dt if dt > 0 else 0.0
+        free = sorted(c for c, v in cores.items() if v is not None and v < thresh)
         result[key] = {
             "label": label,
             "spec": spec,
             "cores": cores,
-            "idle": all(v is not None and v < thresh for v in cores.values()),
+            "free": free,
+            "free_count": len(free),
+            "idle": len(free) == len(cores),
         }
 
     if args.json:
@@ -117,7 +144,7 @@ def main() -> int:
             {"seconds": secs, "threshold_pct": thresh, "conf": CONF_REL, "arms": result},
             ensure_ascii=False, indent=2,
         ))
-        return 0 if all(r["idle"] for r in result.values()) else 1
+        return exit_code(result)
 
     print(f"保留核空闲检查 — 采样 {secs:g}s，阈值 <{thresh}%，数值出处 {CONF_REL}")
     for key, r in result.items():
@@ -127,14 +154,18 @@ def main() -> int:
                 print(f"  cpu{c:<4} —        /proc/stat 里没有这个核（配置与本机不符）")
             else:
                 print(f"  cpu{c:<4} {pct:7.3f}%  {'空闲' if pct < thresh else '忙  ← 有人在用'}")
-        print(f"  判定：{'可用' if r['idle'] else '不可用'}")
+        print(f"  空闲核：{fmt_list(r['free'])}  共 {r['free_count']}/{len(r['cores'])} 个")
 
     print(
-        "\n注意：占用率是**证据**不是**归属**——容器内看不到是谁在用（`ps` 只看得见"
-        "本容器的进程），此刻空闲也不保证开跑那一刻仍空闲。把上面的实测数字原样"
-        "贴进 Checkpoint 1，由用户判断是否开跑。"
+        "\n占用状态怎么用（决策 0004 §3.1）：**忙是粘性的**——测到忙就假定它一直忙，"
+        "直到下一次实测到它空闲为止；没测到忙就按不忙处理，不要假设看不见的占用。\n"
+        "只要本条臂的空闲核数量满足计划要求，就可以用这些空闲核开跑，**默认不必顾虑**"
+        "对同机其他实验的影响（除非计划或用户特别要求不打扰）。空闲核不够则停下走"
+        "Checkpoint 2。实际使用的核号必须写进 Checkpoint 1 和 spec；同机有别的实验在跑"
+        "时，也要一并记为本次数字的已知扰动源（共享 LLC/内存带宽，绑核不隔离这两样）。\n"
+        "另注：占用率是证据不是归属——容器内看不到是谁在用（`ps` 只看得见本容器的进程）。"
     )
-    return 0 if all(r["idle"] for r in result.values()) else 1
+    return exit_code(result)
 
 
 if __name__ == "__main__":
