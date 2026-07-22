@@ -3,7 +3,9 @@
 **Status: builds and restores cleanly; smoke test surfaced a real
 serial-vs-parallel stats divergence that is O3-specific (does NOT
 reproduce with the unmodified TimingSimpleCPU script at the same tiny
-window) -- root cause not yet found, see §6.** This session wrote
+window). Mechanism now identified in §6.2 -- an unsigned-Tick underflow
+in `AvgStor::set()` from cross-domain `curTick()` skew; no fix applied
+yet.** This session wrote
 `docs/refs/scripts/x86_fs_mesi3_parallel_eventq_o3.py` (an O3-CPU sibling
 of `x86_fs_mesi3_parallel_eventq.py`) and bumped `RubySequencer.
 max_outstanding_requests` to 32 on both scripts' shared restore path. No
@@ -195,20 +197,107 @@ buffers are affected isn't stable across configs either -- both facts
 argue for tracing the actual tick-arithmetic rather than guessing further
 from the numbers.
 
+## 6.2 Reproduction after a bad-edit cleanup, and the actual mechanism
+
+**Worktree cleanup first.** A later session left the worktree in a state
+that could not build or run, and wrote a `TODO.md` planning around the
+resulting symptoms as if they were real findings. For the record, none
+of that `TODO.md`'s premises held:
+
+- `x86_fs_mesi3_parallel_eventq_o3.py` had been edited (uncommitted) to
+  replace the working restore path -- `obtain_resource("x86-ubuntu-24.04
+  -boot-with-systemd", "5.0.0").get_parameters()` feeding `kernel`,
+  `disk_image` **and `kernel_args`** -- with hardcoded
+  `obtain_resource("x86-linux-kernel", "5.4.0")` /
+  `("x86-ubuntu-24.04-img", "2024-01-01")` and **no `kernel_args`**. The
+  `TypeError: set_kernel_disk_workload() missing 2 required positional
+  arguments` that `TODO.md` records as "当前错误", and its
+  highest-priority "resource version mismatch" blocker, were both
+  artifacts of that half-finished edit. HEAD never asks for those
+  resources. Dropping `kernel_args` would additionally have restored the
+  checkpoint under different boot arguments than it was created with --
+  a silent config divergence, worse than the loud `TypeError`.
+- `src/base/stats/text.cc` had an edit containing a literal newline
+  inside a string literal, i.e. the tree did not compile at all.
+- `src/python/m5/{simulate.py,stats/__init__.py}` had a
+  `postCheckpointRestore()` mechanism added on the theory that stats file
+  streams go invalid across a checkpoint restore. There is no evidence
+  for that: §6 already recorded both arms dumping stats normally, and the
+  0-byte `stats.txt` files that motivated it came from runs reporting
+  `Return code: -15` (SIGTERM) -- a killed process never reaches the exit
+  dump. The driver `run_parallel_test.py` also silently dropped
+  `SIM_QUANTUM_TICKS` (falling back to the script default of 300 rather
+  than §6's 6660, ~18x more barrier syncs) and passed no `timeout=`.
+
+All four files were reverted to HEAD; the discarded diff is preserved
+outside the repo. `scons build/X86_MESI_Three_Level/gem5.opt` then
+relinked cleanly (the binary had been stale).
+
+**Reproduction.** Reran §6's protocol verbatim on the rebuilt binary
+(`SIM_QUANTUM_TICKS=6660`, `MAX_TICKS=10000000`, serial `taskset -c 10`,
+parallel `HOST_PIN_CPUS=11..18`). §6's numbers reproduce exactly:
+`simInsts` 5481 / `simOps` 10892 identical across arms, `finalTick`
+5303204840323, `hostSeconds` 1.15 serial vs 1.21 parallel -- i.e. the
+parallel arm is still *slower* at this window. The `m_buf_msgs`
+divergence also reproduces, again only in the parallel arm, this time on
+four links (`int_links102.buffers1`, `int_links116.buffers1`,
+`int_links128.buffers1`, `int_links79.buffers2`). Which links are
+affected and how many keeps varying run to run, as §6.1 already noted.
+
+**Mechanism.** The bogus values are not arbitrary. Every one observed so
+far -- the four above plus both values recorded in §6 and §6.1 -- fits
+
+    value = k * 2^64 / 10000001,   k in {1, 2, 3, 5}
+
+with the denominator exactly 10000001 in all six cases. That denominator
+is correct (the `Average` stat's elapsed-tick divisor for a 10M-tick
+window), which **rules out §7's earlier leading candidate**: the problem
+is not a wrong-domain `curTick()` in the denominator. The numerator has
+overflowed by exactly k whole 2^64 units.
+
+`m_buf_msgs` (`MessageBuffer.hh:299`) is a `statistics::Average`, backed
+by `AvgStor` (`src/base/stats/storage.hh`), whose every update does:
+
+```cpp
+total += current * (curTick() - last);
+last = curTick();
+```
+
+`Tick` is `uint64_t` and `last` is stamped by whichever domain last
+touched the buffer. Under this project's relaxed cross-domain timing,
+two domains sharing a `MessageBuffer` do not agree on `curTick()`: when
+a domain that is *behind* the barrier enqueues or dequeues, `curTick() <
+last`, and `curTick() - last` underflows to ~2^64 instead of a small
+positive delta. It is then scaled by `current`, the buffer's occupancy at
+that instant -- which is exactly the observed k. So k is not a corruption
+count; it is how many messages were sitting in the buffer when a
+backwards-in-time cross-domain update landed.
+
+This is consistent with §7's framing that the bug is O3-*triggered* but
+not O3-*caused*: `AvgStor` is shared upstream code, and TimingSimpleCPU's
+concurrency-1 traffic simply never produced a cross-domain update on a
+non-empty buffer at a lagging tick. It also puts this in the same family
+as S-009 through S-016 (cross-domain reads of state stamped by another
+domain's clock), and means a fix belongs in shared code, not in this
+spec's own script.
+
+Not yet decided: whether to fix this in `AvgStor` (clamp/skip when
+`curTick() < last`), at the `MessageBuffer` call sites, or by giving
+cross-domain-shared stats a domain-consistent tick source. Nothing has
+been changed -- per `CLAUDE.md`'s working-style rule, that choice is a
+checkpoint, not something to pick unattended.
+
 ## 7. Not done yet
 
-- Root cause of §6/§6.1's divergence -- not traced, despite ruling out
-  the concurrency bump. Leading candidate now: an existing cross-domain
-  tick-sampling gap in `statistics::Average`/`MessageBuffer` that only
-  O3's traffic pattern (rather than TimingSimpleCPU's) reaches, in the
-  same family as this project's long history of cross-domain-read bugs
-  (S-009 through S-016) -- consistent with the bug being O3-triggered but
-  not O3-caused, i.e. latent in shared `xbar.cc`/`MessageBuffer` code
-  this whole project rather than newly introduced, just never triggered
-  by Timing-CPU's concurrency-1 access pattern before. Not confirmed --
-  worth keeping in mind before assuming it's O3-script-local, since a
-  fix would then belong in shared code rather than this spec's own
-  script.
+- ~~Root cause of §6/§6.1's divergence~~ -- **traced in §6.2**: unsigned
+  `Tick` underflow of `curTick() - last` in `AvgStor::set()`, driven by
+  cross-domain `curTick()` skew, scaled by buffer occupancy. The
+  hypothesis this bullet previously carried (a wrong-domain `curTick()`
+  in the *denominator*) is wrong and has been retracted -- the
+  denominator is exactly correct in all six observed cases. **No fix
+  applied**; choosing where the fix belongs (`AvgStor` vs. the
+  `MessageBuffer` call sites vs. a domain-consistent tick source for
+  shared stats) is the open decision.
 - No real-window run of any kind yet -- everything so far is the 10M-tick
   smoke test. S-013 §9's own lesson (a 2e8-tick window was still
   boot-phase) suggests this smoke window is nowhere near representative;
@@ -224,10 +313,11 @@ from the numbers.
   that would answer this.
 
 Per this project's checkpoint-before-risky-step convention (`CLAUDE.md`
-"Working style"), root-causing §6's divergence is new, unexplored
-territory (first real bug found in this project's first-ever O3 use, no
-existing design doc or fix pattern obviously covers it) and should be
-checked in on before diving in further, not pursued unattended.
+"Working style"): §6's divergence is now root-caused (§6.2), but
+*fixing* it means touching shared upstream stats code (`AvgStor`) or the
+cross-domain tick contract, which affects every stat in every past S-NNN
+run, not just this spec's. That is the checkpoint -- it should be agreed
+before any code changes, not pursued unattended.
 
 ---
 
