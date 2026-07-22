@@ -83,9 +83,13 @@ usual convention below, keyed to the pre-fork commit hash rather than an `sNNN-s
   A core measured busy is treated as busy until a later sample shows it idle — re-run the skill rather than
   guessing when it frees up; a core never measured busy counts as free. If the arm's own reserved set has
   enough idle cores for the plan, use them and start: perturbing another experiment sharing the box is
-  explicitly not a reason to wait unless the plan or the user says so. Never borrow across arms (they sit on
-  different NUMA nodes), always record which cores were actually used, and record a concurrent experiment as
-  a known perturbation source — pinning isolates CPU occupancy, not LLC or memory bandwidth.
+  explicitly not a reason to wait unless the plan or the user says so. If its own set is short, an arm may by
+  default borrow idle cores from the other arm's set (the serial set is small and fills up easily) — taking
+  only what the plan needs, unless the plan or the user rules that out. Always record which cores were used
+  **and their NUMA node**, plus both known perturbation sources: another experiment sharing the box (pinning
+  isolates CPU occupancy, not LLC or memory bandwidth) and, when borrowing, the NUMA node change (serial set
+  on node 0, parallel set on node 1) — borrowed-core numbers are not the same memory-locality condition as
+  historical runs of that arm and must not be compared as a like-for-like repeat.
 
 ## Branches
 
