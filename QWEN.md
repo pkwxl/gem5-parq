@@ -113,8 +113,10 @@ Paths used in this sandbox:
 ### CPU Isolation
 
 Current isolation plan:
-- **Serial**: cores `54-55` (NUMA 0)
-- **Parallel**: cores `92-111` (NUMA 1, 8 domains use `92-99`)
+- **Serial** / **Parallel** arm cores: single source of truth is `util/roles/reserved-cores`
+  (`SERIAL_ARM_CPUS` / `PARALLEL_ARM_CPUS`; builds go to `BUILD_CPUS`). Never hard-code them.
+- Before occupying them, run the `check-cores` skill — container `ps` cannot see other
+  containers' jobs pinned to those cores.
 - Build uses: `0-53,56-91` (excluding isolation set)
 
 Use `taskset -c <cpu-list>` for builds.

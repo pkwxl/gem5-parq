@@ -27,6 +27,7 @@ harness 回落到自己的确认提示——用户仍然看得到这次调用。
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -38,9 +39,11 @@ MAIN_ROLES = {"pi", "architect"}
 WT_ROLES = {"researcher", "experimenter", "implementor", "debugger"}
 ROLES = MAIN_ROLES | WT_ROLES
 
-# 内核隔离核（/proc/cmdline 的 isolcpus=）：54-55 归串行臂，92-111 归并行臂，
-# 只有实验员可以碰。构建工具占用它们会污染正在跑的 A/B 计时。
-RESERVED_CPUS = {54, 55} | set(range(92, 112))
+# 保留核（/proc/cmdline 的 isolcpus=）只有实验员可以碰；重核任务占用它们会污染
+# 正在跑的 A/B 计时。**数值不在本文件里**——单点定义在 util/roles/reserved-cores，
+# 这里只负责读它（决策 0004）。读不到就 ask，不回落到内置默认：一个静默失效的
+# 保留核门比没有门更危险。
+CORES_CONF = "util/roles/reserved-cores"
 
 # 写权矩阵的可执行副本。先匹配者胜，所以更具体的条目必须排在前面。
 MAIN_AREAS: list[tuple[str, set[str]]] = [
@@ -191,7 +194,22 @@ PI_ONLY_GIT = re.compile(
 MERGE_LIKE = re.compile(r"^git\s+(?:merge|rebase)\b")
 
 SCONS = re.compile(r"\bscons\b")
-SCONS_J = re.compile(r"-j\s*\d+|-j\d+")
+# `-j` 后面跟什么都算请求并行：`-j80`、`-j 80`、`-j$(nproc)`、以及裸 `-j`（make
+# 的裸 -j 是"不限并发"）。旧版只匹配 `-j\d+`，`scons -j$(nproc)` 直接漏过去——
+# nproc 在容器内返回 112，正好吃满含保留核的整机（S-010 §12 记过这次事故）。
+JOB_J = re.compile(r"(?:^|\s)-j(?:\s*\S+)?")
+
+# 会自己吃满整机的工具：命令位正则 + 判定"是否请求了并行"的旗标正则（None =
+# 该工具默认就并行）。旗标必须逐工具绑定：xargs 的 `-n` 是批大小不是并发度，
+# 一律用同一个宽正则会误杀。
+JOB_SPECS: list[tuple[re.Pattern[str], re.Pattern[str] | None]] = [
+    (re.compile(r"^scons\b"), JOB_J),
+    (re.compile(r"^make\b"), JOB_J),
+    (re.compile(r"^ninja\b"), None),
+    (re.compile(r"^xargs\b"), re.compile(r"(?:^|\s)-P\s*(?!1\b)\d+")),
+    (re.compile(r"^(?:py\.)?pytest\b"), re.compile(r"(?:^|\s)-n\s*(?:\d+|auto)")),
+    (re.compile(r"^(?:python3?\s+)?(?:\./|tests/)*main\.py\b"), JOB_J),
+]
 PINNED = re.compile(r"^(?:taskset|numactl)\b")
 GEM5_BIN = re.compile(r"\bgem5\.(?:opt|debug|fast|prof|perf)\b")
 GEM5_OUTDIR = re.compile(r"(?:^|\s)(?:-d|--outdir)(?:[=\s]+)(\S+)")
@@ -249,6 +267,23 @@ def expand_cpus(spec: str) -> set[int]:
             except ValueError:
                 continue
     return out
+
+
+@functools.lru_cache(maxsize=8)
+def load_cores(root_s: str) -> dict[str, str] | None:
+    """读 `util/roles/reserved-cores`。读不到或缺键返回 None——调用方据此 ask。"""
+    try:
+        text = (Path(root_s) / CORES_CONF).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    conf: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if "=" in line:
+            k, _, v = line.partition("=")
+            conf[k.strip()] = v.strip().strip("\"'")
+    need = {"SERIAL_ARM_CPUS", "PARALLEL_ARM_CPUS", "BUILD_CPUS"}
+    return conf if need <= conf.keys() else None
 
 
 def area_for(rel: str, tree: str) -> tuple[str, set[str]] | None:
@@ -362,15 +397,33 @@ def unquoted(seg: str) -> str:
 def check_discipline(seg: str, root: Path, role: str, tree: str) -> tuple[str, str] | None:
     """本项目特有的实验操作纪律。"""
     seg = unquoted(seg)
-    # 隔离核：只有实验员可以碰。
+    conf = load_cores(str(root))
+
     m = CPU_LIST.search(seg)
-    if m:
-        hit = expand_cpus(m.group(1)) & RESERVED_CPUS
+    parallel_job = any(
+        tool.match(seg) and (flag is None or flag.search(seg)) for tool, flag in JOB_SPECS
+    )
+
+    # 保留核的数值只有一个出处；读不到就不装作知道。
+    if (m or parallel_job) and conf is None:
+        return (
+            "ask",
+            f"读不到 `{CORES_CONF}`（保留核的单点定义，决策 0004），无法判定这条命令"
+            "是否会占用 A/B 计时专用核。请先确认该文件存在且含 SERIAL_ARM_CPUS / "
+            "PARALLEL_ARM_CPUS / BUILD_CPUS 三个键。",
+        )
+
+    # 隔离核：只有实验员可以碰。
+    if m and conf:
+        reserved = expand_cpus(conf["SERIAL_ARM_CPUS"]) | expand_cpus(conf["PARALLEL_ARM_CPUS"])
+        hit = expand_cpus(m.group(1)) & reserved
         if hit and role != "experimenter":
             return (
                 "deny",
-                f"核 {sorted(hit)} 是内核隔离的 A/B 计时专用核（54-55 串行臂 / 92-111 并行臂），"
-                f"只对 experimenter 开放，当前角色是 {role}。构建请限制到非保留核（上限 90）。",
+                f"核 {sorted(hit)} 是内核隔离的 A/B 计时专用核"
+                f"（{conf['SERIAL_ARM_CPUS']} 串行臂 / {conf['PARALLEL_ARM_CPUS']} 并行臂，"
+                f"见 {CORES_CONF}），只对 experimenter 开放，当前角色是 {role}。"
+                f"重核任务请限制到 BUILD_CPUS（{conf['BUILD_CPUS']}）。",
             )
 
     if SCONS.search(seg):
@@ -385,12 +438,15 @@ def check_discipline(seg: str, root: Path, role: str, tree: str) -> tuple[str, s
                 "请求 `ROLE SWITCH: experimenter — <理由>`（跑计划里的三臂）或 "
                 "`ROLE SWITCH: implementor — <理由>`（改完代码自检构建）。",
             )
-        if SCONS_J.search(seg) and not PINNED.match(seg):
-            return (
-                "deny",
-                "`scons -j` 会吃满整机，包括隔离核 54-55 / 92-111，污染正在跑的 A/B 计时。"
-                "必须用 taskset/numactl 限制到非保留核，例如 `taskset -c 0-53,56-91 scons -j80 ...`。",
-            )
+    # 重核任务通则：不绑核就会吃满整机，连带保留核（决策 0004 §4）。
+    if parallel_job and conf and not PINNED.match(seg):
+        return (
+            "deny",
+            f"这是会吃满整机的并行任务，不绑核就会占用保留核 "
+            f"{conf['SERIAL_ARM_CPUS']} / {conf['PARALLEL_ARM_CPUS']}，污染正在跑的 A/B 计时。"
+            f"必须用 taskset/numactl 限制到 BUILD_CPUS，例如 "
+            f"`taskset -c {conf['BUILD_CPUS']} scons build/... -j80`（数值出处：{CORES_CONF}）。",
+        )
 
     if GEM5_BIN.search(seg):
         if tree == "main":

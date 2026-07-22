@@ -66,13 +66,22 @@ usual convention below, keyed to the pre-fork commit hash rather than an `sNNN-s
 - Known operational pitfall specific to this project: never send `SIGUSR1`/`SIGUSR2` to a running
   parallel-`EventQueue` gem5 process (async stat dump on a non-main thread without the GIL segfaults it) —
   see `docs/specs/S-007-spin-barrier-and-milestone.md` §14 for the safe way to read a live tick instead.
-- Host CPUs `54-55,92-111` are kernel-isolated (`isolcpus=`, see `/proc/cmdline`) for clean A/B timing.
-  `54-55` is on NUMA node 0 (node 0 spans 0-55) — pin the serial arm there. `92-111` is on NUMA node 1
-  (node 1 spans 56-111) — pin the parallel-spin arm there.
-- `54-55` is reserved exclusively for the serial-arm test and `92-111` exclusively for the parallel-arm
-  test — no other job may be scheduled or pinned to them. This includes build tools (e.g. `scons -j`) that
-  would otherwise happily use every core on the box: constrain those to the unreserved cores (e.g. via
-  `taskset`/`--cpu-list`), whose max available count is 90.
+- Some host CPUs are kernel-isolated (`isolcpus=`, see `/proc/cmdline`) and reserved for clean A/B timing:
+  one set for the serial arm, one for the parallel-spin arm, each on its own NUMA node. **The core numbers
+  live in exactly one place — `util/roles/reserved-cores`** (`SERIAL_ARM_CPUS`, `PARALLEL_ARM_CPUS`,
+  `BUILD_CPUS`, plus the idle criterion). Read them from there; never hard-code them again, here or in a
+  script. Changing machines means editing that one file — see
+  [docs/decisions/0004-reserved-cores-single-source-and-idle-check.md](docs/decisions/0004-reserved-cores-single-source-and-idle-check.md).
+- Nothing but the arm that owns them may run on the reserved cores. This includes any job that would
+  otherwise spread over the whole box (`scons -j`, `make -j`, `ninja`, `pytest -n`, `xargs -P`,
+  `tests/main.py -j`): pin those to `BUILD_CPUS` via `taskset`/`numactl`. The role gate denies an
+  unpinned parallel job outright.
+- **Reserved does not mean free.** This is a container: `ps`/`top` only see this container's processes, so
+  a job pinned to those cores by the host or another container is invisible here. Before occupying them,
+  run the `check-cores` skill — it samples `/proc/stat` (which is *not* namespaced, so it does see the
+  outside world) per core and reports the measured busy percentage against the configured idle threshold.
+  A "busy" verdict goes into the Experimenter's Checkpoint 1 for the user to judge; do not silently pick
+  substitute cores.
 
 ## Branches
 
@@ -145,8 +154,10 @@ the ones that silently void data rather than corrupt files:
 
 - `SIGUSR1`/`SIGUSR2` to any process — denied for every role (async stat dump off the main thread
   segfaults a parallel run; read a live tick per `S-007` §14 instead)
-- the kernel-isolated cores `54-55` / `92-111` — only `experimenter` may pin to them
-- `scons -j` without a `taskset`/`numactl` cpu-list — denied; unconstrained it eats the reserved cores
+- the kernel-isolated cores (`SERIAL_ARM_CPUS`/`PARALLEL_ARM_CPUS` in `util/roles/reserved-cores`) — only
+  `experimenter` may pin to them; if that file is unreadable the gate `ask`s rather than guessing
+- a parallel job (`scons`/`make` with `-j`, `ninja`, `pytest -n`, `xargs -P`, `main.py -j`) with no
+  `taskset`/`numactl` cpu-list — denied; unconstrained it eats the reserved cores
 - a gem5 run with no `-d`, or with `-d` pointing inside the repo — denied (`cpt.*/` is not source)
 - `scons` or a gem5 binary invoked on the **main tree** — denied; main is the trunk, not an experiment host
 - `scons` in a worktree — denied for `researcher` only (read-only probing is its mandate; building is

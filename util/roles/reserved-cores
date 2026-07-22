@@ -1,0 +1,32 @@
+# 保留核与空闲判据 —— 单点定义（决策 0004）
+#
+# 这份文件是**唯一**的数值出处。散文（CLAUDE.md、docs/roles/*/PROTOCOL.md）只
+# 指名本文件、不复述数字；下游读它的有三处：
+#   - .claude/hooks/role-gate.py  （谁可以绑到保留核、重核任务必须绑到哪里）
+#   - util/roles/use-role         （切角色时回显当前值）
+#   - .claude/skills/check-cores/ （实验前实测保留核是否真空闲）
+#
+# 换机器或改隔离核时，**只改这里**，然后跑
+#   python3 .claude/hooks/test-role-gate.py
+# 确认门仍然自洽。docs/specs/** 里出现的核号是历史实验记录，记录当时实际用的核，
+# 不随本文件变动——不要去改它们。
+#
+# 格式：KEY=VALUE，一行一条，`#` 起注释。shell 可 source，Python 三行可解析。
+# 取值用 taskset 的 cpu-list 语法（`a-b` 区间、`,` 分隔）。
+
+# 串行臂专属。当前机器上位于 NUMA node 0（node 0 覆盖 0-55）。
+SERIAL_ARM_CPUS=54-55
+
+# 并行 spin 臂专属。当前机器上位于 NUMA node 1（node 1 覆盖 56-111）。
+PARALLEL_ARM_CPUS=92-111
+
+# 一切重核任务（构建、测试、批处理）的许可范围 = 上面两组之外的全部核。
+# 必须与上面两组互斥；改上面两组时同步改这里。
+BUILD_CPUS=0-53,56-91
+
+# 空闲判据（check-cores skill）：连续采样 IDLE_SAMPLE_SECONDS 秒，单核忙碌率
+# 低于 IDLE_MAX_BUSY_PCT 才判为空闲。这台机器的保留核同时设了 nohz_full 和
+# rcu_nocbs（见 /proc/cmdline），真正空闲时连周期时钟中断都没有，所以 0.1%
+# 是现实阈值而不是理想值；换到没有 nohz_full 的机器上需要放宽。
+IDLE_SAMPLE_SECONDS=10
+IDLE_MAX_BUSY_PCT=0.1

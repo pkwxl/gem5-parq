@@ -27,6 +27,11 @@ def setup() -> tuple[Path, Path]:
             (root / d).mkdir(parents=True, exist_ok=True)
     (main / ".git").mkdir(exist_ok=True)
     (wt / ".git").write_text("gitdir: /workspace/gem5/.git/worktrees/wt\n")
+    # 保留核的单点定义（决策 0004）。用真文件而不是假值——门读不到它就一律 ask，
+    # 假根若没有这份文件，全部纪律用例都会假红。
+    real = Path(__file__).resolve().parents[2] / "util" / "roles" / "reserved-cores"
+    for root in (main, wt):
+        (root / "util" / "roles" / "reserved-cores").write_text(real.read_text())
     return main, wt
 
 
@@ -115,9 +120,22 @@ def main() -> int:
          "deny", "numactl 形式也要拦"),
         (wt_root, "implementor", B("taskset -c 0-53,56-91 scons build/X86/gem5.opt -j80"),
          "allow", "限制到非保留核就放行"),
-        # ---- scons -j 纪律 ----
+        # ---- 重核任务必须绑核（ADR 0004 §4）----
         (wt_root, "implementor", B("scons build/X86/gem5.opt -j80"), "deny", "未绑核的 -j 吃满整机"),
         (wt_root, "implementor", B("scons build/X86/gem5.opt"), "allow", "无 -j 不设限"),
+        (wt_root, "implementor", B("scons build/X86/gem5.opt -j$(nproc)"),
+         "deny", "-j$(nproc) 旧版漏网，nproc 在容器内是 112"),
+        (wt_root, "implementor", B("taskset -c 0-53,56-91 scons build/X86/gem5.opt -j$(nproc)"),
+         "allow", "绑到 BUILD_CPUS 后 -j$(nproc) 也放行"),
+        (wt_root, "implementor", B("make -j"), "deny", "make 裸 -j 是不限并发"),
+        (wt_root, "implementor", B("ninja -C build"), "deny", "ninja 默认就吃满整机"),
+        (wt_root, "implementor", B("taskset -c 0-53 ninja -C build"), "allow", "绑核后放行"),
+        (wt_root, "experimenter", B("xargs -P 8 -I{} sh -c 'echo {}' < list"),
+         "deny", "xargs -P 是并发度"),
+        (wt_root, "experimenter", B("xargs -n 10 echo < list"), "allow", "xargs -n 是批大小不是并发"),
+        (wt_root, "implementor", B("pytest -n auto tests/"), "deny", "pytest -n auto"),
+        (wt_root, "implementor", B("pytest tests/pyunit"), "allow", "串行 pytest 不设限"),
+        (wt_root, "experimenter", B("cd tests && ./main.py run -j6"), "deny", "回归测试的 -j 同理"),
         (wt_root, "experimenter", B("taskset -c 0-53 scons build/X86/gem5.opt -j40"),
          "allow", "实验员自己建三臂（ADR 0003 缺口 1）"),
         (wt_root, "researcher", B("taskset -c 0-53 scons build/X86/gem5.opt -j40"),
@@ -178,7 +196,58 @@ def main() -> int:
         if got != want:
             fails += 1
             print(f"FAIL  [{role}@{root.name}] {label}\n      期望 {want} 实得 {got}: {why}")
-    print(f"\n{len(cases) - fails}/{len(cases)} 通过")
+
+    # 单点定义缺失时的失败安全方向：ask，绝不静默放行（ADR 0004 §3）。
+    conf = wt_root / "util" / "roles" / "reserved-cores"
+    saved = conf.read_text()
+    conf.unlink()
+    extra = [
+        ("experimenter", B("taskset -c 54,55 ./build/X86/gem5.opt -d /tmp/r f.py"),
+         "ask", "读不到保留核清单就不装作知道"),
+        ("implementor", B("scons build/X86/gem5.opt -j80"), "ask", "同上，重核任务也降级为 ask"),
+        ("implementor", B("git status"), "allow", "与保留核无关的命令不受影响"),
+    ]
+    for role, (tool, ti), want, label in extra:
+        got, why = run(wt_root, role, tool, ti)
+        if got != want:
+            fails += 1
+            print(f"FAIL  [{role}@wt/无配置] {label}\n      期望 {want} 实得 {got}: {why}")
+    conf.write_text(saved)
+
+    # 配置自身的自洽：BUILD_CPUS 与两条臂必须互斥，否则"绑到 BUILD_CPUS"这条
+    # 建议本身就会踩保留核。没有任何代码强制这三者的关系，只能在这里断言。
+    conf_vals: dict[str, str] = {}
+    for line in (Path(__file__).resolve().parents[2] / "util" / "roles" / "reserved-cores") \
+            .read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if "=" in line:
+            k, _, v = line.partition("=")
+            conf_vals[k.strip()] = v.strip()
+
+    def cpus(spec: str) -> set[int]:
+        out: set[int] = set()
+        for part in spec.split(","):
+            if "-" in part:
+                lo, _, hi = part.partition("-")
+                out |= set(range(int(lo), int(hi) + 1))
+            elif part.strip():
+                out.add(int(part))
+        return out
+
+    serial, parallel = cpus(conf_vals["SERIAL_ARM_CPUS"]), cpus(conf_vals["PARALLEL_ARM_CPUS"])
+    build = cpus(conf_vals["BUILD_CPUS"])
+    conf_checks = [
+        (not (serial & parallel), "两条臂的核不得重叠"),
+        (not (build & (serial | parallel)), "BUILD_CPUS 不得含保留核"),
+        (bool(serial) and bool(parallel) and bool(build), "三个键都不得为空"),
+    ]
+    for ok, label in conf_checks:
+        if not ok:
+            fails += 1
+            print(f"FAIL  [reserved-cores] {label}")
+
+    total = len(cases) + len(extra) + len(conf_checks)
+    print(f"\n{total - fails}/{total} 通过")
     return 1 if fails else 0
 
 

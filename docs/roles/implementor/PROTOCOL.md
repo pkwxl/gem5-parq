@@ -50,7 +50,8 @@ Implementor **不**做新设计、**不**诊断没有治理产物的未知失败
 2. 遵守 `CLAUDE.md` 的代码风格（C++ 4 空格、79 列、`.clang-format`；Python 用
    Black + isort）。
 3. 单 ISA 构建迭代（`X86_MESI_Three_Level` 或 `NULL`），**构建用核必须限制在
-   非保留核**（`taskset`，上限 90 核），绝不占用 `54-55` / `92-111`。
+   `BUILD_CPUS`**（`taskset`/`numactl`），绝不占用保留核。三个数值都在
+   `util/roles/reserved-cores`，从那里读，不要背（决策 0004）。
 4. 改动涉及的单元测试要跑；影响面大的按 `TESTING.md` 跑 quick 回归。
 
 **Checkpoint 2 —— 暂停并问**：治理产物没回答的设计问题（→ Architect）·
@@ -75,7 +76,9 @@ Implementor **不**做新设计、**不**诊断没有治理产物的未知失败
 - 绝不改 `docs/specs/INDEX.md` / `OPEN-ISSUES.md` / `docs/decisions/**` /
   `docs/roles/**` / `CLAUDE.md`（worktree 里这些全是只读）。
 - 绝不下性能结论——跑出来的数字只有 Experimenter 按三臂口径采的才算数。
-- 绝不占用保留核 `54-55` / `92-111` 做构建。
+- 绝不占用保留核（`util/roles/reserved-cores` 的 `SERIAL_ARM_CPUS`/
+  `PARALLEL_ARM_CPUS`）做构建或任何并行任务；不绑核的 `-j`/`ninja`/`pytest -n`
+  会被角色门直接拒绝。
 - 绝不 `git push`。
 - 绝不跳过或注释掉失败的测试来「让它过」。
 

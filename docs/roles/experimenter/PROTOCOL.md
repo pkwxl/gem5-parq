@@ -29,10 +29,12 @@ Experimenter **不**改任何代码，**也不**改驱动脚本（`docs/refs/scr
 - **绝不**对运行中的 parallel-`EventQueue` gem5 进程发 `SIGUSR1`/`SIGUSR2`
   ——非主线程无 GIL 的异步 stat dump 会直接段错误。要读实时 tick 见
   `docs/specs/S-007-spin-barrier-and-milestone.md` §14 的安全办法。
-- **绑核专属**：`54-55`（NUMA 0）只给串行臂，`92-111`（NUMA 1）只给并行 spin 臂。
-  这两组核上不得跑任何其他东西。
-- **构建不得占用保留核**：`scons -j` 默认会吃满整机。必须用 `taskset` 或
-  `--cpu-list` 限制到非保留核，可用上限 90。
+- **绑核专属**：`SERIAL_ARM_CPUS` 只给串行臂、`PARALLEL_ARM_CPUS` 只给并行 spin 臂，
+  两组核上不得跑任何其他东西。**核号一律从 `util/roles/reserved-cores` 读**，不要
+  背数字、不要往别处抄（决策 0004）。
+- **重核任务不得占用保留核**：`scons -j`、`make -j`、`ninja`、`pytest -n`、
+  `xargs -P`、`tests/main.py -j` 默认都会吃满整机，必须 `taskset`/`numactl` 限制到
+  `BUILD_CPUS`。不绑核的并行任务会被角色门直接拒绝。
 - **checkpoint 与输出目录**：`-d /tmp/<...>`，绝不让 `cpt.*/` 落进仓库。
 - **build 目录**走 tmpfs 软链（`/workspace/shm/gem5/<branch>/build/`）。
 - **构建是本角色自己的活**（`scons` 对本角色放行，见
@@ -47,7 +49,11 @@ Experimenter **不**改任何代码，**也不**改驱动脚本（`docs/refs/scr
 1. 本分支 spec 的**实验计划**一节，全文，逐项抄成执行清单。
 2. 确认三臂的构建各自就位（worktree、tmpfs build 目录、二进制存在且是预期
    commit）。
-3. 确认保留核当前空闲（`ps`/`top` 核查，不要盲信）。
+3. **实测**保留核当前空闲：跑 `check-cores` skill
+   （`python3 .claude/skills/check-cores/sample-cores.py`），把逐核忙碌率贴进
+   Checkpoint 1。**不要用 `ps`/`top` 代替**——容器内只看得见本容器的进程，宿主机
+   或别的容器绑在保留核上的任务在这里完全不可见，而它照样会污染计时。
+   判定为「忙」时不得自行改用别的核：如实报告，等用户裁决。
 
 **Checkpoint 1 —— 输出后等用户确认：**
 
@@ -56,7 +62,8 @@ Experimenter **不**改任何代码，**也不**改驱动脚本（`docs/refs/scr
 分支 / spec / 计划：<sNNN-slug> / <S-NNN> / <计划编号>
 臂：Baseline <commit+路径> · Current Serial <路径> · Current Parallel <路径>
 工作点参数：<逐项>
-绑核：串行 54-55 · 并行 92-111 · 构建核 <列表>
+绑核：串行 <SERIAL_ARM_CPUS> · 并行 <PARALLEL_ARM_CPUS> · 构建核 <BUILD_CPUS>
+保留核实测：<check-cores 的逐核忙碌率与判定，采样时长>
 预注册判据：<抄自计划>
 预计墙钟：<时长>
 偏离计划之处：<无 | 逐条列出+原因>
@@ -90,7 +97,8 @@ Experimenter **不**改任何代码，**也不**改驱动脚本（`docs/refs/scr
 ## 5. 硬红线
 
 - 绝不 `SIGUSR1`/`SIGUSR2` 并行 gem5 进程。
-- 绝不在 `54-55` / `92-111` 上跑非本臂的东西，绝不让构建占用它们。
+- 绝不在保留核（`util/roles/reserved-cores`）上跑非本臂的东西，绝不让构建占用它们。
+- 绝不跳过 `check-cores` 就占用保留核，也绝不在它判定「忙」时自行换核开跑。
 - 绝不改 `src/`、`configs/`、`docs/refs/scripts/**`。
 - 绝不事后修改判据，绝不因为数字不好看而多跑几次挑一个报。
 - 绝不把原始输出或 checkpoint 落进仓库。

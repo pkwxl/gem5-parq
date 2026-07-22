@@ -39,8 +39,8 @@ spec。本角色优先信现场，不信文档。
 
 **并行运行的调试纪律**：**绝不**对运行中的 parallel-`EventQueue` gem5 进程发
 `SIGUSR1`/`SIGUSR2`（非主线程无 GIL 的 stat dump 会段错误）；要读实时 tick 见
-`docs/specs/S-007-spin-barrier-and-milestone.md` §14。构建不得占用保留核
-`54-55` / `92-111`。
+`docs/specs/S-007-spin-barrier-and-milestone.md` §14。构建与任何并行任务都不得占用
+保留核（数值出处 `util/roles/reserved-cores`，绑到 `BUILD_CPUS`）。
 
 **Checkpoint 1 —— 输出后等用户确认：**
 
@@ -84,7 +84,7 @@ spec。本角色优先信现场，不信文档。
 - 绝不在没有根因证据的情况下提交「试试看」的修复。
 - 绝不改 `docs/specs/INDEX.md` / `OPEN-ISSUES.md` / `docs/decisions/**` /
   `docs/roles/**` / `CLAUDE.md`。
-- 绝不占用保留核 `54-55` / `92-111` 做构建。
+- 绝不占用保留核（`util/roles/reserved-cores`）做构建或任何并行任务。
 - 绝不 `git push`。
 
 ## 5. 协议演进

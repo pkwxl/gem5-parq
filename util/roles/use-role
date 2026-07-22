@@ -145,6 +145,18 @@ chmod +x "$REPO_ROOT/util/roles/use-role" 2>/dev/null || true
 echo "当前角色：$ROLE（$TREE 树：$REPO_ROOT）"
 echo "协议：docs/roles/$ROLE/PROTOCOL.md"
 
+# 保留核的单点定义（决策 0004）。回显当前值，省得任何人再去背数字。
+CORES_CONF="$REPO_ROOT/util/roles/reserved-cores"
+if [[ -r "$CORES_CONF" ]]; then
+    # shellcheck disable=SC1090
+    source "$CORES_CONF"
+    echo "保留核：串行 ${SERIAL_ARM_CPUS:-?} · 并行 ${PARALLEL_ARM_CPUS:-?} · 构建 ${BUILD_CPUS:-?}（util/roles/reserved-cores）"
+    [[ "$ROLE" == "experimenter" ]] && \
+        echo "开跑前请先跑 check-cores skill 实测保留核是否空闲（容器内 ps 看不见外部占用）。"
+else
+    echo "警告：读不到 $CORES_CONF —— 角色门会把涉及绑核的命令一律降级为 ask。"
+fi
+
 if [[ -n "$PREV_ROLE" && "$PREV_ROLE" != "$ROLE" ]]; then
     cat <<EOF
 

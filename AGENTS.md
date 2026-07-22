@@ -49,7 +49,7 @@ Check which one a config/test uses before assuming a fix applies to both.
 
 Derive: Overhead ratio = 2/1, Real speedup = 1/3, Internal speedup = 2/3.
 
-Isolcpus: `54-55` (NUMA 0) for serial, `92-111` (NUMA 1) for parallel. No other jobs there. `taskset` builds to `0-53,56-91`.
+Reserved isolcpus cores: values live only in `util/roles/reserved-cores` (`SERIAL_ARM_CPUS` / `PARALLEL_ARM_CPUS` / `BUILD_CPUS`) — read them there, never hard-code. No other job may run on the arm cores; pin every parallel job to `BUILD_CPUS`. `ps` inside this container cannot see outside occupancy — run the `check-cores` skill first.
 
 ## Critical gotchas
 
