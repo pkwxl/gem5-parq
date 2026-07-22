@@ -106,6 +106,15 @@ if [[ "$TREE" == "main" ]]; then
     gate_dir  .claude                  architect
     gate_dir  util/roles               architect
     gate_file CLAUDE.md                architect
+    # 仓库级配置与 agent 指令文件：不属于任何一次研究，归角色体系的 owner。
+    gate_file AGENTS.md                architect
+    gate_file QWEN.md                  architect
+    gate_dir  .qwen                    architect
+    gate_file .gitignore               architect
+    gate_file .pre-commit-config.yaml  architect
+    gate_file .clang-format            architect
+    gate_file pyproject.toml           architect
+    gate_file SConstruct
 else
     gate_specs                         researcher experimenter implementor debugger
     # INDEX / OPEN-ISSUES 只在主树由 PI 维护——worktree 里改必然引发合并冲突。
@@ -117,6 +126,16 @@ else
     gate_dir  .claude
     gate_dir  util/roles
     gate_file CLAUDE.md
+    # 仓库级配置只在主树改：在分支里改会随 --no-ff 合并把它带进主干。
+    gate_file AGENTS.md
+    gate_file QWEN.md
+    gate_dir  .qwen
+    gate_file .gitignore
+    gate_file .pre-commit-config.yaml
+    gate_file .clang-format
+    gate_file pyproject.toml
+    # 构建系统是代码，不是仓库配置——和 src/ 同归 implementor。
+    gate_file SConstruct               implementor
     # 驱动脚本改动会改变被测对象本身——只有 implementor 可改，实验员不可。
     gate_dir  docs/refs/scripts        implementor
 fi

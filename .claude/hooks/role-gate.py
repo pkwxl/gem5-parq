@@ -53,10 +53,19 @@ MAIN_AREAS: list[tuple[str, set[str]]] = [
     ("CLAUDE.md", {"architect"}),
     (".claude/", {"architect"}),
     ("util/roles/", {"architect"}),
+    # Agent 指令文件与仓库级配置：不属于任何一次研究，归角色体系的 owner。
+    ("AGENTS.md", {"architect"}),
+    ("QWEN.md", {"architect"}),
+    (".qwen/", {"architect"}),
+    (".gitignore", {"architect"}),
+    (".pre-commit-config.yaml", {"architect"}),
+    (".clang-format", {"architect"}),
+    ("pyproject.toml", {"architect"}),
     ("src/", set()),
     ("configs/", set()),
     ("build_opts/", set()),
     ("tests/", set()),
+    ("SConstruct", set()),
     (".active-role", set()),
 ]
 
@@ -70,11 +79,21 @@ WT_AREAS: list[tuple[str, set[str]]] = [
     ("CLAUDE.md", set()),
     (".claude/", set()),
     ("util/roles/", set()),
+    # 同上：仓库级配置只在主树改，分支里改会随 --no-ff 合并把它带进主干。
+    ("AGENTS.md", set()),
+    ("QWEN.md", set()),
+    (".qwen/", set()),
+    (".gitignore", set()),
+    (".pre-commit-config.yaml", set()),
+    (".clang-format", set()),
+    ("pyproject.toml", set()),
     ("docs/refs/scripts/", {"implementor"}),
     ("src/", {"implementor", "debugger"}),
     ("configs/", {"implementor"}),
     ("build_opts/", {"implementor"}),
     ("tests/", {"implementor", "debugger"}),
+    # 构建系统是代码，不是仓库配置——改它和改 src/ 同一性质。
+    ("SConstruct", {"implementor"}),
     (".active-role", set()),
 ]
 
@@ -161,11 +180,15 @@ ASK: list[tuple[re.Pattern[str], str]] = [
     ),
 ]
 
-# `git` 里只有 PI 能做的动作：造分支/worktree、合并回主干。
+# 造分支/worktree 在哪棵树上都只有 PI 能做（生命周期第 3 步）。
 PI_ONLY_GIT = re.compile(
-    r"^git\s+(?:merge\b|worktree\s+add\b|checkout\s+-b\b|switch\s+-c\b"
+    r"^git\s+(?:worktree\s+add\b|checkout\s+-b\b|switch\s+-c\b"
     r"|branch\s+(?!-[avlr]|--list|--show|--contains|-d\b|-D\b))"
 )
+
+# 合并/变基**按树**判定：在主树上动的是研究主干（结题动作，PI 专属）；
+# 在 worktree 里把 main 拉进分支只是分支卫生，是该分支任何角色的日常。
+MERGE_LIKE = re.compile(r"^git\s+(?:merge|rebase)\b")
 
 SCONS = re.compile(r"\bscons\b")
 SCONS_J = re.compile(r"-j\s*\d+|-j\d+")
@@ -353,11 +376,14 @@ def check_discipline(seg: str, root: Path, role: str, tree: str) -> tuple[str, s
     if SCONS.search(seg):
         if tree == "main":
             return ("deny", "主树是研究主干，不是实验场：构建只在 worktree 里做（CLAUDE.md）。")
-        if role in {"researcher", "experimenter"}:
-            who = "implementor" if role == "researcher" else "implementor"
+        # experimenter 按计划自己建三臂（CLAUDE.md 角色表、experimenter
+        # PROTOCOL §0/§1）；researcher 只读探查，不构建（researcher PROTOCOL §4）。
+        if role == "researcher":
             return (
                 "deny",
-                f"{role} 不做构建。需要重建请求 `ROLE SWITCH: {who} — <理由>`。",
+                "researcher 不做构建——只读探查可以，一旦要建二进制就是实验员/实现者的活。"
+                "请求 `ROLE SWITCH: experimenter — <理由>`（跑计划里的三臂）或 "
+                "`ROLE SWITCH: implementor — <理由>`（改完代码自检构建）。",
             )
         if SCONS_J.search(seg) and not PINNED.match(seg):
             return (
@@ -395,8 +421,16 @@ def check_discipline(seg: str, root: Path, role: str, tree: str) -> tuple[str, s
     if PI_ONLY_GIT.match(seg) and role != "pi":
         return (
             "deny",
-            "建分支/worktree 和合并回主干是 PI 的职权（CLAUDE.md 生命周期第 3、5 步）。"
+            "建分支/worktree 是 PI 的职权（CLAUDE.md 生命周期第 3 步）。"
             "请求 `ROLE SWITCH: pi — <理由>`，或由用户直接执行。",
+        )
+
+    if MERGE_LIKE.match(seg) and tree == "main" and role != "pi":
+        return (
+            "deny",
+            "在主树上 merge/rebase 改写的是研究主干，是 PI 的结题动作"
+            "（CLAUDE.md 生命周期第 5 步）。请求 `ROLE SWITCH: pi — <理由>`。"
+            "把 main 拉进某个 sNNN 分支不走这条路——那要在该分支自己的 worktree 里做。",
         )
 
     return None

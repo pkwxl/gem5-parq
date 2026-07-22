@@ -123,10 +123,10 @@ double-writing one file.
 | Tree | Role | Mandate | Writable areas |
 |---|---|---|---|
 | main `/workspace/gem5` | **pi** | Direction, priorities, claiming S-NNN numbers, creating branches+worktrees, doc↔data↔code consistency audit (report, don't fix), go/no-go and the `--no-ff` merge back. | `docs/roadmap/**`, `docs/specs/INDEX.md`, `docs/specs/OPEN-ISSUES.md` |
-| main | **architect** | Mechanism-selection decision notes and the **initial version** of an `S-NNN` spec (background, research points, design, acceptance criteria). Sole owner of the role system itself. | `docs/decisions/**`, `docs/specs/S-*.md`, `docs/roles/**`, `CLAUDE.md`, `.claude/**`, `util/roles/**` |
+| main | **architect** | Mechanism-selection decision notes and the **initial version** of an `S-NNN` spec (background, research points, design, acceptance criteria). Sole owner of the role system itself, and of repo-level config and agent-instruction files. | `docs/decisions/**`, `docs/specs/S-*.md`, `docs/roles/**`, `CLAUDE.md`, `.claude/**`, `util/roles/**`, `AGENTS.md`, `QWEN.md`, `.qwen/**`, `.gitignore`, `.pre-commit-config.yaml`, `.clang-format`, `pyproject.toml` |
 | worktree `/workspace/gem5-wt/<branch>/` | **researcher** | Deepen one research point; produce an experiment plan executable without further judgement (arms, workpoint, pinning, metrics, **pre-registered** criteria). | this branch's `docs/specs/S-NNN-*.md` |
 | worktree | **experimenter** | Execute a plan faithfully: build, run, measure, analyse, write results back — including inconvenient ones, same session. | this branch's `docs/specs/S-NNN-*.md` (results sections) |
-| worktree | **implementor** | Code changes governed by an accepted spec task or decision note. | `src/**`, `configs/**`, `build_opts/**`, `tests/**`, `docs/refs/scripts/**`, spec change log |
+| worktree | **implementor** | Code changes governed by an accepted spec task or decision note. | `src/**`, `configs/**`, `build_opts/**`, `tests/**`, `SConstruct`, `docs/refs/scripts/**`, spec change log |
 | worktree | **debugger** | Root-cause and minimally fix **one** specific failure. | `src/**`, `tests/**`, spec debug log |
 
 `util/roles/use-role <role>` records `.active-role`, refuses a role that does not belong to the current
@@ -149,7 +149,13 @@ the ones that silently void data rather than corrupt files:
 - `scons -j` without a `taskset`/`numactl` cpu-list — denied; unconstrained it eats the reserved cores
 - a gem5 run with no `-d`, or with `-d` pointing inside the repo — denied (`cpt.*/` is not source)
 - `scons` or a gem5 binary invoked on the **main tree** — denied; main is the trunk, not an experiment host
-- creating branches/worktrees and `git merge` — `pi` only; `git push` — denied for every role
+- `scons` in a worktree — denied for `researcher` only (read-only probing is its mandate; building is
+  `experimenter`'s per its own protocol, and `implementor`/`debugger` build to self-check a change)
+- creating branches/worktrees — `pi` only, in any tree; `git push` — denied for every role
+- `git merge`/`git rebase` **on the main tree** — `pi` only (that is the `--no-ff` merge-back, lifecycle
+  step 5). Inside a worktree both are open to that branch's roles: pulling `main` into an `sNNN` branch is
+  branch hygiene, not a merge-back, and it is the only way a branch picks up trunk updates — `pi` cannot do
+  it, being main-tree-only.
 
 This table is the **prose original**; `use-role` and `role-gate.py:MAIN_AREAS`/`WT_AREAS` are downstream
 executable copies — when they drift, this file wins. `.claude/hooks/test-role-gate.py` is the hook's

@@ -61,6 +61,12 @@ def main() -> int:
         (main_root, "pi", W("docs/roadmap/ROADMAP.md"), "allow", "PI 拥有 roadmap"),
         (main_root, "pi", W("docs/specs/S-019-x.md"), "deny", "spec 正文是 architect 的"),
         (main_root, "pi", W("CLAUDE.md"), "deny", "CLAUDE.md 是 architect 的"),
+        # ---- 仓库级配置与 agent 指令文件（ADR 0003 缺口 3）----
+        (main_root, "architect", W(".gitignore"), "allow", "仓库配置归 architect"),
+        (main_root, "architect", W(".qwen/QWEN.md"), "allow", "agent 指令文件归 architect"),
+        (main_root, "architect", W("pyproject.toml"), "allow", "格式化配置归 architect"),
+        (main_root, "pi", W(".gitignore"), "deny", "PI 不改仓库配置"),
+        (main_root, "architect", W("SConstruct"), "deny", "构建系统是代码，主树不写"),
         # ---- 主树不是实验场 ----
         (main_root, "architect", B("scons build/X86/gem5.opt -j8"), "deny", "主树禁构建"),
         (main_root, "pi", B("./build/X86/gem5.opt -d /tmp/x foo.py"), "deny", "主树禁跑 gem5"),
@@ -70,6 +76,11 @@ def main() -> int:
         (main_root, "architect", B("git merge --no-ff s019-x"), "deny", "architect 不可合并"),
         (wt_root, "implementor", B("git checkout -b s020-y"), "deny", "分支由 PI 建"),
         (main_root, "pi", B("git branch -a"), "allow", "列分支不是造分支"),
+        # ---- merge/rebase 按树判定（ADR 0003 缺口 2）----
+        (main_root, "architect", B("git rebase main"), "deny", "主树变基改写主干"),
+        (wt_root, "experimenter", B("git merge main"), "allow", "分支自取 main 更新"),
+        (wt_root, "researcher", B("git rebase main"), "allow", "rebase 到 main 是分支卫生"),
+        (wt_root, "implementor", B("git worktree add /workspace/gem5-wt/z z"), "deny", "建 worktree 仍是 PI"),
         # ---- worktree 写权矩阵 ----
         (wt_root, "implementor", W("src/sim/eventq.cc"), "allow", "implementor 拥有 src"),
         (wt_root, "implementor", W("docs/refs/scripts/drv.py"), "allow", "驱动脚本归 implementor"),
@@ -81,6 +92,10 @@ def main() -> int:
         (wt_root, "researcher", W("src/sim/eventq.cc"), "deny", "researcher 不改代码"),
         (wt_root, "experimenter", W("docs/specs/S-019-x.md"), "allow", "实验员写结果"),
         (wt_root, "experimenter", W("docs/refs/scripts/drv.py"), "deny", "实验员不改驱动脚本"),
+        (wt_root, "implementor", W(".gitignore"), "deny", "仓库配置只在主树改"),
+        (wt_root, "implementor", W(".qwen/QWEN.md"), "deny", "agent 指令文件只在主树改"),
+        (wt_root, "implementor", W("SConstruct"), "allow", "构建系统归 implementor"),
+        (wt_root, "researcher", W("SConstruct"), "deny", "researcher 不改构建系统"),
         # ---- 跨树写入 ----
         (wt_root, "implementor", W("/workspace/gem5/src/sim/eventq.cc"), "deny", "不得跨树写主树"),
         (wt_root, "implementor", W("/workspace/gem5-wt/other/src/x.cc"), "deny", "不得跨树写别的 worktree"),
@@ -104,7 +119,10 @@ def main() -> int:
         (wt_root, "implementor", B("scons build/X86/gem5.opt -j80"), "deny", "未绑核的 -j 吃满整机"),
         (wt_root, "implementor", B("scons build/X86/gem5.opt"), "allow", "无 -j 不设限"),
         (wt_root, "experimenter", B("taskset -c 0-53 scons build/X86/gem5.opt -j40"),
-         "deny", "实验员不做构建"),
+         "allow", "实验员自己建三臂（ADR 0003 缺口 1）"),
+        (wt_root, "researcher", B("taskset -c 0-53 scons build/X86/gem5.opt -j40"),
+         "deny", "researcher 仍不构建"),
+        (wt_root, "debugger", B("scons build/X86/gem5.debug"), "allow", "debugger 可重建"),
         # ---- gem5 输出目录纪律 ----
         (wt_root, "experimenter", B("./build/X86/gem5.opt fs.py"), "deny", "缺 -d 会写进仓库"),
         (wt_root, "experimenter", B("./build/X86/gem5.opt -d m5out fs.py"), "deny", "-d 指到仓库内"),

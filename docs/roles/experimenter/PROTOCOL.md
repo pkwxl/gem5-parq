@@ -35,6 +35,10 @@ Experimenter **不**改任何代码，**也不**改驱动脚本（`docs/refs/scr
   `--cpu-list` 限制到非保留核，可用上限 90。
 - **checkpoint 与输出目录**：`-d /tmp/<...>`，绝不让 `cpt.*/` 落进仓库。
 - **build 目录**走 tmpfs 软链（`/workspace/shm/gem5/<branch>/build/`）。
+- **构建是本角色自己的活**（`scons` 对本角色放行，见
+  [决策 0003](../../decisions/0003-role-gate-scons-merge-and-repo-config.md)）；只有
+  `researcher` 不构建。需要先把 `main` 的更新拉进本分支时，在本 worktree 里
+  `git rebase main` 或 `git merge main` —— 这不是「合并回主干」，不需要 PI。
 - **三臂**：`CLAUDE.md`「三臂比较」——Current Serial 不能冒充 Baseline，
   Baseline 也不能冒充 Current Serial，两者回答的是不同问题。
 
