@@ -193,6 +193,16 @@ PI_ONLY_GIT = re.compile(
 # 在 worktree 里把 main 拉进分支只是分支卫生，是该分支任何角色的日常。
 MERGE_LIKE = re.compile(r"^git\s+(?:merge|rebase)\b")
 
+# 只读命令：路径或参数里出现 `scons`/`gem5.opt` 只是**提到**，不是执行。
+# `ls -l build/X86/gem5.opt`、`grep -rn scons docs/`、`du -sh .../gem5.opt` 以前
+# 全被判成「主树跑实验」。引号能让它们逃掉（`find -name 'gem5.opt'` 就逃掉了），
+# 于是同一件事写法不同结论不同——那不是纪律，是抽签。
+READONLY_CMD = re.compile(
+    r"^(?:ls|stat|file|du|df|find|readlink|realpath|basename|dirname|wc|head|tail"
+    r"|cat|md5sum|sha\d+sum|cmp|diff|grep|rg|nl|sort|uniq|column|test|\["
+    r"|git\s+(?:log|show|diff|status|grep|ls-files|cat-file|blame|worktree\s+list))\b"
+)
+
 SCONS = re.compile(r"\bscons\b")
 # `-j` 后面跟什么都算请求并行：`-j80`、`-j 80`、`-j$(nproc)`、以及裸 `-j`（make
 # 的裸 -j 是"不限并发"）。旧版只匹配 `-j\d+`，`scons -j$(nproc)` 直接漏过去——
@@ -214,6 +224,15 @@ PINNED = re.compile(r"^(?:taskset|numactl)\b")
 GEM5_BIN = re.compile(r"\bgem5\.(?:opt|debug|fast|prof|perf)\b")
 GEM5_OUTDIR = re.compile(r"(?:^|\s)(?:-d|--outdir)(?:[=\s]+)(\S+)")
 CPU_LIST = re.compile(r"(?:taskset\s+(?:-c|--cpu-list)|numactl\s+(?:-C|--physcpubind=?))\s*=?\s*([0-9,\-]+)")
+
+# 解释器 + 内联代码（`-c`、`-e`、或裸 `-` 接 heredoc）。门看不进代码：路径不在
+# 命令位上，PATH_WRITERS/REDIRECTS 都提取不到，heredoc 正文还会被整段剥掉。
+# 这不是理论漏洞——本仓库 2026-07-22 就靠一个断言才挡下一次跨树写 INDEX.md。
+INLINE_CODE = re.compile(
+    r"^(?:python3?|perl|ruby|node|bash|sh|zsh|awk)\b[^|;&]*?(?:\s-(?:c|e)\b|\s-\s*$)"
+)
+# 代码里长得像路径的东西：引号串里含 `/` 的，或裸 token 含 `/` 且不是 URL。
+CODE_PATH = re.compile(r"""['"]([^'"\s]*/[^'"\s]*)['"]|(?<![\w:.-])((?:[\w.~-]+/)+[\w.~-]+)""")
 
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1.*?^\s*\2\s*$", re.DOTALL | re.MULTILINE)
 ENV_PREFIX = re.compile(r"^(?:\w+=\S*\s+)+")
@@ -311,8 +330,15 @@ def deny_reason(prefix: str, owners: set[str], role: str, tree: str) -> str:
     )
 
 
-def check_path(raw: str, root: Path, role: str, tree: str) -> tuple[str, str] | None:
+def check_path(
+    raw: str, root: Path, role: str, tree: str, base: Path | None = None
+) -> tuple[str, str] | None:
     """`raw` 若是当前角色不该写的目标，返回 (decision, reason)。
+
+    相对路径按 `base`（harness 报的真实 shell cwd）解析，而不是按 `root`。Bash
+    工具的 cwd 在调用之间**是粘的**：一次 `cd` 进别的 worktree 之后，`sed -i
+    docs/specs/INDEX.md` 打的是那棵树的文件，而按 root 解析会把它错判成主树的、
+    从而对 PI 放行。2026-07-22 就差点这样跨树写掉一次 INDEX.md（决策 0006）。
 
     走的是**词法**归一（normpath），不是 resolve()——resolve 会跟着 build/ 的 tmpfs
     软链跑出仓库，把实验员自己的活判成越界。代价是仓库内种下的软链能绕过检查，
@@ -320,7 +346,9 @@ def check_path(raw: str, root: Path, role: str, tree: str) -> tuple[str, str] | 
     """
     raw = os.path.expanduser(raw.strip("\"'"))
     root_s = str(root)
-    target = os.path.normpath(raw if os.path.isabs(raw) else os.path.join(root_s, raw))
+    target = os.path.normpath(
+        raw if os.path.isabs(raw) else os.path.join(str(base or root), raw)
+    )
 
     if target in {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"} or target.startswith("/dev/fd/"):
         return None
@@ -426,6 +454,10 @@ def check_discipline(seg: str, root: Path, role: str, tree: str) -> tuple[str, s
                 f"重核任务请限制到 BUILD_CPUS（{conf['BUILD_CPUS']}）。",
             )
 
+    # 只读命令到此为止：下面全是「执行」类纪律，提到不算执行。
+    if READONLY_CMD.match(seg):
+        return None
+
     if SCONS.search(seg):
         if tree == "main":
             return ("deny", "主树是研究主干，不是实验场：构建只在 worktree 里做（CLAUDE.md）。")
@@ -492,7 +524,9 @@ def check_discipline(seg: str, root: Path, role: str, tree: str) -> tuple[str, s
     return None
 
 
-def gate_bash(cmd: str, root: Path, role: str, tree: str) -> tuple[str, str]:
+def gate_bash(
+    cmd: str, root: Path, role: str, tree: str, base: Path | None = None
+) -> tuple[str, str]:
     segs = segments(cmd)
 
     for seg, _ in segs:
@@ -514,9 +548,23 @@ def gate_bash(cmd: str, root: Path, role: str, tree: str) -> tuple[str, str]:
         elif DEST_ONLY_WRITERS.match(bare) and args:
             targets.append(args[-1])
         for raw in targets:
-            verdict = check_path(raw, root, role, tree)
+            verdict = check_path(raw, root, role, tree, base)
             if verdict:
                 return verdict
+
+    # --- C. 解释器内联代码：门看不进代码，只能扫代码里提到的路径 ---
+    if any(INLINE_CODE.match(bare) for _, bare in segs):
+        for hit in CODE_PATH.finditer(cmd):
+            raw = hit.group(1) or hit.group(2)
+            if not raw or "://" in raw:
+                continue
+            verdict = check_path(raw, root, role, tree, base)
+            if verdict and verdict[0] == "deny":
+                return (
+                    "ask",
+                    f"内联代码里出现受保护路径 `{raw}`——门看不进解释器代码，"
+                    f"无法分辨这是读还是写。若是写就越权了：{verdict[1]}",
+                )
 
     for seg, bare in segs:
         for pat, why in ASK:
@@ -532,6 +580,11 @@ def main() -> None:
     ti = payload.get("tool_input") or {}
     root = repo_root()
     tree = tree_kind(root)
+    # harness 报的真实 shell cwd（Bash 工具的 cwd 跨调用是粘的）。只要是绝对路径就
+    # 用它解析相对路径——不要求它存在：门在命令**执行前**跑，而且"shell 自称在哪"
+    # 正是我们要判的东西。缺失或非绝对路径才回落到 root，与旧行为一致。
+    raw_cwd = payload.get("cwd")
+    base = Path(raw_cwd) if raw_cwd and os.path.isabs(raw_cwd) else root
 
     role_file = root / ".active-role"
     role = role_file.read_text().strip() if role_file.is_file() else ""
@@ -550,13 +603,13 @@ def main() -> None:
         cmd = ti.get("command", "")
         if not cmd:
             emit("ask", "Bash 调用没有 command 字段")
-        emit(*gate_bash(cmd, root, role, tree))
+        emit(*gate_bash(cmd, root, role, tree, base))
 
     if tool in {"Edit", "Write", "NotebookEdit"}:
         path = ti.get("file_path") or ti.get("notebook_path") or ""
         if not path:
             emit("ask", f"{tool} 调用没有 file_path")
-        emit(*(check_path(path, root, role, tree) or ("allow", f"{role} 职权内")))
+        emit(*(check_path(path, root, role, tree, base) or ("allow", f"{role} 职权内")))
 
     emit("ask", f"role-gate 未覆盖工具 {tool!r}")
 

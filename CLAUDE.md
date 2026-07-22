@@ -181,8 +181,16 @@ This table is the **prose original**; `use-role` and `role-gate.py:MAIN_AREAS`/`
 executable copies — when they drift, this file wins. `.claude/hooks/test-role-gate.py` is the hook's
 regression suite; run it after touching either.
 
-The hook is a guardrail, not a sandbox — a sufficiently indirect write (a `python -c` that opens a file, a
-symlink planted in-tree) evades it by design. It is sized against drift and accident.
+**Use absolute paths for every file operation.** The Bash tool's working directory is *sticky across
+calls*: one `cd` into another worktree and every later relative path lands in that tree, while the role gate
+resolves what it can against the session's project dir. That mismatch nearly wrote another worktree's
+`INDEX.md` on 2026-07-22 — an `assert` caught it, the gate had said `allow`. The gate now resolves relative
+paths against the shell's reported cwd, and downgrades interpreter one-liners that mention a protected path
+to `ask` ([decision 0006](docs/decisions/0006-role-gate-readonly-cwd-and-inline-code.md)), but absolute
+paths remove the whole class at the source.
+
+The hook is a guardrail, not a sandbox — a sufficiently indirect write (a `python -c` that builds the path
+from variables, a symlink planted in-tree) evades it by design. It is sized against drift and accident.
 
 Two rules exist purely to keep main and its branches from colliding, and they are not negotiable:
 `docs/specs/INDEX.md` and `OPEN-ISSUES.md` are **PI-only and main-only** (a worktree never edits them);

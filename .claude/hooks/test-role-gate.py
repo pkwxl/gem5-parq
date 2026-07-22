@@ -35,12 +35,15 @@ def setup() -> tuple[Path, Path]:
     return main, wt
 
 
-def run(root: Path, role: str, tool: str, ti: dict) -> tuple[str, str]:
+def run(root: Path, role: str, tool: str, ti: dict, cwd: str | None = None) -> tuple[str, str]:
     (root / ".active-role").write_text(role + "\n")
     env = dict(os.environ, CLAUDE_PROJECT_DIR=str(root))
+    payload = {"tool_name": tool, "tool_input": ti}
+    if cwd is not None:
+        payload["cwd"] = cwd
     p = subprocess.run(
         [sys.executable, str(HOOK)],
-        input=json.dumps({"tool_name": tool, "tool_input": ti}),
+        input=json.dumps(payload),
         capture_output=True, text=True, env=env,
     )
     if p.returncode != 0 or not p.stdout:
@@ -141,6 +144,14 @@ def main() -> int:
         (wt_root, "researcher", B("taskset -c 0-53 scons build/X86/gem5.opt -j40"),
          "deny", "researcher 仍不构建"),
         (wt_root, "debugger", B("scons build/X86/gem5.debug"), "allow", "debugger 可重建"),
+        # ---- 只读命令只是「提到」红线词，不是执行（ADR 0006 §2）----
+        (main_root, "architect", B("ls -l build/X86/gem5.opt"), "allow", "ls 不是跑 gem5"),
+        (main_root, "architect", B("du -sh build/X86/gem5.opt"), "allow", "du 同理"),
+        (main_root, "architect", B("grep -rn scons docs/"), "allow", "grep 不是构建"),
+        (main_root, "architect", B("git log --oneline -- build/X86/gem5.opt"), "allow", "git log 只读"),
+        (main_root, "pi", B("./build/X86/gem5.opt -d /tmp/x f.py"), "deny", "真跑仍拦"),
+        (main_root, "architect", B("scons build/X86/gem5.opt"), "deny", "真构建仍拦"),
+        (wt_root, "researcher", B("stat build/X86/gem5.opt"), "allow", "researcher 可只读探查二进制"),
         # ---- gem5 输出目录纪律 ----
         (wt_root, "experimenter", B("./build/X86/gem5.opt fs.py"), "deny", "缺 -d 会写进仓库"),
         (wt_root, "experimenter", B("./build/X86/gem5.opt -d m5out fs.py"), "deny", "-d 指到仓库内"),
@@ -214,6 +225,29 @@ def main() -> int:
             print(f"FAIL  [{role}@wt/无配置] {label}\n      期望 {want} 实得 {got}: {why}")
     conf.write_text(saved)
 
+    # 粘性 cwd 与解释器内联代码（ADR 0006 §3/§4）。Bash 的 cwd 跨调用不重置，
+    # 一次 cd 进别的树之后，相对路径打的是那棵树的文件。
+    other_wt = "/workspace/gem5-wt/some-other-branch"
+    cwd_cases = [
+        (main_root, "pi", B("sed -i s/a/b/ docs/specs/INDEX.md"), str(main_root),
+         "allow", "cwd 就是本树时行为不变"),
+        (main_root, "pi", B("sed -i s/a/b/ docs/specs/INDEX.md"), other_wt,
+         "deny", "cd 进别的 worktree 后相对路径按那棵树算"),
+        (main_root, "architect", B("python3 -c \"open('docs/specs/INDEX.md','w')\""), other_wt,
+         "ask", "内联代码里的跨树路径降级为 ask"),
+        (main_root, "architect", B("python3 -c \"print(1)\""), None,
+         "allow", "内联代码没提受保护路径就不打扰"),
+        (main_root, "architect", B("python3 util/roles/gen.py"), None,
+         "allow", "跑脚本文件不是内联代码"),
+        (wt_root, "implementor", B("python3 - <<'EOF'\nopen('/workspace/gem5/CLAUDE.md','w')\nEOF"),
+         None, "ask", "heredoc 正文里的主树路径同样降级"),
+    ]
+    for root, role, (tool, ti), cwd, want, label in cwd_cases:
+        got, why = run(root, role, tool, ti, cwd)
+        if got != want:
+            fails += 1
+            print(f"FAIL  [{role}@{root.name} cwd={cwd}] {label}\n      期望 {want} 实得 {got}: {why}")
+
     # 配置自身的自洽：BUILD_CPUS 与两条臂必须互斥，否则"绑到 BUILD_CPUS"这条
     # 建议本身就会踩保留核。没有任何代码强制这三者的关系，只能在这里断言。
     conf_vals: dict[str, str] = {}
@@ -246,7 +280,7 @@ def main() -> int:
             fails += 1
             print(f"FAIL  [reserved-cores] {label}")
 
-    total = len(cases) + len(extra) + len(conf_checks)
+    total = len(cases) + len(extra) + len(cwd_cases) + len(conf_checks)
     print(f"\n{total - fails}/{total} 通过")
     return 1 if fails else 0
 
