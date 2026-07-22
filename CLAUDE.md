@@ -109,6 +109,12 @@ read it before starting a new investigation):
 - Give each investigation its own `git worktree` under `/workspace/gem5-wt/<branch>/`, with its `build/`
   symlinked into namespaced tmpfs `/workspace/shm/gem5/<branch>/build/` (volatile — builds regenerate;
   checkpoints still go to `-d /tmp/...`). One-time: `mkdir -p /workspace/shm/gem5`.
+- **No build directory is ever a real directory inside a tree — always a symlink into
+  `/workspace/shm/gem5/<tree-name>/build/`.** This holds for every worktree *and* for the Baseline arm's
+  `baseline-*` worktree. Binaries are regenerable and large (tens of GB per configuration); tmpfs is the
+  right home for them and disk is not. **The main tree has no `build/` at all** — it neither builds nor
+  runs, and a build directory sitting there is a standing counter-example to that rule, whatever its
+  history. Check with `ls -ld <tree>/build` before assuming a tree complies.
 - Orthogonal investigations → independent branches; conflicting/same-subsystem ones (the S-009→S-014→S-015
   pattern over `xbar.cc`/`packet_queue.cc`) → chain off the parent branch or rebase after it merges.
 - Conclude by merging to `main` with `--no-ff` (**never squash** — the step-by-step commit log is itself a
@@ -137,6 +143,34 @@ silence is not consent.**
 worktree is one investigation (research, code, experiments). The same `docs/specs/S-NNN-*.md` path is
 therefore owned by different roles in different trees, which is what keeps main and a branch from
 double-writing one file.
+
+**Start the session in the tree whose work you intend to do.** `CLAUDE_PROJECT_DIR` — the directory Claude
+was launched in — decides which tree you are in, hence which roles are legal and which writable-area matrix
+applies. `cd`-ing into a worktree from a main-rooted session does **not** move you: the tree stays `main`,
+so any worktree role is rejected as mismatched, `scons` and gem5 binaries stay denied (main is not an
+experiment host), and writes into `/workspace/gem5-wt/**` are denied as cross-tree. Nothing useful survives
+that route — only the accident-prone residue it was never meant to allow (relative paths landing in the
+other tree; see [decision 0006](docs/decisions/0006-role-gate-readonly-cwd-and-inline-code.md)).
+
+| Work | Launch Claude in | Role |
+|---|---|---|
+| Direction, claiming S-NNN, audit, `--no-ff` merge, creating branches/worktrees | `/workspace/gem5` | `pi` |
+| Decision notes, `S-NNN` initial version, the role system itself | `/workspace/gem5` | `architect` |
+| Deepen a research point, run experiments, change code, debug | `/workspace/gem5-wt/<branch>/` | `researcher` · `experimenter` · `implementor` · `debugger` |
+
+`ROLE SWITCH` works only **within** one tree (`pi ↔ architect`, or between the four worktree roles). There
+is no cross-tree switch — that needs a new session in the other tree. Running one Claude per worktree in
+parallel is the intended shape; they do not interfere (separate `.active-role`, separate matrices).
+
+Two consequences worth knowing before they surprise you:
+
+- **A worktree session is governed by that branch's own copy** of `.claude/hooks/role-gate.py`,
+  `.claude/skills/**` and `docs/roles/**` — the hook is invoked as
+  `$CLAUDE_PROJECT_DIR/.claude/hooks/role-gate.py`. A branch that has not been rebased onto `main` runs a
+  **stale gate with stale skills**, so it will re-hit guardrail bugs that `main` already fixed. Rebasing a
+  branch is what installs the current guardrails, not just the current docs.
+- Claude's persistent memory is namespaced by project directory, so a worktree session does **not** see the
+  main tree's `MEMORY.md`.
 
 | Tree | Role | Mandate | Writable areas |
 |---|---|---|---|
