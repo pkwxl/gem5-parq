@@ -296,17 +296,49 @@ def segments(cmd: str) -> list[tuple[str, str]]:
     """返回 (env 剥离后的段, 再剥掉 nohup/time 等包装后的段)。
 
     taskset/numactl **不**算包装——它们承载绑核信息，必须留在第一个元素里。
+
+    切分前先把引号串整体遮蔽成占位符：`git commit -m "…"` 的多行消息里含有
+    换行、`&&`、`;`，直接按分隔符切会把消息后半段变成一个独立的「命令段」，
+    于是一条只是在描述红线的提交信息被判成执行红线。这个 bug 拦下了本文件
+    自己的两次提交。
     """
+    stash: list[str] = []
+
+    def mask(m: re.Match[str]) -> str:
+        stash.append(m.group(0))
+        return f"\x00{len(stash) - 1}\x00"
+
+    masked = QUOTED.sub(mask, HEREDOC.sub("", cmd))
+    unmask = lambda s: re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m.group(1))], s)  # noqa: E731
+
     out = []
-    for raw in SEGMENT_SPLIT.split(HEREDOC.sub("", cmd)):
-        seg = ENV_PREFIX.sub("", raw.strip())
+    for raw in SEGMENT_SPLIT.split(masked):
+        seg = ENV_PREFIX.sub("", unmask(raw).strip())
         if seg:
             out.append((seg, WRAPPERS.sub("", seg)))
     return out
 
 
+# 反斜杠转义的引号必须参与配对，否则 `-m "... \"x\" ..."` 会在第一个 \" 处提前
+# 收尾，把消息的后半段当成命令位暴露出来——这条正则的第一版就栽在这里。
+QUOTED = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
+
+
+def unquoted(seg: str) -> str:
+    """抹掉引号内的字符串再做纪律匹配。
+
+    纪律检查（scons / gem5 / 绑核 / git 动作）用的是 search 而不是命令位锚定，
+    所以 `git commit -m "... scons -j80 ..."`、`grep -rn "gem5.opt" docs/` 这类
+    **只是提到**红线词的调用会被误杀。抹掉引号内容即可——代价是
+    `sh -c "scons -j80"` 这种把命令塞进引号的写法逃得掉，属于 docstring 里
+    说明的护栏/沙箱那条线。SIGUSR 的模式本身锚在命令位，不走这里。
+    """
+    return QUOTED.sub(" ", seg)
+
+
 def check_discipline(seg: str, root: Path, role: str, tree: str) -> tuple[str, str] | None:
     """本项目特有的实验操作纪律。"""
+    seg = unquoted(seg)
     # 隔离核：只有实验员可以碰。
     m = CPU_LIST.search(seg)
     if m:
