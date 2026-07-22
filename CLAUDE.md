@@ -131,11 +131,32 @@ double-writing one file.
 
 `util/roles/use-role <role>` records `.active-role`, refuses a role that does not belong to the current
 tree, refuses an in-session switch while the tree is dirty, and applies the **writability gate** — red
-lines are mechanism, not prose. Stage 1 gates the documentation areas by `chmod`; `src/**` and this
-project's operational red lines (no `SIGUSR1`/`SIGUSR2` to a parallel run, the reserved isolated cores, a
-`scons -j` that would eat them) are gated in stage 2 by `.claude/hooks/role-gate.py`. This table is the
-**prose original**; the script and the hook are downstream executable copies — when they drift, this file
-wins.
+lines are mechanism, not prose.
+
+**Two layers enforce that table.** The `chmod` gate in `use-role` covers the documentation areas and is
+tool-level, not OS-level: it stops `Edit`/`Write`, `>` and `tee`, but `sed -i` and `rm`+recreate go
+straight through it, because `rename(2)`/`unlink(2)` need directory permission, not the file bit. The
+`PreToolUse` hook `.claude/hooks/role-gate.py` therefore adjudicates **every** `Bash`/`Edit`/`Write` call
+against `.active-role` and covers the whole table, including `src/**`, `configs/**`, `tests/**` and writes
+that cross into another tree. Within the role's mandate it returns `allow` — no prompt; on a crossing,
+`deny` naming the `ROLE SWITCH` to request; for irreversible or outward-facing actions (`sudo`, `git
+commit --amend`, `git reset --hard`), `ask`. It also gates this project's operational red lines, which are
+the ones that silently void data rather than corrupt files:
+
+- `SIGUSR1`/`SIGUSR2` to any process — denied for every role (async stat dump off the main thread
+  segfaults a parallel run; read a live tick per `S-007` §14 instead)
+- the kernel-isolated cores `54-55` / `92-111` — only `experimenter` may pin to them
+- `scons -j` without a `taskset`/`numactl` cpu-list — denied; unconstrained it eats the reserved cores
+- a gem5 run with no `-d`, or with `-d` pointing inside the repo — denied (`cpt.*/` is not source)
+- `scons` or a gem5 binary invoked on the **main tree** — denied; main is the trunk, not an experiment host
+- creating branches/worktrees and `git merge` — `pi` only; `git push` — denied for every role
+
+This table is the **prose original**; `use-role` and `role-gate.py:MAIN_AREAS`/`WT_AREAS` are downstream
+executable copies — when they drift, this file wins. `.claude/hooks/test-role-gate.py` is the hook's
+regression suite; run it after touching either.
+
+The hook is a guardrail, not a sandbox — a sufficiently indirect write (a `python -c` that opens a file, a
+symlink planted in-tree) evades it by design. It is sized against drift and accident.
 
 Two rules exist purely to keep main and its branches from colliding, and they are not negotiable:
 `docs/specs/INDEX.md` and `OPEN-ISSUES.md` are **PI-only and main-only** (a worktree never edits them);

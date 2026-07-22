@@ -46,5 +46,20 @@
       "Bash(shutdown *)",
       "Bash(reboot)"
     ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/role-gate.py\"",
+            "timeout": 10,
+            "statusMessage": "role-gate"
+          }
+        ]
+      }
+    ]
   }
 }
