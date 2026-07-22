@@ -45,6 +45,17 @@ ROLES = MAIN_ROLES | WT_ROLES
 # 保留核门比没有门更危险。
 CORES_CONF = "util/roles/reserved-cores"
 
+# 末位兜底。空串让 `rel.startswith(CATCHALL)` 恒真，所以它**必须**排在最后。
+# 此前匹配不到任何条目就放行，等于把白名单矩阵变成一份伪装成白名单的黑名单：
+# 仓库根的新脚本、`util/`、`ext/`、`site_scons/` 对所有角色敞开，且矩阵越老洞越大。
+# 2026-07-22 的 s019 worktree 里就躺着实验员写下的 `run-a0.sh`——门当时给的是 allow。
+# 决策 0007 把默认方向翻过来：未列举 = 拒绝。
+CATCHALL = ""
+
+# use-role 生成的派生文件（决策 0008）：正本是 CLAUDE.md + docs/roles/<role>/PROTOCOL.md，
+# 手改它们只会在下次角色切换时被覆盖，所以对任何角色都不开写权。
+GENERATED = {"AGENTS.md", "QWEN.md"}
+
 # 写权矩阵的可执行副本。先匹配者胜，所以更具体的条目必须排在前面。
 MAIN_AREAS: list[tuple[str, set[str]]] = [
     ("docs/specs/INDEX.md", {"pi"}),
@@ -56,9 +67,10 @@ MAIN_AREAS: list[tuple[str, set[str]]] = [
     ("CLAUDE.md", {"architect"}),
     (".claude/", {"architect"}),
     ("util/roles/", {"architect"}),
-    # Agent 指令文件与仓库级配置：不属于任何一次研究，归角色体系的 owner。
-    ("AGENTS.md", {"architect"}),
-    ("QWEN.md", {"architect"}),
+    # Agent 指令文件是 use-role 的生成物（决策 0008），谁都不该手写；
+    # `.qwen/` 是 Qwen Code 的会话状态目录，不是生成物，仍归角色体系的 owner。
+    ("AGENTS.md", set()),
+    ("QWEN.md", set()),
     (".qwen/", {"architect"}),
     (".gitignore", {"architect"}),
     (".pre-commit-config.yaml", {"architect"}),
@@ -70,6 +82,9 @@ MAIN_AREAS: list[tuple[str, set[str]]] = [
     ("tests/", set()),
     ("SConstruct", set()),
     (".active-role", set()),
+    # 主树的可写区在 CLAUDE.md 角色表里已逐项列全；主树既不构建也不跑实验，
+    # 没有合法的「未列举写入」。
+    (CATCHALL, set()),
 ]
 
 WT_AREAS: list[tuple[str, set[str]]] = [
@@ -98,6 +113,14 @@ WT_AREAS: list[tuple[str, set[str]]] = [
     # 构建系统是代码，不是仓库配置——改它和改 src/ 同一性质。
     ("SConstruct", {"implementor"}),
     (".active-role", set()),
+    # `build/` 是指向 tmpfs 的软链，但 check_path 走**词法**归一（不 resolve，
+    # 否则会跟着软链跑出仓库），所以 build/X86/gem5.opt 在门看来仍是树内路径。
+    # 不显式放行，下面的兜底会打死所有构建（决策 0007 §3.B）。researcher 不构建。
+    ("build/", {"experimenter", "implementor", "debugger"}),
+    # 兜底：未列举路径压倒性地是代码相邻的（util/、ext/、site_scons/、根级脚本），
+    # 归代码角色。researcher/experimenter 因此只剩 docs/specs/S-NNN-*.md 一处可写，
+    # 与 CLAUDE.md 角色表逐字一致。临时脚本请落 /tmp（决策 0007 §3.C）。
+    (CATCHALL, {"implementor", "debugger"}),
 ]
 
 # deny 消息里「该找谁」的一半。
@@ -244,6 +267,45 @@ PATH_WRITERS = re.compile(r"^(?:sed\s+[^|;&]*-i|tee|rm|mv|truncate|dd)\b")
 DEST_ONLY_WRITERS = re.compile(r"^(?:cp|install|rsync)\b")
 REDIRECTS = re.compile(r"(?<![0-9<>])>>?\s*([^\s;|&<>()]+)")
 
+# 吃掉下一个 token 的短/长选项。只列写入类命令上真会出现的，宁可漏不可多。
+OPT_TAKES_VALUE = {"-e", "--expression", "-f", "--file", "-s", "--size", "-m", "--mode"}
+SED_SCRIPT_FLAG = re.compile(r"(?:^|\s)-(?:e|f)\b|--(?:expression|file)\b")
+
+
+def write_targets(bare: str) -> list[str]:
+    """从一条写入类命令里取出**真正的写入目标**。
+
+    朴素地「取所有非 `-` 开头的参数」在默认放行的年代无害：认不出的 token 匹配不到
+    任何区域，静静落到 allow。决策 0007 把默认翻成拒绝之后它立刻开始误伤——
+    `sed -i s/a/b/ f` 里的 `s/a/b/` 是脚本不是路径，`truncate -s 0 f` 里的 `0` 是
+    长度不是路径，两者都会撞上兜底，把日常命令拒掉。这个函数按工具语义把它们剥掉。
+
+    本函数只在**兜底**存在的前提下才有必要；它不放宽任何已列举区域的判定。
+    """
+    toks = bare.split()
+    if not toks:
+        return []
+    cmd = os.path.basename(toks[0])
+
+    args: list[str] = []
+    skip = False
+    for t in toks[1:]:
+        if skip:
+            skip = False
+            continue
+        if t.startswith("-"):
+            skip = t in OPT_TAKES_VALUE
+            continue
+        args.append(t)
+
+    if cmd == "sed" and args and not SED_SCRIPT_FLAG.search(bare):
+        args = args[1:]          # 没有 -e/-f 时第一个位置参数是脚本
+    elif cmd == "dd":
+        args = [a.partition("=")[2] for a in args if a.startswith("of=")]
+    elif DEST_ONLY_WRITERS.match(bare):
+        args = args[-1:]         # cp/install/rsync 只有最后一个是目的地
+    return args
+
 
 def emit(decision: str, reason: str = "") -> None:
     json.dump(
@@ -314,6 +376,29 @@ def area_for(rel: str, tree: str) -> tuple[str, set[str]] | None:
 
 def deny_reason(prefix: str, owners: set[str], role: str, tree: str) -> str:
     where = "主树" if tree == "main" else "worktree"
+
+    if prefix in GENERATED:
+        return (
+            f"`{prefix}` 是 util/roles/use-role 的生成物（决策 0008），任何角色都不手写它"
+            "——下次切换角色就会被覆盖。正本是 `CLAUDE.md` + "
+            "`docs/roles/<role>/PROTOCOL.md`，改那两处。"
+        )
+
+    # 兜底的拒绝必须自带出路，否则训练出的行为是「换个目录再试」。
+    if prefix == CATCHALL:
+        out = (
+            f"写权矩阵没有列举这个路径，白名单之外一律拒绝（{where}，决策 0007）。"
+            "临时脚本和中间产物请写到 `/tmp/<...>`——它们不是研究记录，不该进 git 跟踪范围"
+            "（要留痕就把脚本正文贴进本分支的 spec）。"
+        )
+        if owners:
+            route = "implementor" if "implementor" in owners else sorted(owners)[0]
+            return out + (
+                f"值得长期留存、后续臂要复用的驱动脚本走 `ROLE SWITCH: {route} — <理由>` "
+                "收进 docs/refs/scripts/。"
+            )
+        return out + "确需在树内长期存在的新路径，先由 architect 在 CLAUDE.md 角色表里给它归属。"
+
     if not owners:
         return (
             f"`{prefix}` 在 {where} 里不对任何角色开放写权"
@@ -542,11 +627,8 @@ def gate_bash(
     # 职权先于不可逆性：本就无权做的事给 deny，而不是给一个邀请用户确认越界的 ask。
     for seg, bare in segs:
         targets: list[str] = list(REDIRECTS.findall(seg))
-        args = [t for t in bare.split()[1:] if not t.startswith("-")]
-        if PATH_WRITERS.match(bare):
-            targets += args
-        elif DEST_ONLY_WRITERS.match(bare) and args:
-            targets.append(args[-1])
+        if PATH_WRITERS.match(bare) or DEST_ONLY_WRITERS.match(bare):
+            targets += write_targets(bare)
         for raw in targets:
             verdict = check_path(raw, root, role, tree, base)
             if verdict:

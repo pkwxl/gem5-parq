@@ -106,9 +106,8 @@ if [[ "$TREE" == "main" ]]; then
     gate_dir  .claude                  architect
     gate_dir  util/roles               architect
     gate_file CLAUDE.md                architect
-    # 仓库级配置与 agent 指令文件：不属于任何一次研究，归角色体系的 owner。
-    gate_file AGENTS.md                architect
-    gate_file QWEN.md                  architect
+    # 仓库级配置：不属于任何一次研究，归角色体系的 owner。AGENTS.md / QWEN.md
+    # 不在这里——它们是本脚本的生成物（决策 0008），由 gen_agent_files 管。
     gate_dir  .qwen                    architect
     gate_file .gitignore               architect
     gate_file .pre-commit-config.yaml  architect
@@ -127,8 +126,6 @@ else
     gate_dir  util/roles
     gate_file CLAUDE.md
     # 仓库级配置只在主树改：在分支里改会随 --no-ff 合并把它带进主干。
-    gate_file AGENTS.md
-    gate_file QWEN.md
     gate_dir  .qwen
     gate_file .gitignore
     gate_file .pre-commit-config.yaml
@@ -141,6 +138,49 @@ else
 fi
 
 chmod +x "$REPO_ROOT/util/roles/use-role" 2>/dev/null || true
+
+# ---- 派生的 agent 指令文件（决策 0008）------------------------------------
+# 别的 CLI 不跑 /load-protocol，也不跑 role-gate 钩子：Codex/OpenCode 自动读
+# AGENTS.md，Qwen Code 自动读 QWEN.md。手写的第二、第三份副本必然漂移——2026-07-22
+# 抽查 QWEN.md：origin 名写错、S-017 标成未跑、构建核硬编码成 0-53,56-91（违反
+# 决策 0004），而且两份里都完全没有角色协议。改成每次切角色重新拼接生成。
+gen_agent_files() {
+    local out="$REPO_ROOT/AGENTS.md"
+
+    # 过渡期保护：分支未 rebase 到 main 时 AGENTS.md 在那棵树里仍受 git 跟踪，
+    # 生成会弄脏工作树，而本脚本上面那道「脏树拒绝切换」会拒掉下一次 use-role
+    # ——自己把自己锁死。跳过并出声，不弄脏（决策 0008 §4）。
+    if git -C "$REPO_ROOT" ls-files --error-unmatch AGENTS.md >/dev/null 2>&1; then
+        echo "警告：AGENTS.md 在本树仍受 git 跟踪（分支未 rebase 到 main），跳过生成。" >&2
+        return 0
+    fi
+
+    # 上一轮生成后被 chmod a-w 过，先删再写；rm -f 不因只读位而提示。
+    rm -f "$out" "$REPO_ROOT/QWEN.md"
+    {
+        cat <<EOF
+<!-- 由 util/roles/use-role 生成，请勿手工编辑：下次切换角色即被覆盖。
+     正本 = CLAUDE.md + docs/roles/$ROLE/PROTOCOL.md。 -->
+
+# 当前激活角色：$ROLE（$TREE 树：$REPO_ROOT）
+
+本文件 = 仓库指令（CLAUDE.md）+ 当前角色协议全文，拼给不自动读 CLAUDE.md 的
+agent CLI。**注意：\`.claude/hooks/role-gate.py\` 只在 Claude Code 会话里生效。**
+在别的 CLI 里，下面这些红线没有任何机制强制执行，只能靠遵守。
+
+---
+
+EOF
+        cat "$REPO_ROOT/CLAUDE.md"
+        printf '\n---\n\n'
+        cat "$PROTOCOL"
+    } > "$out"
+    chmod a-w "$out"
+    # 软链而不是第二份真实文件：ls -l 一眼看得出派生关系，内容不可能不一致。
+    ln -sfn AGENTS.md "$REPO_ROOT/QWEN.md"
+    echo "已生成 AGENTS.md（CLAUDE.md + $ROLE 协议）· QWEN.md -> AGENTS.md"
+}
+gen_agent_files
 
 echo "当前角色：$ROLE（$TREE 树：$REPO_ROOT）"
 echo "协议：docs/roles/$ROLE/PROTOCOL.md"

@@ -71,10 +71,20 @@ def main() -> int:
         (main_root, "pi", W("CLAUDE.md"), "deny", "CLAUDE.md 是 architect 的"),
         # ---- 仓库级配置与 agent 指令文件（ADR 0003 缺口 3）----
         (main_root, "architect", W(".gitignore"), "allow", "仓库配置归 architect"),
-        (main_root, "architect", W(".qwen/QWEN.md"), "allow", "agent 指令文件归 architect"),
+        (main_root, "architect", W(".qwen/QWEN.md"), "allow", "Qwen 会话状态目录归 architect"),
         (main_root, "architect", W("pyproject.toml"), "allow", "格式化配置归 architect"),
         (main_root, "pi", W(".gitignore"), "deny", "PI 不改仓库配置"),
         (main_root, "architect", W("SConstruct"), "deny", "构建系统是代码，主树不写"),
+        # ---- 生成的 agent 指令文件（ADR 0008）：谁都不手写 ----
+        (main_root, "architect", W("AGENTS.md"), "deny", "AGENTS.md 是 use-role 生成物"),
+        (main_root, "architect", W("QWEN.md"), "deny", "QWEN.md 是指向生成物的软链"),
+        (main_root, "pi", W("AGENTS.md"), "deny", "PI 同样不手写生成物"),
+        (wt_root, "implementor", W("AGENTS.md"), "deny", "worktree 里也不手写"),
+        # ---- 写权矩阵默认拒绝（ADR 0007）：未列举路径不再自动放行 ----
+        (main_root, "architect", W("run-a0.sh"), "deny", "主树根级临时脚本"),
+        (main_root, "pi", W("util/foo.py"), "deny", "util/ 不在主树任何角色的可写区"),
+        (main_root, "architect", W("docs/refs/note.md"), "deny", "docs/refs 不在 architect 的区"),
+        (main_root, "architect", B("echo x > scratch.txt"), "deny", "重定向到未列举路径"),
         # ---- 主树不是实验场 ----
         (main_root, "architect", B("scons build/X86/gem5.opt -j8"), "deny", "主树禁构建"),
         (main_root, "pi", B("./build/X86/gem5.opt -d /tmp/x foo.py"), "deny", "主树禁跑 gem5"),
@@ -104,6 +114,18 @@ def main() -> int:
         (wt_root, "implementor", W(".qwen/QWEN.md"), "deny", "agent 指令文件只在主树改"),
         (wt_root, "implementor", W("SConstruct"), "allow", "构建系统归 implementor"),
         (wt_root, "researcher", W("SConstruct"), "deny", "researcher 不改构建系统"),
+        # ---- worktree 的兜底（ADR 0007）：实验员/研究员只剩 spec 一处可写 ----
+        (wt_root, "experimenter", W("run-a0.sh"), "deny", "实验员不得在树根落临时脚本"),
+        (wt_root, "experimenter", B("echo x > analyze.sh"), "deny", "重定向落树根同样拦"),
+        (wt_root, "experimenter", W("util/plot.py"), "deny", "util/ 也在兜底之内"),
+        (wt_root, "researcher", W("ext/foo/bar.c"), "deny", "researcher 不写未列举路径"),
+        (wt_root, "experimenter", W("/tmp/gem5-scratch/analyze.sh"), "allow", "临时脚本的正确落点"),
+        (wt_root, "implementor", W("util/foo.py"), "allow", "未列举路径归代码角色"),
+        (wt_root, "debugger", W("site_scons/site_tools/x.py"), "allow", "debugger 同上"),
+        # build/ 必须显式放行：词法归一不跟软链，兜底会打死构建（ADR 0007 §3.B）
+        (wt_root, "experimenter", B("rm -f build/X86/gem5.opt"), "allow", "实验员清理自己的构建"),
+        (wt_root, "implementor", W("build/X86/config/foo.hh"), "allow", "构建产物区"),
+        (wt_root, "researcher", B("rm -rf build/X86"), "deny", "researcher 不构建也不清构建"),
         # ---- 跨树写入 ----
         (wt_root, "implementor", W("/workspace/gem5/src/sim/eventq.cc"), "deny", "不得跨树写主树"),
         (wt_root, "implementor", W("/workspace/gem5-wt/other/src/x.cc"), "deny", "不得跨树写别的 worktree"),
@@ -172,6 +194,12 @@ def main() -> int:
         (wt_root, "implementor", B("rm docs/specs/INDEX.md"), "deny", "rm+重建绕 chmod"),
         (wt_root, "implementor", B("cp /tmp/x.md docs/specs/INDEX.md"), "deny", "cp 目标是保护区"),
         (wt_root, "implementor", B("cp docs/specs/INDEX.md /tmp/x.md"), "allow", "读保护区是自由的"),
+        # 写入类命令的非路径参数不得被当成写入目标（ADR 0007 §5：兜底放大了这类误判）
+        (wt_root, "implementor", B("sed -i s/a/b/ src/sim/eventq.cc"), "allow", "sed 脚本不是路径"),
+        (wt_root, "implementor", B("sed -i -e s/a/b/ src/sim/eventq.cc"), "allow", "-e 形式同理"),
+        (wt_root, "implementor", B("sed -i s/a/b/ docs/specs/INDEX.md"), "deny", "真正的目标仍要拦"),
+        (wt_root, "implementor", B("truncate -s 0 src/sim/eventq.cc"), "allow", "-s 的值不是路径"),
+        (wt_root, "implementor", B("truncate -s 0 docs/specs/INDEX.md"), "deny", "目标仍要拦"),
         # ---- 外向 / 不可逆 ----
         (wt_root, "implementor", B("git push origin main"), "deny", "推送由用户手工做"),
         (wt_root, "implementor", B("sudo apt install m4"), "ask", "sudo 交人确认"),

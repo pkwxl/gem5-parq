@@ -175,15 +175,29 @@ Two consequences worth knowing before they surprise you:
 | Tree | Role | Mandate | Writable areas |
 |---|---|---|---|
 | main `/workspace/gem5` | **pi** | Direction, priorities, claiming S-NNN numbers, creating branches+worktrees, doc↔data↔code consistency audit (report, don't fix), go/no-go and the `--no-ff` merge back. | `docs/roadmap/**`, `docs/specs/INDEX.md`, `docs/specs/OPEN-ISSUES.md` |
-| main | **architect** | Mechanism-selection decision notes and the **initial version** of an `S-NNN` spec (background, research points, design, acceptance criteria). Sole owner of the role system itself, and of repo-level config and agent-instruction files. | `docs/decisions/**`, `docs/specs/S-*.md`, `docs/roles/**`, `CLAUDE.md`, `.claude/**`, `util/roles/**`, `AGENTS.md`, `QWEN.md`, `.qwen/**`, `.gitignore`, `.pre-commit-config.yaml`, `.clang-format`, `pyproject.toml` |
+| main | **architect** | Mechanism-selection decision notes and the **initial version** of an `S-NNN` spec (background, research points, design, acceptance criteria). Sole owner of the role system itself, and of repo-level config. | `docs/decisions/**`, `docs/specs/S-*.md`, `docs/roles/**`, `CLAUDE.md`, `.claude/**`, `util/roles/**`, `.qwen/**`, `.gitignore`, `.pre-commit-config.yaml`, `.clang-format`, `pyproject.toml` |
 | worktree `/workspace/gem5-wt/<branch>/` | **researcher** | Deepen one research point; produce an experiment plan executable without further judgement (arms, workpoint, pinning, metrics, **pre-registered** criteria). | this branch's `docs/specs/S-NNN-*.md` |
 | worktree | **experimenter** | Execute a plan faithfully: build, run, measure, analyse, write results back — including inconvenient ones, same session. | this branch's `docs/specs/S-NNN-*.md` (results sections) |
 | worktree | **implementor** | Code changes governed by an accepted spec task or decision note. | `src/**`, `configs/**`, `build_opts/**`, `tests/**`, `SConstruct`, `docs/refs/scripts/**`, spec change log |
 | worktree | **debugger** | Root-cause and minimally fix **one** specific failure. | `src/**`, `tests/**`, spec debug log |
 
+**Writable areas are a whitelist, and the whitelist is closed.** Anything in the tree that the row does not
+name is denied — there is no "unlisted therefore fine" (it used to be exactly that, which is how an
+experimenter's `run-a0.sh` ended up sitting in a worktree root;
+[decision 0007](docs/decisions/0007-writable-matrix-default-deny-and-scratch-outside-repo.md)). So:
+**throwaway scripts and intermediate data go to `/tmp/<...>`, never anywhere in the repo** — not even
+gitignored, because `git status` noticing a stray file is what surfaces this class of mistake at all. If a
+script is worth keeping and re-running, it is not throwaway: `ROLE SWITCH: implementor` and land it in
+`docs/refs/scripts/`. To record a one-off in the research log, paste its text into the spec.
+
 `util/roles/use-role <role>` records `.active-role`, refuses a role that does not belong to the current
 tree, refuses an in-session switch while the tree is dirty, and applies the **writability gate** — red
-lines are mechanism, not prose.
+lines are mechanism, not prose. It also regenerates `AGENTS.md` (= `CLAUDE.md` + the active role's
+`PROTOCOL.md`) with `QWEN.md` symlinked to it, for the agent CLIs that read those names instead. Both are
+generated, gitignored, and written read-only: **never hand-edit them** — edit `CLAUDE.md` or the protocol
+and re-run `use-role`
+([decision 0008](docs/decisions/0008-generated-agent-instruction-files.md)). Note that `role-gate.py` is a
+Claude Code hook, so in those other CLIs the red lines below have the text but no enforcement.
 
 **Two layers enforce that table.** The `chmod` gate in `use-role` covers the documentation areas and is
 tool-level, not OS-level: it stops `Edit`/`Write`, `>` and `tee`, but `sed -i` and `rm`+recreate go
@@ -205,6 +219,10 @@ the ones that silently void data rather than corrupt files:
 - `scons` or a gem5 binary invoked on the **main tree** — denied; main is the trunk, not an experiment host
 - `scons` in a worktree — denied for `researcher` only (read-only probing is its mandate; building is
   `experimenter`'s per its own protocol, and `implementor`/`debugger` build to self-check a change)
+- a write to any in-tree path the role's row does not name — denied (decision 0007). In a worktree the
+  catch-all belongs to `implementor`/`debugger`, so `researcher`/`experimenter` can write **only** their
+  `docs/specs/S-NNN-*.md`; `build/` is listed separately (it is a symlink the gate resolves lexically, so
+  without an explicit entry the catch-all would deny every build)
 - creating branches/worktrees — `pi` only, in any tree; `git push` — denied for every role
 - `git merge`/`git rebase` **on the main tree** — `pi` only (that is the `--no-ff` merge-back, lifecycle
   step 5). Inside a worktree both are open to that branch's roles: pulling `main` into an `sNNN` branch is

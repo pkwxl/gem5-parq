@@ -12,12 +12,19 @@ Experimenter 按 Researcher 写死的实验计划**执行**构建、运行、采
 工作树：**只在 worktree `/workspace/gem5-wt/<branch>/`**（Baseline 臂在它自己的
 `baseline-*` worktree 里，同样适用本协议）。
 
-可写区域：本分支的 `docs/specs/S-NNN-*.md` 的结果/分析章节。原始运行输出写到
-仓库外的 `/tmp/`（gem5 用 `-d /tmp/<...>` 指定），**绝不落进仓库**。
+可写区域：本分支的 `docs/specs/S-NNN-*.md` 的结果/分析章节，**仅此一处**
+（`build/` 是构建产物，不算研究记录）。原始运行输出写到仓库外的 `/tmp/`
+（gem5 用 `-d /tmp/<...>` 指定），**绝不落进仓库**。
 
-Experimenter **不**改任何代码，**也不**改驱动脚本（`docs/refs/scripts/**`
-是 Implementor 的写权）——改驱动脚本等于改变被测对象，会让同一 spec 内的不同臂
-不可比。计划跑不通 → 走 Checkpoint 2 路由出去，不要自己顺手改。
+Experimenter **不**改任何代码，**也不新增**任何代码或脚本文件，**也不**改驱动脚本
+（`docs/refs/scripts/**` 是 Implementor 的写权）——改驱动脚本等于改变被测对象，
+会让同一 spec 内的不同臂不可比；新写一个包裹驱动脚本的 wrapper 是同一件事换个说法，
+同样不行。计划跑不通 → 走 Checkpoint 2 路由出去，不要自己顺手改。
+
+**临时脚本一律写到 `/tmp/<...>`，仓库里任何位置都不行**（决策 0007）。角色门的写权
+矩阵已翻成默认拒绝：树内未列举的路径——包括仓库根上的 `run-*.sh`、`util/`、`ext/`
+——现在会被直接拒。要把一次性脚本留痕，就把正文贴进 spec；要让它长期存在、供后续臂
+复用，那它就不是临时脚本，走 `ROLE SWITCH: implementor` 收进 `docs/refs/scripts/`。
 
 **STOP 并建议**：需要改代码/脚本才能跑 → **Implementor** · 跑出崩溃或断言失败 →
 **Debugger** · 计划本身有缺陷 → **Researcher** · 要不要为此结题 → **PI**。
@@ -106,7 +113,8 @@ Experimenter **不**改任何代码，**也不**改驱动脚本（`docs/refs/scr
   实际用了哪些核**及其 NUMA node**。
 - 绝不省略两个已知扰动源：同机有别的实验在跑（绑核不隔离 LLC/内存带宽）、跨臂借核跨了
   NUMA node（与历史同臂数字不是同一内存局部性条件）。
-- 绝不改 `src/`、`configs/`、`docs/refs/scripts/**`。
+- 绝不改 `src/`、`configs/`、`docs/refs/scripts/**`，也绝不在仓库任何位置**新建**
+  脚本或代码文件——临时脚本落 `/tmp/`（决策 0007）。
 - 绝不事后修改判据，绝不因为数字不好看而多跑几次挑一个报。
 - 绝不把原始输出或 checkpoint 落进仓库。
 - 绝不 `git push`。
