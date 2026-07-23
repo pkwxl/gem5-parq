@@ -3,9 +3,13 @@
 - **Status**: Accepted (2026-07-17). The branch-**naming** clause ("One branch per
   investigation", `sNNN-slug` matching the spec filename) is amended by
   [0005](./0005-short-branch-names.md) (2026-07-22): branches are now
-  `sNNN-<word>`, ≤16 chars, keyed to the spec by **number** rather than slug.
-  Everything else here stands; per this record's own rule the body is not
-  rewritten.
+  `sNNN-<word>`, ≤16 chars, keyed to the spec by **number** rather than slug. The
+  **lifecycle** (Architect writes the spec first draft before the branch) is amended
+  by [0009](./0009-researcher-owns-spec-and-worktree-handoff-docs.md) (2026-07-23):
+  the spec is authored in-branch by the Researcher, and PI creates the branch
+  immediately after claiming the number — there is no Architect step in between.
+  Everything else here (worktree layout, tmpfs build, `--no-ff` merge-back) stands;
+  per this record's own rule the body is not rewritten.
 - **Scope**: this fork's research work only (the parallel-`EventQueue` +
   shared-L2/L3 project). Upstream-contribution rules are unchanged; see the last
   section.

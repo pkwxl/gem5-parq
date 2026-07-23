@@ -5,6 +5,10 @@
   [0006 只读误杀/粘性 cwd/内联代码](./0006-role-gate-readonly-cwd-and-inline-code.md)、
   `.claude/hooks/role-gate.py`、`CLAUDE.md`「Research role workflow」、
   `docs/roles/experimenter/PROTOCOL.md`
+- 修订：写权矩阵的具体角色归属被
+  [0009](./0009-researcher-owns-spec-and-worktree-handoff-docs.md)（2026-07-23）修订
+  ——spec 单写者归 Researcher、新增 `docs/worktree/` 子树、`docs/decisions/` 对 PI 开放。
+  本记录确立的「默认拒绝 + 临时脚本落仓库外」原则不变；per 本仓库 ADR 规则正文不重写。
 
 ## 1. 背景 —— 散文早就写了，机制一直没盖住
 
