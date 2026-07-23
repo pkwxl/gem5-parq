@@ -20,7 +20,9 @@ well-quantified, deliberate relaxation).
 
 Full design history, decisions, and empirical results live in `docs/specs/INDEX.md` — start there, not with
 this file, for anything related to this work. New investigations get their own `docs/specs/S-NNN-slug.md`
-(see the index for the numbering convention); don't append to an existing spec file for a new topic.
+(see the index for the numbering convention), which holds the **goal + final results + conclusions**; the
+step-by-step research process (experiment tasks, implementation, debugging) lives alongside it under
+`docs/worktree/sNNN-word/` (decision 0009). Don't append to an existing spec file for a new topic.
 
 ### Measurement methodology: three-arm comparison
 
@@ -139,10 +141,14 @@ skip or summarise it. If `.active-role` is missing, ask the user to run `util/ro
 Role protocols define **checkpoints**; wait for the user's explicit confirmation at each one — **user
 silence is not consent.**
 
-**Roles are split by working tree.** The main tree is the research trunk (design and bookkeeping); every
-worktree is one investigation (research, code, experiments). The same `docs/specs/S-NNN-*.md` path is
-therefore owned by different roles in different trees, which is what keeps main and a branch from
-double-writing one file.
+**Roles are split by working tree.** The main tree is the research trunk (direction and bookkeeping); every
+worktree is one investigation (research, code, experiments). A branch's `docs/specs/S-NNN-*.md` is authored
+**only in the worktree, and only by the Researcher** (decision 0009); on main it is a read-only record the
+`--no-ff` merge brings back, so no two roles ever double-write it. Intra-branch handoff between the
+Researcher and the Experimenter/Implementor/Debugger goes through **per-consumer docs under
+`docs/worktree/sNNN-word/`** (`experiment-*.md`, `impl-*.md`, `debug-*.md`), not through the spec — that
+keeps the spec slim (goal + final results + conclusions) while each downstream role's process record lives
+in its own file.
 
 **Start the session in the tree whose work you intend to do.** `CLAUDE_PROJECT_DIR` — the directory Claude
 was launched in — decides which tree you are in, hence which roles are legal and which writable-area matrix
@@ -154,9 +160,9 @@ other tree; see [decision 0006](docs/decisions/0006-role-gate-readonly-cwd-and-i
 
 | Work | Launch Claude in | Role |
 |---|---|---|
-| Direction, claiming S-NNN, audit, `--no-ff` merge, creating branches/worktrees | `/workspace/gem5` | `pi` |
-| Decision notes, `S-NNN` initial version, the role system itself | `/workspace/gem5` | `architect` |
-| Deepen a research point, run experiments, change code, debug | `/workspace/gem5-wt/<branch>/` | `researcher` · `experimenter` · `implementor` · `debugger` |
+| Direction, research-direction ADRs, claiming S-NNN, audit, `--no-ff` merge, creating branches/worktrees | `/workspace/gem5` | `pi` |
+| Protocol-level decision notes and the role system itself | `/workspace/gem5` | `architect` |
+| Author + own the S-NNN spec, deepen a research point, run experiments, change code, debug | `/workspace/gem5-wt/<branch>/` | `researcher` · `experimenter` · `implementor` · `debugger` |
 
 `ROLE SWITCH` works only **within** one tree (`pi ↔ architect`, or between the four worktree roles). There
 is no cross-tree switch — that needs a new session in the other tree. Running one Claude per worktree in
@@ -174,12 +180,12 @@ Two consequences worth knowing before they surprise you:
 
 | Tree | Role | Mandate | Writable areas |
 |---|---|---|---|
-| main `/workspace/gem5` | **pi** | Direction, priorities, claiming S-NNN numbers, creating branches+worktrees, doc↔data↔code consistency audit (report, don't fix), go/no-go and the `--no-ff` merge back. | `docs/roadmap/**`, `docs/specs/INDEX.md`, `docs/specs/OPEN-ISSUES.md` |
-| main | **architect** | Mechanism-selection decision notes and the **initial version** of an `S-NNN` spec (background, research points, design, acceptance criteria). Sole owner of the role system itself, and of repo-level config. | `docs/decisions/**`, `docs/specs/S-*.md`, `docs/roles/**`, `CLAUDE.md`, `.claude/**`, `util/roles/**`, `.qwen/**`, `.gitignore`, `.pre-commit-config.yaml`, `.clang-format`, `pyproject.toml` |
-| worktree `/workspace/gem5-wt/<branch>/` | **researcher** | Deepen one research point; produce an experiment plan executable without further judgement (arms, workpoint, pinning, metrics, **pre-registered** criteria). | this branch's `docs/specs/S-NNN-*.md` |
-| worktree | **experimenter** | Execute a plan faithfully: build, run, measure, analyse, write results back — including inconvenient ones, same session. | this branch's `docs/specs/S-NNN-*.md` (results sections) |
-| worktree | **implementor** | Code changes governed by an accepted spec task or decision note. | `src/**`, `configs/**`, `build_opts/**`, `tests/**`, `SConstruct`, `docs/refs/scripts/**`, spec change log |
-| worktree | **debugger** | Root-cause and minimally fix **one** specific failure. | `src/**`, `tests/**`, spec debug log |
+| main `/workspace/gem5` | **pi** | Direction, priorities, **research-direction ADRs**, claiming S-NNN numbers, creating branches+worktrees, doc↔data↔code consistency audit (report, don't fix), go/no-go and the `--no-ff` merge back. | `docs/roadmap/**`, `docs/specs/INDEX.md`, `docs/specs/OPEN-ISSUES.md`, `docs/decisions/**` |
+| main | **architect** | **Protocol-level** decision notes (the role system, gate mechanism, repo config) — *not* per-investigation mechanism design, which is now the Researcher's in-branch work. Sole owner of the role system itself, and of repo-level config. Never authors specs. | `docs/decisions/**`, `docs/roles/**`, `CLAUDE.md`, `.claude/**`, `util/roles/**`, `.qwen/**`, `.gitignore`, `.pre-commit-config.yaml`, `.clang-format`, `pyproject.toml` |
+| worktree `/workspace/gem5-wt/<branch>/` | **researcher** | In-branch architect for its one Spec: author + solely own the slim spec (goal, research points, acceptance criteria, and — at closeout — final results + conclusions); deepen a research point; issue the per-consumer handoff docs an Experimenter/Implementor can execute without further judgement. | this branch's `docs/specs/S-NNN-*.md` (**sole writer**), `docs/worktree/sNNN-word/**` |
+| worktree | **experimenter** | Execute an experiment-task doc faithfully: build, run, measure, analyse, write results + inconvenient findings back into that doc, same session. | this branch's `docs/worktree/sNNN-word/experiment-*.md` |
+| worktree | **implementor** | Code changes governed by an accepted spec task or decision note. | `src/**`, `configs/**`, `build_opts/**`, `tests/**`, `SConstruct`, `docs/refs/scripts/**`, `docs/worktree/sNNN-word/impl-*.md` |
+| worktree | **debugger** | Root-cause and minimally fix **one** specific failure. | `src/**`, `tests/**`, `docs/worktree/sNNN-word/debug-*.md` |
 
 **Writable areas are a whitelist, and the whitelist is closed.** Anything in the tree that the row does not
 name is denied — there is no "unlisted therefore fine" (it used to be exactly that, which is how an
@@ -220,9 +226,13 @@ the ones that silently void data rather than corrupt files:
 - `scons` in a worktree — denied for `researcher` only (read-only probing is its mandate; building is
   `experimenter`'s per its own protocol, and `implementor`/`debugger` build to self-check a change)
 - a write to any in-tree path the role's row does not name — denied (decision 0007). In a worktree the
-  catch-all belongs to `implementor`/`debugger`, so `researcher`/`experimenter` can write **only** their
-  `docs/specs/S-NNN-*.md`; `build/` is listed separately (it is a symlink the gate resolves lexically, so
-  without an explicit entry the catch-all would deny every build)
+  catch-all belongs to `implementor`/`debugger`, so `researcher` can write **only** its
+  `docs/specs/S-NNN-*.md` plus `docs/worktree/sNNN-word/**`, and `experimenter` **only** the latter
+  (decision 0009); `build/` is listed separately (it is a symlink the gate resolves lexically, so without an
+  explicit entry the catch-all would deny every build)
+- `docs/decisions/**` (ADRs) — `pi` writes **research-direction** ADRs, `architect` writes
+  **protocol/role-system** ADRs; both main-only, a worktree never writes an ADR (decision 0009). The scope
+  split is by convention (an ADR's `范围/Scope:` line), not enforced by the gate
 - creating branches/worktrees — `pi` only, in any tree; `git push` — denied for every role
 - `git merge`/`git rebase` **on the main tree** — `pi` only (that is the `--no-ff` merge-back, lifecycle
   step 5). Inside a worktree both are open to that branch's roles: pulling `main` into an `sNNN` branch is
@@ -245,18 +255,22 @@ The hook is a guardrail, not a sandbox — a sufficiently indirect write (a `pyt
 from variables, a symlink planted in-tree) evades it by design. It is sized against drift and accident.
 
 Two rules exist purely to keep main and its branches from colliding, and they are not negotiable:
-`docs/specs/INDEX.md` and `OPEN-ISSUES.md` are **PI-only and main-only** (a worktree never edits them);
-and once a branch+worktree exists for an `S-NNN`, the **Architect never touches that spec again** on main.
+`docs/specs/INDEX.md` and `OPEN-ISSUES.md` are **PI-only and main-only** (a worktree never edits them); and
+a branch's `S-NNN` spec is authored **only in that worktree, and only by the Researcher** — the Architect
+never authors specs at all, so there is no main-vs-branch double-write to guard against (decision 0009).
 
 **The lifecycle of one investigation:**
 
-1. **PI** (main) claims the number — `INDEX.md` row, status `进行中` — and commits.
-2. **Architect** (main) writes the `S-NNN` initial version plus any decision note, and commits.
-3. **PI** creates `sNNN-<word>` (≤16 chars, decision 0005) from that commit plus its worktree and tmpfs
-   `build/` symlink.
-4. In the worktree: **Researcher** deepens a research point and writes the experiment plan →
-   **Implementor** makes the code change it needs → **Experimenter** runs the three arms and writes the
-   results back → **Debugger** if something breaks. Each is its own session with its own role.
+1. **PI** (main) claims the number — `INDEX.md` row, status `进行中` — and commits. If the investigation
+   embodies a directional call, PI may also write a **research-direction ADR** here.
+2. **PI** (main) creates `sNNN-<word>` (≤16 chars, decision 0005) plus its worktree and tmpfs `build/`
+   symlink — immediately, with no Architect step in between.
+3. In the worktree: **Researcher** authors the slim spec (goal, research points, acceptance criteria),
+   deepens the research, and issues the per-consumer handoff docs under `docs/worktree/sNNN-word/`
+   (`experiment-*.md`, `impl-*.md`). A design-review checkpoint with the user gates the hand-off.
+4. **Implementor** makes the code change its `impl-*.md` governs → **Experimenter** runs the three arms and
+   writes results into its `experiment-*.md` → **Debugger** works a `debug-*.md` if something breaks. None
+   of them touch the spec. **Researcher** then distills the final results + conclusions into the spec.
 5. **PI** audits doc↔data↔code, decides go/no-go, merges `--no-ff`, updates the `INDEX.md` row.
 
 **Role switching.** One session, one role — a fresh session is the strongest isolation and is always

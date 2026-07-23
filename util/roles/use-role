@@ -87,8 +87,9 @@ gate_file() {
     if contains "$ROLE" "$@"; then chmod u+w "$f"; else chmod a-w "$f"; fi
 }
 
-# S-NNN spec 正文：主树归 architect（写初版），worktree 归研究/实验/实现/调试。
-# 同一路径、不同树，两边不会同时可写——这是整套划分的支点。
+# S-NNN spec 正文：worktree 里只归 Researcher（决策 0009——它是分支内的架构师）；
+# 主树上是 --no-ff 合并回来的只读记录（不传 owner = 全部 a-w）。同一路径、不同树，
+# 两边不会同时可写——这是整套划分的支点。
 gate_specs() {
     local f
     while IFS= read -r -d '' f; do
@@ -100,8 +101,9 @@ if [[ "$TREE" == "main" ]]; then
     gate_dir  docs/roadmap             pi
     gate_file docs/specs/INDEX.md      pi
     gate_file docs/specs/OPEN-ISSUES.md pi
-    gate_specs                         architect
-    gate_dir  docs/decisions           architect
+    gate_specs
+    gate_dir  docs/decisions           pi architect
+    gate_dir  docs/worktree
     gate_dir  docs/roles               architect
     gate_dir  .claude                  architect
     gate_dir  util/roles               architect
@@ -115,7 +117,11 @@ if [[ "$TREE" == "main" ]]; then
     gate_file pyproject.toml           architect
     gate_file SConstruct
 else
-    gate_specs                         researcher experimenter implementor debugger
+    # spec 正本只归 Researcher（决策 0009）；其余三角色的过程记录走 docs/worktree/。
+    gate_specs                         researcher
+    # 分支内逐消费者交接文档：experiment-*/impl-*/debug-*.md，四个 worktree 角色都可写，
+    # 具体哪个文件归谁由各角色 PROTOCOL 划分（与 docs/specs/ 分节同一模式，决策 0009）。
+    gate_dir  docs/worktree            researcher experimenter implementor debugger
     # INDEX / OPEN-ISSUES 只在主树由 PI 维护——worktree 里改必然引发合并冲突。
     gate_file docs/specs/INDEX.md
     gate_file docs/specs/OPEN-ISSUES.md

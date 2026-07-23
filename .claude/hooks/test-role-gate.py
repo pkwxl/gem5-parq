@@ -22,8 +22,9 @@ FIXTURE = Path(os.path.expanduser("~/.cache/gem5-role-gate-test"))
 def setup() -> tuple[Path, Path]:
     main, wt = FIXTURE / "main", FIXTURE / "wt"
     for root in (main, wt):
-        for d in ("docs/specs", "docs/roles", "docs/decisions", "docs/roadmap",
-                  "docs/refs/scripts", "src/sim", "configs", "tests", ".claude", "util/roles"):
+        for d in ("docs/specs", "docs/worktree/s019-x", "docs/roles", "docs/decisions",
+                  "docs/roadmap", "docs/refs/scripts", "src/sim", "configs", "tests",
+                  ".claude", "util/roles"):
             (root / d).mkdir(parents=True, exist_ok=True)
     (main / ".git").mkdir(exist_ok=True)
     (wt / ".git").write_text("gitdir: /workspace/gem5/.git/worktrees/wt\n")
@@ -60,14 +61,16 @@ def main() -> int:
     cases: list[tuple[Path, str, tuple[str, dict], str, str]] = [
         # ---- 主树写权矩阵 ----
         (main_root, "architect", W("CLAUDE.md"), "allow", "architect 拥有 CLAUDE.md"),
-        (main_root, "architect", W("docs/decisions/0002-x.md"), "allow", "architect 拥有决策记录"),
-        (main_root, "architect", W("docs/specs/S-019-x.md"), "allow", "architect 写 spec 初版"),
+        (main_root, "architect", W("docs/decisions/0002-x.md"), "allow", "architect 写协议/机制 ADR"),
+        (main_root, "architect", W("docs/specs/S-019-x.md"), "deny", "架构师不再写 spec（决策 0009）"),
+        (main_root, "architect", W("docs/worktree/s019-x/impl-1.md"), "deny", "交接文档在 worktree 里写"),
         (main_root, "architect", W("docs/specs/INDEX.md"), "deny", "INDEX 是 PI 专属"),
         (main_root, "architect", W("docs/roadmap/ROADMAP.md"), "deny", "roadmap 是 PI 专属"),
         (main_root, "architect", W("src/sim/eventq.cc"), "deny", "主树不写代码"),
         (main_root, "pi", W("docs/specs/INDEX.md"), "allow", "PI 拥有 INDEX"),
         (main_root, "pi", W("docs/roadmap/ROADMAP.md"), "allow", "PI 拥有 roadmap"),
-        (main_root, "pi", W("docs/specs/S-019-x.md"), "deny", "spec 正文是 architect 的"),
+        (main_root, "pi", W("docs/decisions/0009-x.md"), "allow", "PI 写研究方向 ADR（决策 0009）"),
+        (main_root, "pi", W("docs/specs/S-019-x.md"), "deny", "主树 spec 只读（正本在 worktree）"),
         (main_root, "pi", W("CLAUDE.md"), "deny", "CLAUDE.md 是 architect 的"),
         # ---- 仓库级配置与 agent 指令文件（ADR 0003 缺口 3）----
         (main_root, "architect", W(".gitignore"), "allow", "仓库配置归 architect"),
@@ -106,15 +109,23 @@ def main() -> int:
         (wt_root, "implementor", W("CLAUDE.md"), "deny", "worktree 不碰 CLAUDE.md"),
         (wt_root, "debugger", W("src/mem/ruby/x.cc"), "allow", "debugger 可最小改 src"),
         (wt_root, "debugger", W("configs/example/x.py"), "deny", "configs 归 implementor"),
-        (wt_root, "researcher", W("docs/specs/S-019-x.md"), "allow", "researcher 写 spec"),
+        (wt_root, "researcher", W("docs/specs/S-019-x.md"), "allow", "researcher 独写 spec 正本"),
         (wt_root, "researcher", W("src/sim/eventq.cc"), "deny", "researcher 不改代码"),
-        (wt_root, "experimenter", W("docs/specs/S-019-x.md"), "allow", "实验员写结果"),
+        (wt_root, "experimenter", W("docs/specs/S-019-x.md"), "deny", "实验员不再写 spec（决策 0009）"),
+        (wt_root, "implementor", W("docs/specs/S-019-x.md"), "deny", "实现者不再写 spec 变更记录"),
+        (wt_root, "debugger", W("docs/specs/S-019-x.md"), "deny", "调试员不再写 spec 调试记录"),
         (wt_root, "experimenter", W("docs/refs/scripts/drv.py"), "deny", "实验员不改驱动脚本"),
+        # ---- 分支内逐消费者交接文档（决策 0009）：四个 worktree 角色都可写 ----
+        (wt_root, "researcher", W("docs/worktree/s019-x/experiment-1.md"), "allow", "研究员出实验任务书"),
+        (wt_root, "researcher", W("docs/worktree/s019-x/impl-1.md"), "allow", "研究员出实现任务书"),
+        (wt_root, "experimenter", W("docs/worktree/s019-x/experiment-1.md"), "allow", "实验员回填执行结果"),
+        (wt_root, "implementor", W("docs/worktree/s019-x/impl-1.md"), "allow", "实现者回填变更记录"),
+        (wt_root, "debugger", W("docs/worktree/s019-x/debug-1.md"), "allow", "调试员写调试交接"),
         (wt_root, "implementor", W(".gitignore"), "deny", "仓库配置只在主树改"),
         (wt_root, "implementor", W(".qwen/QWEN.md"), "deny", "agent 指令文件只在主树改"),
         (wt_root, "implementor", W("SConstruct"), "allow", "构建系统归 implementor"),
         (wt_root, "researcher", W("SConstruct"), "deny", "researcher 不改构建系统"),
-        # ---- worktree 的兜底（ADR 0007）：实验员/研究员只剩 spec 一处可写 ----
+        # ---- worktree 的兜底（ADR 0007）：researcher 写 spec+worktree，experimenter 只写 worktree ----
         (wt_root, "experimenter", W("run-a0.sh"), "deny", "实验员不得在树根落临时脚本"),
         (wt_root, "experimenter", B("echo x > analyze.sh"), "deny", "重定向落树根同样拦"),
         (wt_root, "experimenter", W("util/plot.py"), "deny", "util/ 也在兜底之内"),

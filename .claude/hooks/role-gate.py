@@ -61,8 +61,13 @@ MAIN_AREAS: list[tuple[str, set[str]]] = [
     ("docs/specs/INDEX.md", {"pi"}),
     ("docs/specs/OPEN-ISSUES.md", {"pi"}),
     ("docs/roadmap/", {"pi"}),
-    ("docs/specs/", {"architect"}),
-    ("docs/decisions/", {"architect"}),
+    # spec 正本由 worktree 里的 Researcher 独写（决策 0009）；主树上的 spec 是
+    # --no-ff 合并回来的只读研究记录，不对任何主树角色开写权。
+    ("docs/specs/", set()),
+    # 分支内的逐消费者交接文档同样是合并回来的只读记录。
+    ("docs/worktree/", set()),
+    # 研究方向 ADR 归 PI、协议/机制 ADR 归 architect（决策 0009），两者都在主树写。
+    ("docs/decisions/", {"pi", "architect"}),
     ("docs/roles/", {"architect"}),
     ("CLAUDE.md", {"architect"}),
     (".claude/", {"architect"}),
@@ -90,7 +95,13 @@ MAIN_AREAS: list[tuple[str, set[str]]] = [
 WT_AREAS: list[tuple[str, set[str]]] = [
     ("docs/specs/INDEX.md", set()),
     ("docs/specs/OPEN-ISSUES.md", set()),
-    ("docs/specs/", {"researcher", "experimenter", "implementor", "debugger"}),
+    # spec 正本（目标 + 最终结果表 + 结论）只由 Researcher 写（决策 0009）——它是
+    # 分支内的「架构师」。Experimenter/Implementor/Debugger 的过程记录不进 spec，
+    # 走下面的 docs/worktree/。
+    ("docs/specs/", {"researcher"}),
+    # 分支内逐消费者交接文档：experiment-*/impl-*/debug-*.md。门只按子树授权，
+    # 具体哪个文件归谁由各角色 PROTOCOL 散文划分（与 docs/specs/ 分节同一模式）。
+    ("docs/worktree/", {"researcher", "experimenter", "implementor", "debugger"}),
     ("docs/roadmap/", set()),
     ("docs/decisions/", set()),
     ("docs/roles/", set()),
@@ -118,8 +129,8 @@ WT_AREAS: list[tuple[str, set[str]]] = [
     # 不显式放行，下面的兜底会打死所有构建（决策 0007 §3.B）。researcher 不构建。
     ("build/", {"experimenter", "implementor", "debugger"}),
     # 兜底：未列举路径压倒性地是代码相邻的（util/、ext/、site_scons/、根级脚本），
-    # 归代码角色。researcher/experimenter 因此只剩 docs/specs/S-NNN-*.md 一处可写，
-    # 与 CLAUDE.md 角色表逐字一致。临时脚本请落 /tmp（决策 0007 §3.C）。
+    # 归代码角色。researcher 只写 docs/specs/ + docs/worktree/，experimenter 只写
+    # docs/worktree/（决策 0009）；两者都不碰兜底。临时脚本请落 /tmp（决策 0007 §3.C）。
     (CATCHALL, {"implementor", "debugger"}),
 ]
 
@@ -128,8 +139,9 @@ ROUTE = {
     "docs/specs/INDEX.md": "pi",
     "docs/specs/OPEN-ISSUES.md": "pi",
     "docs/roadmap/": "pi",
-    "docs/specs/": "architect",
-    "docs/decisions/": "architect",
+    # docs/specs/ 与 docs/decisions/ 故意不在此：其归属按树不同（spec 在 worktree
+    # 归 researcher、decisions 在主树 pi/architect 共有），deny_reason 从 owners
+    # 现算路由即可，硬编码一个跨树的固定值反而会指错人（决策 0009）。
     "docs/roles/": "architect",
     "CLAUDE.md": "architect",
     ".claude/": "architect",
